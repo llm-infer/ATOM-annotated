@@ -347,3 +347,21 @@ C 级示例：
 - ATOM 的 forward context 如何从 vLLM / SGLang 的元数据转换而来？
 - RL 训练每轮更新权重时，ATOM 如何在不重启的情况下换掉权重并释放 KV 显存？
 - diffusion 子系统与 LLM 引擎在进程结构上有什么异同？
+
+---
+
+## 4. 跨批备注（注释过程中发现、后续批次要交叉引用的事实）
+
+### 来自第 1 批
+
+- **`kv_cache_block_size` 会被按模型改写**：DeepSeek-V4 改成 256，GLM-5.3 改成 `index_kpool × 16`，V4.1 改成 128（`config.py` 中 `Config.__post_init__` 的第 12、13 步）。调度器、BlockManager、ModelRunner 看到的都是改写后的值；DCP 的 `interleave_size` 检查发生在改写之前。→ 第 3、4、5、8 批
+- **`Config.num_kvcache_blocks` 初始为 -1**：EngineCore 用 `ModelRunner.get_num_blocks` 的结果回填（`engine_core.py`），之后才构造 Scheduler / BlockManager。→ 第 2、4、5 批
+- **`Config.capture_sizes` 是声明的 CUDA Graph 档位**，`ModelRunner.capture_cudagraph` 会再去掉 token 预算永远达不到的档位；decode batch 超过最大档位时以 eager 运行（`ForwardMode.decide` 中的 `on_ladder`）。→ 第 5 批
+- **`stop_token_ids`** 来自 generation_config，`LLMEngine.__init__` 再从中去掉 tokenizer 的 eos，调度器读取的是处理后的结果。→ 第 2、3 批
+- **`Config.compute_hash`** 决定 torch.compile 缓存目录 `~/.cache/atom/torch_compile_cache/<hash>`（`utils/backends.py`），包含投机宽度（v0.1.8里不含 `max_model_len`、`max_num_seqs`）。→ 第 5 批
+- **`--enable-dp-attention` 会改写配置**：CoreManager 在构造后把 `tensor_parallel_size` 设为 1、`data_parallel_size` 乘以原 TP（`engine_core_mgr.py`）。→ 第 2 批
+- **`LLMEngine` 只把 Config 中存在的同名 kwargs 传给 Config**，EngineArgs 中其余字段被静默丢弃。→ 第 2 批
+- **延迟输出的占位 token**：`Scheduler.postprocess` 先往 `token_ids` 末尾追加 `eos_token_id` 占位，下一步原地覆盖；`num_placeholder_tokens` 记录宽度，`preempt` 据此删除。→ 第 3、5 批
+- **ATOM 的序列在第一次被调度做 prefill 时就变成 RUNNING**（`_schedule_prefill_seq`），chunked prefill 未完成的序列留在 running 中由 Phase 1 继续，这一点与 nano-vllm 不同。→ 第 3 批
+- **`envs.py` 的值不缓存**：每次访问 `envs.X` 都重新读 `os.environ`；热路径通常在模块导入时把值存成常量，所以这类开关必须在启动前设置。→ 所有批次
+- 已发现的“注释与代码不符”（均已在注释中用“解释：”标出，代码未改）：`multimodal_inference.py` 的 “Force eager mode” 实际只设置了 `cudagraph_capture_sizes="[1]"`；`cuda_graph_sizes` 的 docstring 描述的是 vLLM 的规则；`CUDAGraphMode.NONE` 在原生 runner 中没有单独的判断，真正关闭捕获的是 `enforce_eager`。
