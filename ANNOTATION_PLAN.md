@@ -1,6 +1,8 @@
 # ATOM 源码注释计划（10 批，全量覆盖）
 
-参考 `../nano-vllm-annotated` 的注释风格，为 ATOM 加中文注释。**`atom/` 下全部 875 个 .py 文件（约 38.5 万行）都分到了某一批**，按深度分为三级。读者按批次顺序阅读，可以从“一个请求怎么进来”一路读到 DeepSeek-V4、Mono 融合 kernel、PD 分离和 vLLM 插件。
+参考 `../nano-vllm-annotated` 的注释风格，为 ATOM 加中文注释。**`atom/` 下全部 787 个 .py 文件（约 34.4 万行）都分到了某一批**，按深度分为三级。读者按批次顺序阅读，可以从“一个请求怎么进来”一路读到 DeepSeek-V4、Mono 融合 kernel、PD 分离和 vLLM 插件。
+
+本计划对应 **ATOM v0.1.8**（upstream commit `daa4f1bb8`）。所有文件数、行数和文件名都按这个版本统计。
 
 - 逐文件清单（每个文件的批次、深度、行数，带勾选框，可用来记录进度）：[ANNOTATION_CHECKLIST.md](ANNOTATION_CHECKLIST.md)
 - 分批规则由脚本生成并校验：没有遗漏，也没有重复
@@ -11,9 +13,9 @@
 
 | | nano-vllm | ATOM |
 |---|---|---|
-| Python 文件 | 19 个 | 875 个 |
-| 代码行数 | ~3,000 | ~385,000 |
-| 最大单文件 | model_runner.py 605 行 | scheduler.py 5,547 行、moe.py 5,595 行 |
+| Python 文件 | 19 个 | 787 个 |
+| 代码行数 | ~3,000 | ~344,000 |
+| 最大单文件 | model_runner.py 605 行 | scheduler.py 5,346 行、moe.py 5,383 行 |
 
 **全量覆盖，深度分级**。38 万行不可能全部逐行注释，读者也读不完。所以每个文件都会注释，但深度不同：
 
@@ -46,11 +48,11 @@
 
 | 级别 | 写什么 | 用于 |
 |---|---|---|
-| **A 逐行详注** | nano-vllm-annotated 的完整风格：文件 / 类开头写总览（职责、架构位置、ASCII 流程图或时序图），成员变量逐个说明，方法按步骤分段解释，几乎每个非平凡语句都有注释 | 主干核心文件，共 53 个 |
-| **B 精注** | 文件头总览；每个类和函数开头写用途、输入输出（张量形状）、调用方；函数体内只注释关键行：分支条件、数据流转折、不直观的技巧 | 主干的配套文件、扩展部分的核心文件，共 283 个 |
-| **C 导读** | 文件头写职责、调用方、与主干的关系（替代或扩展了哪一批的哪个机制）；每个类和公开函数一行用途 | kernel、协议适配、补丁、工具，共 493 个 |
+| **A 逐行详注** | nano-vllm-annotated 的完整风格：文件 / 类开头写总览（职责、架构位置、ASCII 流程图或时序图），成员变量逐个说明，方法按步骤分段解释，几乎每个非平凡语句都有注释 | 主干核心文件，共 52 个 |
+| **B 精注** | 文件头总览；每个类和函数开头写用途、输入输出（张量形状）、调用方；函数体内只注释关键行：分支条件、数据流转折、不直观的技巧 | 主干的配套文件、扩展部分的核心文件，共 260 个 |
+| **C 导读** | 文件头写职责、调用方、与主干的关系（替代或扩展了哪一批的哪个机制）；每个类和公开函数一行用途 | kernel、协议适配、补丁、工具，共 431 个 |
 
-另有 37 个空的 `__init__.py` 或只有几行导出的文件不注释。9 个上游 vendored 文件不修改，见 1.4。
+另有 35 个空的 `__init__.py` 或只有几行导出的文件不注释。9 个上游 vendored 文件不修改，见 1.4。
 
 C 级示例：
 
@@ -91,9 +93,9 @@ C 级示例：
 ### 1.3 每批的执行与验收
 
 - 改动后对修改过的文件跑两个检查脚本（在 [annotation_tools/](annotation_tools/) 下，需 Python ≥ 3.12）：
-  - `python annotation_tools/verify_comments_only.py <files>`：对比 git HEAD 的 AST，证明只加了注释、没改代码，并跑 black --check 和 ruff；
+  - `python annotation_tools/verify_comments_only.py [--base daa4f1bb8] <files>`：对比 git HEAD（或 `--base` 指定的未注释上游版本）的 AST，证明只加了注释、没改代码，并跑 black --check 和 ruff；
   - `python annotation_tools/untranslated.py <files>`：列出还没有 `# 【译】` 翻译的英文注释和 docstring（自己画的图、被注释掉的代码属于误报，可以忽略）。
-- `annotation_tools/gen_checklist.py` 是生成清单的脚本；重新生成会清空清单里已勾选的进度。
+- `annotation_tools/gen_checklist.py ANNOTATION_CHECKLIST.md --base daa4f1bb8` 生成清单（行数按未注释的上游版本统计）；重新生成会清空已勾选的进度，需要重新勾选。
 - 每批完成后勾选 [ANNOTATION_CHECKLIST.md](ANNOTATION_CHECKLIST.md)，并提交一次，提交信息沿用 nano-vllm 格式：`【注释】第N批：调度器`。
 - 后 3 批文件多，按小节（如 8a、8b）拆给多个子任务并行注释，最后统一检查术语和交叉引用。
 - 注释不影响 Dynamo 追踪，但文件 hash 会变，`@support_torch_compile` 模型首次运行会重新编译。在 GPU 上运行前按 CLAUDE.md 清理 `/root/.cache/atom/*`。
@@ -109,16 +111,16 @@ C 级示例：
 
 | 批次 | 主题 | 文件数 | 源码行数 | 深度构成（A / B / C） | 配套文档 |
 |---|---|---|---|---|---|
-| 1 | 入口、配置与请求对象 | 17 | 8.5K | 6 / 9 / 1 | configuration_guide、environment_variables |
-| 2 | 引擎主循环、多进程架构与服务层 | 62 | 25.2K | 6 / 27 / 29 | architecture_guide、api_compatibility |
-| 3 | 调度器 | 2 | 6.4K | 1 / 1 / 0 | scheduling_kv_cache_guide |
-| 4 | KV cache 账本与状态缓存 | 15 | 9.0K | 4 / 11 / 0 | scheduling_kv_cache_guide |
-| 5 | ModelRunner：执行、权重加载、采样、CUDA Graph 与编译 | 44 | 18.0K | 9 / 31 / 4 | compilation_cudagraph_guide、h2d_publication |
-| 6 | 基础算子、量化、注意力与 dense 模型 | 35 | 17.5K | 17 / 16 / 0 | model_ops_guide、model_support_guide |
-| 7 | MoE、MLA、投机解码：DeepSeek-V3 与 MoE 模型家族 | 61 | 38.3K | 10 / 50 / 0 | eagle3_speculative_decoding、recipes/DeepSeek-R1、DSpark |
-| 8 | 新一代模型：线性注意力、DeepSeek-V4 / V4.1 及其他 | 162 | 75.3K | 0 / 26 / 130 | deepseek_v41_*、recipes 中对应模型 |
-| 9 | 进阶执行与分布式：Mono、并行扩展、PD 分离与 KV offload | 256 | 91.9K | 0 / 72 / 169 | distributed_guide、context_parallel_guide、dynamic_chunking_guide、recipes/TBO、pd_disaggregation_guide |
-| 10 | 对外集成与周边：插件、RL rollout、可观测性、diffusion | 212 | 89.0K | 0 / 40 / 160 | vllm_plugin_backend_guide、metrics_guide、observability、recipes/MiniMax-H3 |
+| 1 | 入口、配置与请求对象 | 17 | 8.1K | 6 / 9 / 1 | configuration_guide、environment_variables |
+| 2 | 引擎主循环、多进程架构与服务层 | 57 | 23.2K | 6 / 24 / 27 | architecture_guide、serving_benchmarking_guide |
+| 3 | 调度器 | 2 | 5.9K | 1 / 1 / 0 | scheduling_kv_cache_guide |
+| 4 | KV cache 账本与状态缓存 | 13 | 8.6K | 4 / 9 / 0 | scheduling_kv_cache_guide |
+| 5 | ModelRunner：执行、权重加载、采样、CUDA Graph 与编译 | 43 | 17.8K | 9 / 30 / 4 | compilation_cudagraph_guide、h2d_publication |
+| 6 | 基础算子、量化、注意力与 dense 模型 | 34 | 17.0K | 16 / 16 / 0 | model_ops_guide、model_support_guide |
+| 7 | MoE、MLA、投机解码：DeepSeek-V3 与 MoE 模型家族 | 51 | 36.4K | 10 / 40 / 0 | eagle3_speculative_decoding、recipes/DeepSeek-R1、DSpark |
+| 8 | 新一代模型：线性注意力、DeepSeek-V4 / V4.1 及其他 | 155 | 72.6K | 0 / 26 / 123 | deepseek_v41_*、recipes 中对应模型 |
+| 9 | 进阶执行与分布式：Mono、并行扩展、PD 分离与 KV offload | 205 | 65.4K | 0 / 66 / 125 | distributed_guide、context_parallel_guide、dynamic_chunking_guide、recipes/TBO、pd_disaggregation_guide |
+| 10 | 对外集成与周边：插件、RL rollout、可观测性、diffusion | 201 | 83.5K | 0 / 39 / 151 | vllm_plugin_backend_guide、metrics_guide、observability、recipes/MiniMax-H3 |
 | — | 不修改（vendored） | 9 | 5.9K | — | — |
 
 后 3 批行数多，但以 C 级为主，实际阅读量和前几批相当：读者主要读文件头导读和 B 级的核心文件。
@@ -138,7 +140,7 @@ C 级示例：
 | `examples/simple_inference.py` | A：离线推理入口，EngineArgs → create_engine → generate |
 | `model_engine/arg_utils.py` | A：`EngineArgs`、`from_cli_args`、`_get_engine_kwargs`、`create_engine`；`add_cli_args` 按参数组注释 |
 | `config.py` | A：`Config`、`KVCacheConfig`、`KVCacheTensor`、`CUDAGraphMode`、`CompilationLevel`、`CompilationConfig`、`ParallelConfig`、`get_hf_config`；B：`QuantizationConfig`、`SpeculativeConfig`、`DSparkConfig`、`EPLBConfig`、`DCPConfig`、`KVEventsConfig`，以及各模型的 config 归一化函数 |
-| `sampling_params.py` | A：`SamplingParams`、`RequiredChannel` |
+| `sampling_params.py` | A：`SamplingParams` |
 | `model_engine/sequence.py`、`request.py` | A：`Sequence`、`SequenceStatus`、`BlockTable`、`RequestOutput` 等 |
 | `utils/envs.py` | B：按功能分组说明所有 `ATOM_*` 环境变量 |
 | `utils/__init__.py`、`utils/arg_parser.py`、`model_config/*`、其余 examples | B |
@@ -162,10 +164,10 @@ C 级示例：
 | `engine_core_mgr.py` | A：`CoreManager` 启动、`add_request`、`_dispatch_to_dp_ranks`、输出线程、`launch_engine_core`；B：DP 负载均衡、背压、weight sync、`DisaggCoreManager` |
 | `engine_core.py` | A：`EngineCore.busy_loop`、`_process_engine_step_inner`、输入输出 socket 线程、`DPEngineCoreProc`；B：`PrefillEngineCore` / `DecodeEngineCore`（交叉引用第 9 批） |
 | `async_proc.py` | A：`AsyncIOProc`、`AsyncIOProcManager` |
-| `ipc_utils.py`、`output_transfer.py`、`engine_core_protocol.py`、`engine_utility.py`、`utils/numa_utils.py`、`utils/gc_utils.py`、`utils/network.py` | B |
+| `ipc_utils.py`、`engine_core_protocol.py`、`engine_utility.py`、`utils/numa_utils.py`、`utils/gc_utils.py`、`utils/network.py` | B |
 | `collective_rpc.py`、`capabilities.py`、`engine_stats.py`、`run_labels.py` | C |
 
-**2b 分词与多模态输入**：`segment_tokenizer.py`（复用前序请求的分词结果）、`segment_split.py`、`multimodal_runtime.py`、`multimodal/*`，均为 B。
+**2b 多模态输入**：`multimodal_runtime.py`、`multimodal/*`，均为 B。
 
 **2c OpenAI 兼容服务层**
 
@@ -212,7 +214,7 @@ C 级示例：
 | `block_manager.py` | A：`can_allocate`、`_evaluate`、`_walk_prefix`、`allocate`、`hash_blocks`、`hash_decode_blocks`、`deallocate`、`can_append`、`may_append`、`draft_kv_lookahead`；B：state checkpoint、joint boundary、midstep、offload、remote prefix、KV events |
 | `block_pool.py` | A：空闲链表、引用计数、内容寻址的 hash 索引、惰性淘汰 |
 | `kv_block.py`、`prefix_hash.py` | A |
-| `prefix_block_hashes.py`、`block_table_codec.py`、`byte_lru.py`、`utils/block_tables.py`、`utils/block_convert.py`、`distributed/kv_events.py` | B |
+| `block_table_codec.py`、`utils/block_tables.py`、`utils/block_convert.py`、`distributed/kv_events.py` | B |
 
 **4b 递归状态缓存**：`state_pool.py`、`state_cache.py`、`state_runtime.py`、`state_offload.py`、`page_unit_checkpoint.py`，均为 B。
 
@@ -239,9 +241,9 @@ C 级示例：
 
 **5c 权重加载**：A：`loader.py`、`loading_core.py`、`weight_iterator.py`；B：`weight_dispatch.py`、`weight_names.py`、`expert_staging.py`、`online_quant_streaming.py`、`weight_utils.py`。
 
-**5d 采样**：A：`sampler.py`；B：`lm_head_argmax.py`、`required_channel.py`。
+**5d 采样**：A：`sampler.py`；B：`lm_head_argmax.py`。
 
-**5e CUDA Graph 与 torch.compile**：A：`utils/decorators.py`、`utils/backends.py`、`utils/cuda_piecewise_backend.py`；B：`region_graph.py`、`graph_holders.py`、`custom_register.py`、`module_dispatch_ops.py`、`distributed/nccl_watchdog.py`；C：`compiler_inferface.py`、`graph_marker*.py`。
+**5e CUDA Graph 与 torch.compile**：A：`utils/decorators.py`、`utils/backends.py`、`utils/cuda_piecewise_backend.py`；B：`cuda_graph.py`、`attn_ffn_piecewise.py`、`graph_holders.py`、`custom_register.py`、`module_dispatch_ops.py`；C：`compiler_inferface.py`、`graph_marker*.py`。
 
 **读完应能回答**
 - ATOM 如何算出能分配多少 KV block？比 nano-vllm 多扣了哪些显存？
@@ -260,7 +262,7 @@ C 级示例：
 | 6a 基础算子 | `linear.py`（`LinearBase` 与 Column / Row / QKV / Merged 并行层；量化分支展开 BF16、FP8）、`embed_head.py`、`layernorm.py`（RMSNorm 主干）、`rotary_embedding.py`、`activation.py`、`communication_op.py` | `utils.py`、`base_config.py`、`triton_rmsnorm_nw.py`；`linear.py` 中 Qwen3-Next / MiniMax 专用的并行层 |
 | 6b 量化 | `quant_spec.py` | `quantization/quark/utils.py`、`blockscale.py`、`blockscale_kernels/*`、`triton_fused_qkv_quant.py` |
 | 6c 注意力 | `utils/selector.py`、`base_attention.py`、`paged_attention.py`、`attention_mha.py`（`PagedAttentionImpl`）、`attentions/backends.py`、`attentions/aiter_attention.py`、`attentions/mha_kv_pool.py` | `triton_mha.py`、`triton_merge_attn_states.py`；`SparseMHAPagedAttentionImpl`、FlyDSL plan、ubatch |
-| 6d dense 模型 | `models/registry.py`、`models/utils.py`、`models/qwen3.py` | `llama.py`、`mistral3.py`、`eagle3_llama.py`、`fused_aux_rmsnorm.py` |
+| 6d dense 模型 | `models/utils.py`、`models/qwen3.py`；模型注册表 `support_model_arch_dict`（v0.1.8 中位于 `model_runner.py`） | `llama.py`、`mistral3.py`、`eagle3_llama.py`、`fused_aux_rmsnorm.py` |
 
 **读完应能回答**
 - Column / Row 并行如何搭配，使每层只需一次 all-reduce？
@@ -277,7 +279,7 @@ C 级示例：
 | 小节 | A 级 | B 级 |
 |---|---|---|
 | 7a MoE 与专家并行 | `moe.py`（`FusedMoE`、`UnquantizedFusedMoEMethod`、`Fp8MoEMethod`、`moe_forward`；MXFP4 / NVFP4 等量化方法做 B 级）、`topK.py`、`qwen3_moe.py` | `fused_moe_triton.py`、`fused_moe/*`（modular kernel、MORI / RCCL 的 dispatch 与 combine、all2all）、`eplb.py`、`mixtral.py` |
-| 7b MLA 与 DeepSeek-V3 | `attention_mla.py`（V3 dense 路径：权重吸收、prefill 用 MHA 形式、decode 用 MQA 形式）、`attentions/aiter_mla.py`、`deepseek_v2.py`、`deepseek_mtp.py` | `triton_mla.py`、`triton_fused_mla_ctx_kv.py`、`mla_kv_pool.py`、`sparse_mla_head_groups.py`、`fused_mtp_prologue.py`、`eagle3_deepseek_mla.py` |
+| 7b MLA 与 DeepSeek-V3 | `attention_mla.py`（V3 dense 路径：权重吸收、prefill 用 MHA 形式、decode 用 MQA 形式）、`attentions/aiter_mla.py`、`deepseek_v2.py`、`deepseek_mtp.py` | `triton_mla.py`、`triton_fused_mla_ctx_kv.py`、`mla_kv_pool.py`、`fused_mtp_prologue.py`、`eagle3_deepseek_mla.py` |
 | 7c 投机解码框架 | `spec_decode/drafter.py`、`eagle_proposer.py`、`rejection_sampler.py` | `draft_graph.py`、`draft_kv.py`、`dspark_proposer.py`、`dspark_scheduler.py`、`dspark_verify.py`、`calibration.py`、`dspark_markov_sample.py`、`models/dspark_draft.py` |
 | 7d DSA 稀疏索引器（V3.2 / GLM-5） | — | `model_ops/indexer/*`、`sparse_indexer_*.py`、`fp4_mqa_ragged_metadata.py`；`deepseek_v2.py` 中的 `Indexer` |
 | 7e 其他 MoE 模型 | — | `glm4_moe.py` 及其 MTP、`gpt_oss.py`、`swiglu_oai.py`、`minimax_m2.py`、`mimo_v2.py` 及其 MTP、`kimi_k25.py` |
@@ -299,8 +301,8 @@ C 级示例：
 | 小节 | 内容 | B 级重点（其余为 C） |
 |---|---|---|
 | 8a 线性注意力与混合架构（38 个文件） | Qwen3-Next、Qwen3.5 的 Gated DeltaNet（GDN）；FLA 的 chunk / recurrent kernel；Mamba 的 causal conv1d | `qwen3_next.py`、`qwen3_next_mtp.py`、`qwen3_5.py`、`attention_gdn.py`、`attentions/gdn_attn.py`、`fla_ops/chunk.py`、`fla_ops/fused_recurrent.py` |
-| 8b DeepSeek-V4 / V4.1（80 个文件） | 压缩稀疏注意力（CSA）、hash 路由、V4 kernel 集、V4.1 的分页 runtime 与 Engram | `deepseek_v4/__init__.py`、`deepseek_v4_mtp.py`、`deepseek_v41/{model,runtime,attention,moe}.py`、`attentions/deepseek_v4_attn.py`、`attentions/deepseek_v41/{backend,cache}.py`、`v4_kernels/paged_decode.py`（作为 Triton kernel 的阅读示范）、`engram/host.py` |
-| 8c Kimi-K3 / MiniMax-M3 / GLM-5.x / Qwen4-exp（44 个文件） | KDA + MLA 混合、attention residual、MiniMax-M3 稀疏注意力与索引器 CP、GLM-5.x kpool、Qwen4-exp 的 QSA 与 hyper-connection | `kimi_k3/model.py`、`attentions/kimi_mla_gdn_attn.py`、`minimax_m3/model.py`、`model_ops/minimax_m3/sparse_attn.py`、`glm5_next.py`、`glm5_next/kpool.py`、`qwen4_exp.py`、`attentions/qwen4_exp_attn.py` |
+| 8b DeepSeek-V4 / V4.1（77 个文件） | 压缩稀疏注意力（CSA）、hash 路由、V4 kernel 集、V4.1 的分页 runtime 与 Engram | `deepseek_v4.py`、`deepseek_v4_mtp.py`、`deepseek_v41/{model,runtime,attention,moe}.py`、`attentions/deepseek_v4_attn.py`、`attentions/deepseek_v41/{backend,cache}.py`、`v4_kernels/paged_decode.py`（作为 Triton kernel 的阅读示范）、`engram/host.py` |
+| 8c Kimi-K3 / MiniMax-M3 / GLM-5.x / Qwen4-exp（40 个文件） | KDA + MLA 混合、attention residual、MiniMax-M3 稀疏注意力与索引器 CP、GLM-5.x kpool、Qwen4-exp 的 QSA 与 hyper-connection | `kimi_k3/model.py`、`attentions/kimi_mla_gdn_attn.py`、`minimax_m3/model.py`、`model_ops/minimax_m3/sparse_attn.py`、`glm5_next.py`、`glm5_next/kpool.py`、`qwen4_exp.py`、`attentions/qwen4_exp_attn.py` |
 
 **读完应能回答**
 - GDN 线性注意力的状态是什么形状？prefill 用 chunk 算法、decode 用 recurrent 算法的原因是什么？
@@ -315,9 +317,9 @@ C 级示例：
 
 | 小节 | 内容 | B 级重点（其余为 C） |
 |---|---|---|
-| 9a Mono 融合 decode（164 个文件） | `atom/mono/` 的公共机制（TP 共识、peer memory、mailbox、按宽度构建、编译与 trace 校验）与各模型的 `mono/` 目录 | `mono/runtime/*`、`mono/plan/*`、`mono/weights/{layer,config}.py`、`mono/dsa_indexer/{runner,dispatch,plan}.py`、各模型的 `mono/{runner,dispatch,plan,contract}.py`、`deepseek_v41/mono/*_plan.py` |
+| 9a Mono 融合 decode（115 个文件） | `atom/mono/` 的公共机制（TP 共识、peer memory、mailbox、按宽度构建、编译与 trace 校验）与各模型的 `mono/` 目录 | `mono/runtime/*`、`mono/plan/*`、`mono/weights/{layer,config}.py`、`mono/dsa_indexer/{runner,dispatch,plan}.py`、各模型的 `mono/{runner,dispatch,plan,contract}.py`、`deepseek_v41/mono/*_plan.py` |
 | 9b 并行扩展（17 个文件） | 流水线并行（PP）与动态分块 prefill、decode / prefill 上下文并行（DCP / PCP）、two-batch overlap（TBO） | `pp_engine_core.py`、`distributed/pp_*.py`、`dynamic_chunking*.py`、`dcp_utils.py`、`pcp_utils.py`、`dcp_ops.py`、`tbo/ubatching.py`、`tbo/ubatch_splitting.py`、`utils/distributed/utils.py` |
-| 9c PD 分离与 KV offload（75 个文件） | prefill / decode 分离（Mooncake、MoRI-IO 传输）；KV offload 到 CPU 或 Mooncake Store（dense / hybrid / mp 三种实现） | `disagg_types.py`、`disaggregation/{base,factory,types,aggregator}.py`、`mooncake_connector.py`、`moriio_connector.py`、`offload/{connector,config,_offload_common,chunked_scheduler}.py`、`offload/dense/connector.py` |
+| 9c PD 分离与 KV offload（73 个文件） | prefill / decode 分离（Mooncake、MoRI-IO 传输）；KV offload 到 CPU 或 Mooncake Store（dense / hybrid / mp 三种实现） | `disagg_types.py`、`disaggregation/{base,factory,types,aggregator}.py`、`mooncake_connector.py`、`moriio_connector.py`、`offload/{connector,config,_offload_common,chunked_scheduler}.py`、`offload/dense/connector.py` |
 
 本批也回头补全第 2 至 5 批里标记为 `【分支】` 的入口：`PrefillEngineCore` / `DecodeEngineCore`、调度器的 `_connector_*`、BlockManager 的 offload 与 remote prefix。
 
@@ -334,12 +336,12 @@ C 级示例：
 
 | 小节 | 内容 | B 级重点（其余为 C） |
 |---|---|---|
-| 10a 插件公共层（6 个文件） | 插件模式的配置转换与注册 | `plugin/{register,prepare,config}.py` |
-| 10b vLLM 插件（59 个文件） | platform 注册、模型包装、注意力适配，以及各模型的 bridge 与补丁 | `vllm/{register,platform,model_wrapper}.py`、`vllm/attention/{backend,metadata,layer_mha,layer_mla}.py` |
-| 10c SGLang 插件（64 个文件） | 注意力 backend、模型包装、forward context 转换、TBO 适配 | `sglang/{register,prepare}.py`、`models/base_model_wrapper.py`、`full_attention/full_attention_backend.py`、`runtime/forward_context.py` |
-| 10d RTP-LLM 插件（22 个文件） | 同上，面向 RTP-LLM | `models/base_model_wrapper.py`、`utils/forward_context.py`、`rtp_full_attention.py` |
+| 10a 插件公共层（5 个文件） | 插件模式的配置转换与注册 | `plugin/{register,prepare,config}.py` |
+| 10b vLLM 插件（58 个文件） | platform 注册、模型包装、注意力适配，以及各模型的 bridge 与补丁 | `vllm/{register,platform,model_wrapper}.py`、`vllm/attention/{backend,metadata,layer_mha,layer_mla}.py` |
+| 10c SGLang 插件（63 个文件） | 注意力 backend、模型包装、forward context 转换、TBO 适配 | `sglang/{register,prepare}.py`、`models/base_model_wrapper.py`、`full_attention/full_attention_backend.py`、`runtime/forward_context.py` |
+| 10d RTP-LLM 插件（16 个文件） | 同上，面向 RTP-LLM | `models/base_model_wrapper.py`、`utils/forward_context.py`、`rtp_full_attention.py` |
 | 10e RL rollout（7 个文件） | 给 RL 训练框架用的异步引擎、权重热更新、显存释放与恢复 | `async_engine.py`、`weight_updater.py`、`weight_sync.py` |
-| 10f 可观测性与工具（25 个文件） | Prometheus 指标、tracing、serving 压测、dump / compare 调试工具 | `metrics/exporter.py`、`observability/tracing.py`、`benchmarks/benchmark_serving.py`、`debug_helper/{dump,compare}.py` |
+| 10f 可观测性与工具（23 个文件） | Prometheus 指标、tracing、serving 压测、dump / compare 调试工具 | `metrics/exporter.py`、`benchmarks/benchmark_serving.py`、`debug_helper/{dump,compare}.py` |
 | 10g diffusion 子系统（29 个文件） | 视频 + 音频生成，和 LLM 引擎平级：无 KV cache，固定步数去噪，单请求序列并行（Ulysses） | `diffusion/{pipeline,attention,ulysses}.py`、`engine/*`、`entrypoints/diffusion_server.py`、`models/minimax_h3/{pipeline,denoise,dit}.py` |
 
 **读完应能回答**
@@ -353,6 +355,9 @@ C 级示例：
 ## 4. 跨批备注（注释过程中发现、后续批次要交叉引用的事实）
 
 ### 来自第 1 批
+
+（这些备注整理于把分支换到 v0.1.8 之前，个别细节和行号在 v0.1.8 中可能不同，引用前先核对。）
+
 
 - **`kv_cache_block_size` 会被按模型改写**：DeepSeek-V4 改成 256，GLM-5.3 改成 `index_kpool × 16`，V4.1 改成 128（`config.py` 中 `Config.__post_init__` 的第 12、13 步）。调度器、BlockManager、ModelRunner 看到的都是改写后的值；DCP 的 `interleave_size` 检查发生在改写之前。→ 第 3、4、5、8 批
 - **`Config.num_kvcache_blocks` 初始为 -1**：EngineCore 用 `ModelRunner.get_num_blocks` 的结果回填（`engine_core.py`），之后才构造 Scheduler / BlockManager。→ 第 2、4、5 批

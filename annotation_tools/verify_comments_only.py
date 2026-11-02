@@ -1,13 +1,20 @@
 """Check that annotated files differ from git HEAD only in comments/whitespace.
 
-Usage: python verify.py file1.py file2.py ...   (paths relative to repo root)
-AST (which carries docstrings but not comments) must be identical to HEAD's.
+Usage: python verify_comments_only.py [--base REF] file1.py file2.py ...
+AST (which carries docstrings but not comments) must be identical to REF's
+(default HEAD). Use --base <upstream commit> to check annotations against the
+unannotated original, e.g. after a rebase.
 """
 import ast, subprocess, sys
 
+args = sys.argv[1:]
+base = "HEAD"
+if args[:1] == ["--base"]:
+    base, args = args[1], args[2:]
+sys.argv[1:] = args
 bad = 0
 for f in sys.argv[1:]:
-    old = subprocess.run(["git", "show", f"HEAD:{f}"], capture_output=True, text=True, check=True).stdout
+    old = subprocess.run(["git", "show", f"{base}:{f}"], capture_output=True, text=True, check=True).stdout
     new = open(f).read()
     a, b = ast.dump(ast.parse(old)), ast.dump(ast.parse(new))
     added = sum(1 for l in new.splitlines() if l.strip().startswith("#")) - sum(

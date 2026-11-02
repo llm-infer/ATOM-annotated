@@ -1,5 +1,5 @@
 """Assign every atom/*.py to a batch/section and a depth tier; emit the checklist."""
-import collections, fnmatch, glob, sys
+import collections, fnmatch, glob, subprocess, sys
 
 SECTIONS = [  # (section id, title, patterns) -- first match wins, order = reading order
  ("X",  "不修改：FlyDSL 上游代码（须与上游保持字节一致）", ["atom/models/glm52/mono/kernels/*"]),
@@ -29,7 +29,8 @@ SECTIONS = [  # (section id, title, patterns) -- first match wins, order = readi
  ("5e", "CUDA Graph 与 torch.compile", ["atom/utils/decorators.py", "atom/utils/backends.py",
         "atom/utils/cuda_piecewise_backend.py", "atom/utils/compiler_inferface.py", "atom/utils/region_graph.py",
         "atom/utils/graph_marker*.py", "atom/utils/graph_holders.py", "atom/utils/custom_register.py",
-        "atom/model_ops/module_dispatch_ops.py", "atom/distributed/nccl_watchdog.py"]),
+        "atom/model_ops/module_dispatch_ops.py", "atom/distributed/nccl_watchdog.py",
+        "atom/utils/cuda_graph.py", "atom/utils/attn_ffn_piecewise.py"]),
  ("6a", "基础算子与张量并行", ["atom/model_ops/__init__.py", "atom/model_ops/base_config.py", "atom/model_ops/utils.py",
         "atom/model_ops/linear.py", "atom/model_ops/embed_head.py", "atom/model_ops/layernorm.py",
         "atom/model_ops/rotary_embedding.py", "atom/model_ops/activation.py", "atom/model_ops/communication_op.py",
@@ -60,7 +61,7 @@ SECTIONS = [  # (section id, title, patterns) -- first match wins, order = readi
         "atom/model_ops/split_chunk.py", "atom/model_ops/triton_fused_qkv_norm_rope_cache.py",
         "atom/model_ops/triton_fused_sigmoid_mul_quant.py", "atom/model_ops/triton_gemma_rmsnorm.py",
         "atom/model_ops/triton_mrope.py", "atom/models/qwen3_next*.py", "atom/models/qwen3_5*.py"]),
- ("8b", "DeepSeek-V4 / V4.1", ["atom/models/deepseek_v4/*", "atom/models/deepseek_v4_*.py", "atom/models/deepseek_v41/*",
+ ("8b", "DeepSeek-V4 / V4.1", ["atom/models/deepseek_v4.py", "atom/models/deepseek_v4/*", "atom/models/deepseek_v4_*.py", "atom/models/deepseek_v41/*",
         "atom/model_ops/v4_kernels/*", "atom/model_ops/deepseek_v41/*", "atom/model_ops/sparse_attn_v4.py",
         "atom/model_ops/quant_v4.py", "atom/model_ops/v4_backend_gate.py", "atom/model_ops/triton_hash_topk.py",
         "atom/model_ops/triton_mm_topk.py", "atom/model_ops/attentions/deepseek_v4*.py",
@@ -122,7 +123,7 @@ B_IN_LATE = [  # batches 8-10 default to C; these rise to B
  "atom/model_ops/attentions/gdn_attn.py", "atom/model_ops/fla_ops/chunk.py", "atom/model_ops/fla_ops/fused_recurrent.py",
  "atom/models/qwen3_next_mtp.py",
  # 8b
- "atom/models/deepseek_v4/__init__.py", "atom/models/deepseek_v4_mtp.py", "atom/models/deepseek_v41/model.py",
+ "atom/models/deepseek_v4/__init__.py", "atom/models/deepseek_v4.py", "atom/models/deepseek_v4_mtp.py", "atom/models/deepseek_v41/model.py",
  "atom/models/deepseek_v41/runtime.py", "atom/models/deepseek_v41/attention.py", "atom/models/deepseek_v41/moe.py",
  "atom/model_ops/attentions/deepseek_v4_attn.py", "atom/model_ops/attentions/deepseek_v41/backend.py",
  "atom/model_ops/attentions/deepseek_v41/cache.py", "atom/model_ops/v4_kernels/paged_decode.py",
@@ -166,8 +167,18 @@ B_IN_LATE = [  # batches 8-10 default to C; these rise to B
 
 m = lambda f, pats: any(fnmatch.fnmatch(f, p) for p in pats)
 files = sorted(glob.glob("atom/**/*.py", recursive=True))
-lines = {f: sum(1 for _ in open(f)) for f in files}
-code = {f: sum(1 for l in open(f) if l.strip()) for f in files}
+# Usage: gen_checklist.py OUT.md [--base REF]; with --base, line counts come from the
+# unannotated upstream REF (files absent there fall back to the working tree).
+BASE = sys.argv[sys.argv.index("--base") + 1] if "--base" in sys.argv else None
+def _text(f):
+    if BASE:
+        r = subprocess.run(["git", "show", f"{BASE}:{f}"], capture_output=True, text=True)
+        if r.returncode == 0:
+            return r.stdout
+    return open(f).read()
+_src = {f: _text(f) for f in files}
+lines = {f: len(_src[f].splitlines()) for f in files}
+code = {f: sum(1 for l in _src[f].splitlines() if l.strip()) for f in files}
 sec_of = {}; idx_of = {}
 for f in files:
     for sid, _, pats in SECTIONS:
@@ -185,7 +196,9 @@ def tier(f):
     if b <= 7: return "C" if m(f, C_IN_EARLY) else "B"
     return "B" if m(f, B_IN_LATE) else "C"
 missing_A = [f for f in A if f not in files]
-assert not missing_A, missing_A
+if missing_A:
+    print("A-tier files absent in this tree:", missing_A)
+A = [f for f in A if f in files]
 
 titles = {sid: t for sid, t, _ in SECTIONS if t}
 order = [s for s, t, _ in SECTIONS if t and s != "X"] + ["X"]
