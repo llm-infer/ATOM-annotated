@@ -16,13 +16,25 @@
 # limitations under the License.
 """Qwen3.5-MoE model configuration"""
 
+# 【译】Qwen3.5-MoE模型配置
+#
+# 本文件是qwen3_5.py的MoE版本：Qwen3_5MoeTextConfig、Qwen3_5MoeVisionConfig、Qwen3_5MoeConfig，
+#   与dense版逐字段对应，只是文本配置把dense FFN（intermediate_size）换成了MoE的一组字段
+#   共有字段（layer_types、linear_*、RoPE、v4覆盖问题等）的解释见qwen3_5.py，这里只注释差异
+# 调用方：models/qwen3_5.py用Qwen3_5MoeTextConfig做类型标注并再导出Qwen3_5MoeConfig；
+#   与dense版一样，仓库里没有地方直接实例化这些类，运行时的hf_config来自config.get_hf_config
+# 【分支】MoE层（FusedMoE、专家并行）见第7批；Qwen3.5模型实现见第8批
 from transformers.configuration_utils import PretrainedConfig, layer_type_validation
 
 
+# MoE文本模型配置（model_type="qwen3_5_moe_text"），对应config.json里的text_config；默认值只是占位
 class Qwen3_5MoeTextConfig(PretrainedConfig):
     model_type = "qwen3_5_moe_text"
     keys_to_ignore_at_inference = ["past_key_values"]
 
+    # HF的张量并行方案（ATOM运行时不读）：experts.gate_up_proj是"packed_colwise"，
+    #   说明HF把所有专家的gate/up权重打包成一个张量；ATOM加载时用detect_fused_expert_format区分
+    #   这种打包格式（Qwen3.5 BF16）和逐专家存储的格式（Qwen3.5 FP8），见models/qwen3_5.py
     base_model_tp_plan = {
         "layers.*.self_attn.q_proj": "colwise",
         "layers.*.self_attn.k_proj": "colwise",
@@ -75,6 +87,7 @@ class Qwen3_5MoeTextConfig(PretrainedConfig):
         eos_token_id=None,
         **kwargs,
     ):
+        # 与qwen3_5.py相同：允许rope_parameters里出现M-RoPE的mrope_section / mrope_interleaved
         kwargs["ignore_keys_at_rope_validation"] = {
             "mrope_section",
             "mrope_interleaved",
@@ -95,6 +108,7 @@ class Qwen3_5MoeTextConfig(PretrainedConfig):
         self.rope_parameters = rope_parameters
         kwargs.setdefault("partial_rotary_factor", 0.25)
 
+        # 与qwen3_5.py相同：按full_attention_interval（默认4）生成"3层GDN + 1层全注意力"的层类型表
         self.layer_types = layer_types
         if self.layer_types is None:
             interval_pattern = kwargs.get("full_attention_interval", 4)
@@ -109,11 +123,17 @@ class Qwen3_5MoeTextConfig(PretrainedConfig):
         layer_type_validation(self.layer_types, self.num_hidden_layers)
 
         # linear attention part
+        # 【译】线性注意力部分
         self.linear_conv_kernel_dim = linear_conv_kernel_dim
         self.linear_key_head_dim = linear_key_head_dim
         self.linear_value_head_dim = linear_value_head_dim
         self.linear_num_key_heads = linear_num_key_heads
         self.linear_num_value_heads = linear_num_value_heads
+        # MoE字段：
+        #   moe_intermediate_size：每个路由专家FFN的中间维度
+        #   shared_expert_intermediate_size：共享专家（每个token都会经过）的中间维度
+        #   num_experts_per_tok：每个token激活的专家数（top-k，默认8）；num_experts：路由专家总数（默认256）
+        #   output_router_logits / router_aux_loss_coef：训练时的路由辅助损失，推理用不到
         self.moe_intermediate_size = moe_intermediate_size
         self.shared_expert_intermediate_size = shared_expert_intermediate_size
         self.num_experts_per_tok = num_experts_per_tok
@@ -124,12 +144,15 @@ class Qwen3_5MoeTextConfig(PretrainedConfig):
         # Set these AFTER super().__init__() because transformers v4's
         # PretrainedConfig.__init__ has these as explicit params with different
         # defaults (e.g. tie_word_embeddings=True) that would overwrite our values.
+        # 【译】这些字段要在super().__init__()之后设置，因为transformers v4的PretrainedConfig.__init__
+        #   把它们作为显式参数，且默认值不同（例如tie_word_embeddings=True），会覆盖我们的值。
         self.pad_token_id = pad_token_id
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
         self.tie_word_embeddings = tie_word_embeddings
 
 
+# 视觉编码器配置，字段与Qwen3_5VisionConfig完全相同（见qwen3_5.py），只是model_type为"qwen3_5_moe"
 class Qwen3_5MoeVisionConfig(PretrainedConfig):
     model_type = "qwen3_5_moe"
     base_config_key = "vision_config"
@@ -166,6 +189,8 @@ class Qwen3_5MoeVisionConfig(PretrainedConfig):
         self.initializer_range = initializer_range
 
 
+# 顶层多模态配置（model_type="qwen3_5_moe"），结构与Qwen3_5Config相同
+#   同样只处理dict和None两种vision_config / text_config输入
 class Qwen3_5MoeConfig(PretrainedConfig):
     model_type = "qwen3_5_moe"
     sub_configs = {
@@ -201,6 +226,7 @@ class Qwen3_5MoeConfig(PretrainedConfig):
         self.vision_end_token_id = vision_end_token_id
         super().__init__(**kwargs)
         # Set after super().__init__() to avoid v4 PretrainedConfig overwrite
+        # 【译】在super().__init__()之后设置，避免被transformers v4的PretrainedConfig覆盖
         self.tie_word_embeddings = tie_word_embeddings
 
 

@@ -16,12 +16,25 @@
 # limitations under the License.
 """Qwen3-Next model configuration"""
 
+# 【译】Qwen3-Next模型配置
+#
+# 本文件给Qwen3-Next定义HF配置类Qwen3NextConfig（改编自transformers / vLLM，见文件头版权行）
+# Qwen3-Next = 混合注意力 + MoE：默认每4层里前3层是Gated DeltaNet线性注意力、第4层是全注意力（默认带输出门attn_output_gate），
+#   FFN是"路由专家 + 共享专家"的MoE；它也是Qwen3.5（qwen3_5.py）的结构基础
+# 调用方：
+#   models/qwen3_next.py、models/qwen3_next_mtp.py：用它标注atom_config.hf_config的类型
+#   plugin/vllm/models/qwen3_next.py：同样只做类型标注
+# 运行时的hf_config：config.get_hf_config里_CONFIG_REGISTRY把"qwen3_next"映射到transformers自带的同名配置类，
+#   仓库里没有地方直接实例化本类；这里的类主要说明有哪些字段、默认值是什么
+# 对比nano-vllm：nano-vllm的Qwen3只有全注意力和dense FFN；这里的linear_*、MoE字段都是它没有的
+# 【分支】GDN线性注意力和Qwen3-Next模型实现见第8批；MoE见第7批
 from transformers.configuration_utils import PretrainedConfig, layer_type_validation
 from transformers.utils import logging
 
 logger = logging.get_logger(__name__)
 
 
+# Qwen3-Next的配置类；docstring是HF风格的完整参数说明，中文译文在docstring之后
 class Qwen3NextConfig(PretrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`Qwen3NextModel`]. It is used to instantiate a
@@ -159,7 +172,83 @@ class Qwen3NextConfig(PretrainedConfig):
     ```
     """  # noqa: E501
 
+    # 【译】这是用来保存[`Qwen3NextModel`]配置的配置类，用于按指定参数实例化Qwen3-Next模型、定义模型架构。
+    #   用默认值实例化，会得到与Qwen3-Next-80B-A3B-Instruct
+    #   [Qwen/Qwen3-Next-80B-A3B-Instruct](https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct)相近的配置。
+    #
+    #   配置对象继承自[`PretrainedConfig`]，可用来控制模型输出。更多信息请阅读[`PretrainedConfig`]的文档。
+    #
+    #   参数：
+    #     vocab_size（`int`，可选，默认151936）：模型词表大小，决定`inputs_ids`能表示多少种不同的token。
+    #     hidden_size（`int`，可选，默认2048）：隐藏表示的维度。
+    #     intermediate_size（`int`，可选，默认5632）：MLP表示的维度。
+    #     num_hidden_layers（`int`，可选，默认48）：Transformer编码器中的隐藏层数。
+    #     num_attention_heads（`int`，可选，默认16）：Transformer编码器中每个注意力层的注意力头数。
+    #     num_key_value_heads（`int`，可选，默认2）：实现分组查询注意力（GQA）所用的key_value头数。
+    #       若`num_key_value_heads=num_attention_heads`，模型使用多头注意力（MHA）；若`num_key_value_heads=1`，
+    #       使用多查询注意力（MQA）；否则使用GQA。把多头checkpoint转换为GQA checkpoint时，每组的key和value头
+    #       应由该组内所有原始头做均值池化得到。详见[这篇论文](https://arxiv.org/pdf/2305.13245.pdf)。
+    #       未指定时默认为`32`。
+    #     hidden_act（`str`，可选，默认`"silu"`）：解码器中的非线性激活函数。
+    #     max_position_embeddings（`int`，可选，默认32768）：模型可能用到的最大序列长度。
+    #     initializer_range（`float`，可选，默认0.02）：初始化所有权重矩阵所用截断正态分布的标准差。
+    #     rms_norm_eps（`float`，可选，默认1e-06）：RMS归一化层使用的epsilon。
+    #     use_cache（`bool`，可选，默认`True`）：模型是否返回最后的key/value注意力（并非所有模型都使用）。
+    #       仅在`config.is_decoder=True`时有意义。
+    #     tie_word_embeddings（`bool`，可选，默认`False`）：输入和输出词嵌入是否共享权重。
+    #     rope_parameters（`dict`，可选）：RoPE嵌入的缩放配置字典。注意：如果采用新的rope类型，并希望模型能处理
+    #       更长的`max_position_embeddings`，建议相应地更新该值。期望的内容：
+    #         `rope_theta`（`float`）：RoPE嵌入的基础周期。
+    #         `rope_type`（`str`）：要使用的RoPE子变体，可取['default', 'linear', 'dynamic', 'yarn', 'longrope',
+    #           'llama3']之一，'default'是原始RoPE实现。
+    #         `factor`（`float`，可选）：除'default'外的所有rope类型都会用到，是施加在RoPE嵌入上的缩放因子。
+    #           多数缩放类型中，因子x能让模型处理长度为x * 原始预训练最大长度的序列。
+    #         `original_max_position_embeddings`（`int`，可选）：'dynamic'、'longrope'和'llama3'使用，
+    #           表示预训练时的原始最大位置嵌入数。
+    #         `attention_factor`（`float`，可选）：'yarn'和'longrope'使用，是施加在注意力计算上的缩放因子。
+    #           未指定时默认取实现推荐的值，用`factor`字段推断建议值。
+    #         `beta_fast`（`float`，可选）：仅'yarn'使用。线性斜坡函数中设定外推（仅外推）边界的参数。未指定时默认32。
+    #         `beta_slow`（`float`，可选）：仅'yarn'使用。线性斜坡函数中设定内插（仅内插）边界的参数。未指定时默认1。
+    #         `short_factor`（`List[float]`，可选）：仅'longrope'使用。施加在短上下文
+    #           （< `original_max_position_embeddings`）上的缩放因子。必须是数字列表，长度等于hidden size除以注意力头数再除以2
+    #         `long_factor`（`List[float]`，可选）：仅'longrope'使用。施加在长上下文
+    #           （< `original_max_position_embeddings`）上的缩放因子。必须是数字列表，长度等于hidden size除以注意力头数再除以2
+    #         `low_freq_factor`（`float`，可选）：仅'llama3'使用。施加在RoPE低频分量上的缩放因子
+    #         `high_freq_factor`（`float`，可选）：仅'llama3'使用。施加在RoPE高频分量上的缩放因子
+    #         `partial_rotary_factor`（`float`，可选，默认0.25）：query和key中施加旋转嵌入的部分所占比例。
+    #     attention_bias（`bool`，可选，默认`False`）：自注意力的query、key、value和输出投影层是否使用偏置。
+    #     attention_dropout（`float`，可选，默认0.0）：注意力概率的dropout比例。
+    #     head_dim（`int`，可选，默认256）：多头注意力中投影权重的维度。
+    #     linear_conv_kernel_dim（`int`，可选，默认4）：线性注意力层中所用卷积的核大小。
+    #     linear_key_head_dim（`int`，可选，默认128）：线性注意力中每个key头的维度。
+    #     linear_value_head_dim（`int`，可选，默认128）：线性注意力中每个value头的维度。
+    #     linear_num_key_heads（`int`，可选，默认16）：线性注意力层使用的key头数。
+    #     linear_num_value_heads（`int`，可选，默认32）：线性注意力层使用的value头数。
+    #     decoder_sparse_step（`int`，可选，默认1）：MoE层出现的频率。
+    #     moe_intermediate_size（`int`，可选，默认512）：路由专家的中间维度。
+    #     shared_expert_intermediate_size（`int`，可选，默认512）：共享专家的中间维度。
+    #     num_experts_per_tok（`int`，可选，默认10）：每个token选中的专家数。
+    #     num_experts（`int`，可选，默认512）：路由专家的数量。
+    #     norm_topk_prob（`bool`，可选，默认`True`）：是否对topk概率做归一化。
+    #     output_router_logits（`bool`，可选，默认`False`）：模型是否返回路由器logits。开启后模型还可以输出
+    #       辅助损失，包括负载均衡损失和路由器z-loss。
+    #     router_aux_loss_coef（`float`，可选，默认0.001）：辅助损失在总损失中的系数。
+    #     mlp_only_layers（`list[int]`，可选，默认`[]`）：指定哪些层使用Qwen3NextMLP而不是Qwen3NextSparseMoeBlock。
+    #       列表里是层下标，有num_layers层时取值0到num_layers-1。若`mlp_only_layers`为空，则用`decoder_sparse_step`决定稀疏性。
+    #     layer_types（`list[str]`，可选）：每一层的类型（注意力或线性注意力）。
+    #
+    #   示例（transformers中的用法）：
+    #     from transformers import Qwen3NextModel, Qwen3NextConfig
+    #     configuration = Qwen3NextConfig()        # 初始化一个Qwen3Next风格的配置
+    #     model = Qwen3NextModel(configuration)    # 用Qwen3-Next-80B-A3B风格的配置初始化模型
+    #     configuration = model.config             # 读取模型的配置
+    #
+    # 补充：上文"Transformer编码器"是HF文档模板的原话，Qwen3-Next实际是decoder-only模型
+    # ATOM怎么用这些MoE字段（models/qwen3_next.py）：第i层不在mlp_only_layers里、num_experts>0、
+    #   且(i+1) % decoder_sparse_step == 0时用Qwen3NextSparseMoeBlock，否则用dense的Qwen3NextMLP
     model_type = "qwen3_next"
+    # keys_to_ignore_at_inference、base_model_tp_plan、base_model_pp_plan是HF transformers的约定写法，ATOM运行时不读取
+    #   ATOM的张量并行由自己的并行Linear实现（第6批），流水线并行见第9批
     keys_to_ignore_at_inference = ["past_key_values"]
 
     base_model_tp_plan = {
@@ -218,6 +307,8 @@ class Qwen3NextConfig(PretrainedConfig):
         layer_types=None,
         **kwargs,
     ):
+        # 与Qwen3.5不同，这里先调用super().__init__再设置各字段，所以不存在"被父类默认值覆盖"的问题
+        #   tie_word_embeddings显式传给父类；其余通用字段在kwargs里，由父类设成属性
         if mlp_only_layers is None:
             mlp_only_layers = []
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
@@ -233,9 +324,14 @@ class Qwen3NextConfig(PretrainedConfig):
         self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache
         # Try to set `rope_scaling` if available, otherwise use `rope_parameters`
+        # 【译】如果有`rope_scaling`就用它，否则使用`rope_parameters`
+        # 背景：旧版config.json把RoPE配置写在rope_scaling字段，新版transformers改名为rope_parameters；两种都兼容
+        # 注意：super().__init__(**kwargs)已经先看过kwargs（会把rope_theta等设成属性）；这里再从同一个dict里pop只是为了读值
         rope_scaling = kwargs.pop("rope_scaling", None)
         rope_parameters = rope_scaling or rope_parameters or {"rope_type": "default"}
         rope_theta = kwargs.pop("rope_theta", 10000.0)
+        # 把rope_theta和partial_rotary_factor补进rope_parameters：models/qwen3_next.py的Qwen3NextAttention
+        #   只从rope_parameters里读它们（rotary_dim = head_dim * partial_rotary_factor，默认只旋转前1/4维）
         if "rope_theta" not in rope_parameters:
             rope_parameters["rope_theta"] = rope_theta
         partial_rotary_factor = kwargs.pop("partial_rotary_factor", 0.25)
@@ -247,6 +343,8 @@ class Qwen3NextConfig(PretrainedConfig):
         self.attention_dropout = attention_dropout
         self.head_dim = head_dim
 
+        # layer_types没给时：第i层满足(i+1)%4==0时是全注意力，其余是线性注意力（48层时第3、7、...、47层是全注意力）
+        # 这里调用layer_type_validation没传num_hidden_layers；Qwen3.5版本传了，会额外检查列表长度
         self.layer_types = layer_types
         if self.layer_types is None:
             self.layer_types = [
@@ -256,6 +354,9 @@ class Qwen3NextConfig(PretrainedConfig):
         layer_type_validation(self.layer_types)
 
         # linear attention part
+        # 【译】线性注意力部分
+        # 线性注意力（GDN）层的形状：q/k/v先过长度为linear_conv_kernel_dim的短因果卷积；
+        #   默认16个k头、32个v头，即每个q/k头被2个v头共享
         self.linear_conv_kernel_dim = linear_conv_kernel_dim
         self.linear_key_head_dim = linear_key_head_dim
         self.linear_value_head_dim = linear_value_head_dim
@@ -263,6 +364,7 @@ class Qwen3NextConfig(PretrainedConfig):
         self.linear_num_value_heads = linear_num_value_heads
 
         # MoE arguments
+        # 【译】MoE参数
         self.decoder_sparse_step = decoder_sparse_step
         self.moe_intermediate_size = moe_intermediate_size
         self.shared_expert_intermediate_size = shared_expert_intermediate_size

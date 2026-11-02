@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+# 【导读】离线profiling示例：建引擎、预热一次，然后在torch profiler包裹下跑一批请求，导出kernel trace
+# 用法：python -m atom.examples.profile_offline --model <model> --bs 8 --input-length 128 --output-length 32 [--random-input]
+# 调用方：开发者手动运行；结构与simple_inference.py（本批）相同，只多了start_profile / stop_profile两步
+# 与主干的关系：LLMEngine.start_profile经CoreManager向每个EngineCore广播"start_profile"工具命令，
+#   最终由每个ModelRunner.start_profiler打开torch.profiler，trace按rank写到--torch-profiler-dir/<rank名>/下（见第2批、第5批）
 import argparse
 import random
 from transformers import AutoTokenizer
@@ -41,10 +46,13 @@ parser.add_argument(
 )
 
 
+# 主流程：解析参数 -> 建引擎 -> 构造prompt -> 预热 -> start_profile -> generate(bs个相同prompt) -> stop_profile -> 打印输出
 def main():
     args = parser.parse_args()
 
     # Set default torch_profiler_dir to current directory if not provided
+    # 【译】如果没给torch_profiler_dir，默认用当前目录
+    # 必须在from_cli_args之前设置：Config里torch_profiler_dir为None时ModelRunner不建profiler目录，start_profiler就什么也不做
     if args.torch_profiler_dir is None:
         args.torch_profiler_dir = "./profiler_traces"
         print(
@@ -64,6 +72,7 @@ def main():
         ]
         prompt = tokenizer.decode(random_token_ids, skip_special_tokens=True)
         # Re-encode to verify and truncate to exact length
+        # 【译】重新编码以校验，并截断到精确长度
         token_ids = tokenizer.encode(prompt, add_special_tokens=False)[
             : args.input_length
         ]
@@ -80,6 +89,7 @@ def main():
     )
 
     # TODO: remove warm up and skip cuda capture process in engine while profiling.
+    # 【译】TODO：profiling时去掉预热，并跳过引擎里的cuda graph捕获过程。
     print("Warming up...")
     _ = llm.generate(["warmup"], sampling_params)
     print("Warm up done")
@@ -91,6 +101,7 @@ def main():
     llm.start_profile()
 
     # Create batch of prompts based on batch size
+    # 【译】按batch size构造一批prompt
     prompts = [prompt] * args.bs
     print(f"Processing batch of {args.bs} requests...")
 

@@ -10,23 +10,23 @@
 
 ### 1 入口、配置与请求对象
 
-- [ ] **A** `atom/examples/simple_inference.py`（96 行）
-- [ ] **A** `atom/model_engine/arg_utils.py`（950 行）
-- [ ] **A** `atom/config.py`（2995 行）
-- [ ] **A** `atom/sampling_params.py`（160 行）
-- [ ] **A** `atom/model_engine/sequence.py`（653 行）
-- [ ] **A** `atom/model_engine/request.py`（17 行）
-- [ ] **B** `atom/__init__.py`（33 行）
-- [ ] **B** `atom/examples/multimodal_inference.py`（119 行）
-- [ ] **B** `atom/utils/envs.py`（1386 行）
-- [ ] **B** `atom/utils/arg_parser.py`（44 行）
-- [ ] **B** `atom/utils/__init__.py`（1123 行）
-- [ ] **B** `atom/model_config/kimi_k25.py`（175 行）
-- [ ] **B** `atom/model_config/qwen3_5.py`（195 行）
-- [ ] **B** `atom/model_config/qwen3_5_moe.py`（207 行）
-- [ ] **B** `atom/model_config/qwen3_next.py`（277 行）
-- [ ] **C** `atom/examples/profile_offline.py`（119 行）
-- [ ] — `atom/model_config/__init__.py`（0 行）
+- [x] **A** `atom/examples/simple_inference.py`（96 行）
+- [x] **A** `atom/model_engine/arg_utils.py`（950 行）
+- [x] **A** `atom/config.py`（2995 行）
+- [x] **A** `atom/sampling_params.py`（160 行）
+- [x] **A** `atom/model_engine/sequence.py`（653 行）
+- [x] **A** `atom/model_engine/request.py`（17 行）
+- [x] **B** `atom/__init__.py`（33 行）
+- [x] **B** `atom/examples/multimodal_inference.py`（119 行）
+- [x] **B** `atom/utils/envs.py`（1386 行）
+- [x] **B** `atom/utils/arg_parser.py`（44 行）
+- [x] **B** `atom/utils/__init__.py`（1123 行）
+- [x] **B** `atom/model_config/kimi_k25.py`（175 行）
+- [x] **B** `atom/model_config/qwen3_5.py`（195 行）
+- [x] **B** `atom/model_config/qwen3_5_moe.py`（207 行）
+- [x] **B** `atom/model_config/qwen3_next.py`（277 行）
+- [x] **C** `atom/examples/profile_offline.py`（119 行）
+- [x] — `atom/model_config/__init__.py`（0 行）
 
 ## 第 2 批：引擎主循环、多进程架构与服务层（62 个文件，25,208 行）
 

@@ -16,11 +16,32 @@
 # limitations under the License.
 """Qwen3.5 model configuration"""
 
+# 【译】Qwen3.5模型配置
+#
+# 本文件给Qwen3.5（dense版，多模态）定义HF配置类：Qwen3_5TextConfig（文本）、Qwen3_5VisionConfig（视觉）、
+#   Qwen3_5Config（顶层），改编自transformers / vLLM的同名配置（见文件头版权行）
+# Qwen3.5的文本部分是混合架构：默认每4层里前3层是线性注意力（Gated DeltaNet，GDN），第4层是全注意力，
+#   所以除了常规注意力字段，还多了一组linear_*字段描述线性注意力层；结构与Qwen3-Next（qwen3_next.py）相同
+# 调用方：
+#   models/qwen3_5.py：用Qwen3_5TextConfig做类型标注，并把Qwen3_5Config再导出给vLLM插件
+#   plugin/vllm/models/qwen3_5.py：从models/qwen3_5.py导入Qwen3_5Config做类型标注
+# 注意：仓库里没有地方直接实例化这些类。原生路径的hf_config来自config.get_hf_config：
+#   model_type="qwen3_5"时抽出config.json里的text_config，交给transformers的AutoConfig.for_model构造（见本批config.py）
+#   所以这里的类主要充当类型标注和"有哪些字段"的说明
+# 对比nano-vllm：nano-vllm只支持Qwen3，直接用AutoConfig；ATOM要支持transformers未必内置的新模型，才有model_config/这个目录
+# 【分支】Qwen3.5模型实现与GDN线性注意力见第8批
 from transformers.configuration_utils import PretrainedConfig, layer_type_validation
 
 
+# 文本模型配置（model_type="qwen3_5_text"），对应config.json里的text_config
+#   下面的默认值只是占位，实际值都从checkpoint的config.json读入
 class Qwen3_5TextConfig(PretrainedConfig):
     model_type = "qwen3_5_text"
+    # 以下几个类属性是HF transformers的约定写法，ATOM运行时不读取它们：
+    #   keys_to_ignore_at_inference：HF推理时从模型输出里忽略的键
+    #   base_model_tp_plan：HF自带的张量并行切分方案（colwise按列切、rowwise按行切）；ATOM用自己的并行Linear（第6批）
+    #   base_model_pp_plan：HF的流水线并行方案；ATOM的PP见第9批
+    #   base_config_key：说明本类在顶层配置里对应哪个键（"text_config"）
     keys_to_ignore_at_inference = ["past_key_values"]
 
     base_model_tp_plan = {
@@ -68,6 +89,8 @@ class Qwen3_5TextConfig(PretrainedConfig):
         eos_token_id=None,
         **kwargs,
     ):
+        # 告诉transformers的RoPE参数校验：rope_parameters里的mrope_section / mrope_interleaved是允许的额外键
+        #   M-RoPE（多模态RoPE）把旋转维度分给时间、高、宽三种位置，图文混排的输入要用它
         kwargs["ignore_keys_at_rope_validation"] = {
             "mrope_section",
             "mrope_interleaved",
@@ -87,8 +110,11 @@ class Qwen3_5TextConfig(PretrainedConfig):
         self.attention_dropout = attention_dropout
         self.head_dim = head_dim
         self.rope_parameters = rope_parameters
+        # partial_rotary_factor=0.25：只对head_dim的前1/4做RoPE；用setdefault写进kwargs，在super().__init__(**kwargs)里成为配置属性
         kwargs.setdefault("partial_rotary_factor", 0.25)
 
+        # layer_types：每层是"linear_attention"还是"full_attention"；config.json没给时按full_attention_interval（默认4）生成
+        #   第i层满足(i+1)%4==0时是全注意力。例：32层时第3、7、11、...、31层是全注意力，其余是GDN线性注意力
         self.layer_types = layer_types
         if self.layer_types is None:
             interval_pattern = kwargs.get("full_attention_interval", 4)
@@ -100,9 +126,14 @@ class Qwen3_5TextConfig(PretrainedConfig):
                 )
                 for i in range(self.num_hidden_layers)
             ]
+        # layer_type_validation（transformers提供）：检查每项取值合法，并检查列表长度等于num_hidden_layers
         layer_type_validation(self.layer_types, self.num_hidden_layers)
 
         # linear attention part
+        # 【译】线性注意力部分
+        # linear_conv_kernel_dim：GDN层里q/k/v先过一个短因果卷积，这是卷积核长度
+        # linear_num_key_heads / linear_num_value_heads：默认16个k头、32个v头，即每个q/k头被2个v头共享
+        # linear_key_head_dim / linear_value_head_dim：线性注意力每个头的维度
         self.linear_conv_kernel_dim = linear_conv_kernel_dim
         self.linear_key_head_dim = linear_key_head_dim
         self.linear_value_head_dim = linear_value_head_dim
@@ -112,12 +143,17 @@ class Qwen3_5TextConfig(PretrainedConfig):
         # Set these AFTER super().__init__() because transformers v4's
         # PretrainedConfig.__init__ has these as explicit params with different
         # defaults (e.g. tie_word_embeddings=True) that would overwrite our values.
+        # 【译】这些字段要在super().__init__()之后设置，因为transformers v4的PretrainedConfig.__init__
+        #   把它们作为显式参数，且默认值不同（例如tie_word_embeddings=True），会覆盖我们的值。
         self.pad_token_id = pad_token_id
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
         self.tie_word_embeddings = tie_word_embeddings
 
 
+# 视觉编码器（ViT）配置；model_type与顶层相同（"qwen3_5"），靠base_config_key="vision_config"表明自己是子配置
+#   patch_size=16：图片切成16x16的patch；spatial_merge_size=2：相邻2x2个patch合并成1个视觉token
+#   temporal_patch_size=2：视频按2帧一组切patch；out_hidden_size：视觉特征输出维度，需与文本hidden_size对齐
 class Qwen3_5VisionConfig(PretrainedConfig):
     model_type = "qwen3_5"
     base_config_key = "vision_config"
@@ -154,6 +190,8 @@ class Qwen3_5VisionConfig(PretrainedConfig):
         self.initializer_range = initializer_range
 
 
+# 顶层多模态配置（model_type="qwen3_5"），对应checkpoint的整个config.json
+#   sub_configs：HF的子配置声明，告诉transformers vision_config / text_config分别用哪个类解析
 class Qwen3_5Config(PretrainedConfig):
     model_type = "qwen3_5"
     sub_configs = {
@@ -173,6 +211,8 @@ class Qwen3_5Config(PretrainedConfig):
         tie_word_embeddings=False,
         **kwargs,
     ):
+        # vision_config / text_config：是dict时用对应的子配置类构造；是None时用默认值
+        #   代码本身只处理这两种情况：传入已构造好的配置对象时，这里不会给self.vision_config / self.text_config赋值
         if isinstance(vision_config, dict):
             self.vision_config = self.sub_configs["vision_config"](**vision_config)
         elif vision_config is None:
@@ -183,12 +223,14 @@ class Qwen3_5Config(PretrainedConfig):
         elif text_config is None:
             self.text_config = self.sub_configs["text_config"]()
 
+        # image_token_id / video_token_id：prompt里图片、视频占位token；vision_start / vision_end：视觉段的起止标记token
         self.image_token_id = image_token_id
         self.video_token_id = video_token_id
         self.vision_start_token_id = vision_start_token_id
         self.vision_end_token_id = vision_end_token_id
         super().__init__(**kwargs)
         # Set after super().__init__() to avoid v4 PretrainedConfig overwrite
+        # 【译】在super().__init__()之后设置，避免被transformers v4的PretrainedConfig覆盖
         self.tie_word_embeddings = tie_word_embeddings
 
 
