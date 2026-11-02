@@ -3,6 +3,15 @@
 
 """Text completion handler for the OpenAI-compatible API."""
 
+# 【译】OpenAI兼容API的文本补全处理器。
+#
+# 本文件（第2批2c，B级）：/v1/completions 的响应构造（接口函数在api_server.completions）
+#   结构与serving_chat.py相同，但更简单：没有chat template、没有推理内容分离、没有工具调用解析，
+#   生成的文本原样放进choices[i].text
+#   流式：stream_completion_response（n=1）、stream_completion_response_fanout（n>1）
+#   非流式：build_completion_response / build_completion_response_multi
+# 流式帧序列：若干 {"choices": [{"text": "...", "finish_reason": null}]}
+#   → 最后一次发送里：最后一段文本帧 + 带finish_reason的空文本帧 + usage帧 + [DONE]
 import logging
 import time
 from collections.abc import AsyncGenerator
@@ -20,6 +29,7 @@ from .streaming_dispatch import StreamOutputCollector
 logger = logging.getLogger("atom")
 
 
+# 构造一帧text_completion并编码成SSE；extra_fields会加到帧的顶层（例如PD分离的kv_transfer_params）
 def create_completion_chunk(
     request_id: str,
     model: str,
@@ -40,6 +50,13 @@ def create_completion_chunk(
     on the terminal one, so a single response reported `max_tokens` in a place
     clients do not read and `stop` in the place they do.
     """
+    # 【译】创建一个SSE格式的文本补全chunk。
+    #
+    #   index 决定 choices[0].index；扇出的兄弟序列共用一个SSE流，靠这个字段区分。
+    #
+    #   finish_reason 只属于结束chunk，不出现在别处，并且已经由 openai_stop_reason 翻译过。这里的两条流式路径以前在每个
+    #   "内容"chunk上传引擎自己的词，却在结束chunk上硬编码 "stop"，于是同一个响应在客户端不读的地方报告 max_tokens，
+    #   在客户端读的地方报告 stop。
     chunk = {
         "id": request_id,
         "object": TEXT_COMPLETION_OBJECT,
@@ -60,6 +77,8 @@ def create_completion_chunk(
     return data_frame(chunk)
 
 
+# 流式文本补全（n=1）。调用方：api_server.completions，交给StreamingResponse(_client_stream(gen))
+# 每个chunk产出一帧文本；finished时把最后一帧文本、结束帧、usage帧和[DONE]拼在一起发出；finally里清理
 async def stream_completion_response(
     request_id: str,
     model: str,
@@ -75,6 +94,10 @@ async def stream_completion_response(
     num_prompt_tokens``); reusing it avoids re-tokenizing the prompt on the
     event loop at stream start.
     """
+    # 【译】生成流式的文本补全响应。
+    #
+    #   num_prompt_tokens 是引擎算出的prompt长度（Sequence.num_prompt_tokens）；复用它可以避免在流开始时
+    #   在事件循环上重新tokenize prompt。
     num_tokens_input = num_prompt_tokens
     num_tokens_output = 0
 
@@ -82,12 +105,16 @@ async def stream_completion_response(
     # disconnect the generator is closed (GeneratorExit) before we get there,
     # so the finally below aborts the still-running seq; on normal completion
     # we flip this to False and skip the (no-op) abort.
+    # 【译】在引擎的finished chunk到达之前都假定是abort。客户端断开时，生成器会在那之前被关闭（GeneratorExit），
+    #   于是下面的finally会abort仍在运行的序列；正常结束时我们把它改成False，跳过（本来就是空操作的）abort。
     aborted = True
     # The engine's own word, kept for the terminal chunk. It arrives on the
     # chunk that reports `finished`, which is not the frame it belongs on.
+    # 【译】引擎自己的词，留给结束chunk用。它随报告 finished 的那个chunk到达，而那一帧并不是它该出现的地方。
     engine_reason: str | None = None
     try:
         while True:
+            # chunk_data：{"text": 已反分词的新增文本, "token_ids": [...], "finished": ..., "finish_reason": ..., ...}
             chunk_data = await stream_collector.get()
             new_text = chunk_data["text"]
             num_tokens_output += len(chunk_data.get("token_ids", []))
@@ -101,16 +128,21 @@ async def stream_completion_response(
                 request_id,
                 model,
                 new_text,
+                # 【译】（行尾注释）由结束chunk携带它
                 finish_reason=None,  # the terminal chunk carries it
                 **extra_fields,
             )
 
             if chunk_data.get("finished", False):
+                # 正常结束：引擎已经结束了这条序列，不需要abort
                 aborted = False
                 # Coalesce the finalization SSE messages (content + stop + usage
                 # + [DONE]) into a single send. At a wave boundary many requests
                 # finish simultaneously; collapsing 4 sends/req to 1 cuts the
                 # per-request socket-write syscalls that saturate the API loop.
+                # 【译】把收尾的几条SSE消息（content + stop + usage + [DONE]）合并成一次发送。在一波请求的边界上很多请求同时结束；
+                #   把每个请求4次发送合成1次，能减少那些把API事件循环打满的逐请求socket写系统调用。
+                # 注意：这里的usage没有prompt_tokens_details（前缀缓存命中数），chat路径有
                 usage_chunk = {
                     "id": request_id,
                     "object": TEXT_COMPLETION_OBJECT,
@@ -138,16 +170,19 @@ async def stream_completion_response(
 
             yield content_chunk
     finally:
+        # 正常结束时aborted为False，只做登记清理；客户端断开时为True，cleanup_stream会向引擎发abort
         cleanup_stream(seq_id, aborted=aborted)
         cleanup_request(request_id)
 
 
+# 非流式、n=1：把generate_async的结果dict组装成CompletionResponse；finish_reason经openai_stop_reason翻译
 def build_completion_response(
     request_id: str,
     model: str,
     final_output: dict[str, Any],
 ) -> CompletionResponse:
     """Build a non-streaming text completion response (single choice)."""
+    # 【译】构造一个非流式的文本补全响应（单个choice）。
     response = CompletionResponse(
         id=request_id,
         created=int(time.time()),
@@ -179,12 +214,14 @@ def build_completion_response(
     return response
 
 
+# 非流式、n>1：每个兄弟一个choice；usage里completion token数求和，ttft/tpot/latency取各兄弟的最大值
 def build_completion_response_multi(
     request_id: str,
     model: str,
     final_outputs: list[dict[str, Any]],
 ) -> CompletionResponse:
     """Build a non-streaming response with one choice per fan-out sibling."""
+    # 【译】构造一个非流式响应，每个扇出的兄弟序列一个choice。
     assert final_outputs, "build_completion_response_multi requires at least one output"
     choices = [
         {
@@ -218,6 +255,7 @@ def build_completion_response_multi(
         },
     )
     # Sibling outputs share the first output's prompt IDs.
+    # 【译】兄弟输出共用第一个输出的prompt ID。
     if "prompt_token_ids" in final_outputs[0]:
         response = response.model_copy(
             update={"prompt_token_ids": final_outputs[0]["prompt_token_ids"]}
@@ -225,6 +263,7 @@ def build_completion_response_multi(
     return response
 
 
+# 流式、n>1：从共享collector取(兄弟序号, chunk)，以choices[0].index=兄弟序号逐帧发出；全部finished后一次性发结束帧
 async def stream_completion_response_fanout(
     request_id: str,
     model: str,
@@ -244,6 +283,12 @@ async def stream_completion_response_fanout(
     siblings; reusing it avoids re-tokenizing on the event loop at stream
     start.
     """
+    # 【译】流式变体：把 len(seq_ids) 个兄弟序列复用到一个SSE流里。
+    #
+    #   从 shared_collector 取出的每个chunk都是 (sibling_index, chunk_data) 元组；我们以 choices[0].index = sibling_index 重新发出。
+    #   只有当每个兄弟都报告了 finished=True 时才结束。
+    #
+    #   num_prompt_tokens 是引擎算出的、所有兄弟共用的prompt长度；复用它可以避免在流开始时在事件循环上重新tokenize。
     n = len(seq_ids)
     num_tokens_input = num_prompt_tokens
     num_tokens_output = [0] * n
@@ -253,6 +298,8 @@ async def stream_completion_response_fanout(
     # Assume abort until every sibling has reported finished; a client
     # disconnect closes the generator first, leaving this True so the finally
     # aborts whichever siblings are still running.
+    # 【译】在每个兄弟都报告finished之前都假定是abort；客户端断开会先关闭生成器，这个标志保持True，
+    #   finally就会abort所有仍在运行的兄弟。
     aborted = True
     try:
         while not all(finished):
@@ -271,6 +318,7 @@ async def stream_completion_response_fanout(
                 request_id,
                 model,
                 new_text,
+                # 【译】（行尾注释）由结束chunk携带它
                 finish_reason=None,  # the terminal chunk carries it
                 index=idx,
                 **extra_fields,
@@ -296,6 +344,7 @@ async def stream_completion_response_fanout(
             "usage": usage,
         }
         # Coalesce the per-sibling stop chunks + usage + [DONE] into one send.
+        # 【译】把每个兄弟的停止chunk + usage + [DONE] 合并成一次发送。
         yield (
             "".join(
                 create_completion_chunk(

@@ -370,3 +370,27 @@ C 级示例：
 - **ATOM 的序列在第一次被调度做 prefill 时就变成 RUNNING**（`_schedule_prefill_seq`），chunked prefill 未完成的序列留在 running 中由 Phase 1 继续，这一点与 nano-vllm 不同。→ 第 3 批
 - **`envs.py` 的值不缓存**：每次访问 `envs.X` 都重新读 `os.environ`；热路径通常在模块导入时把值存成常量，所以这类开关必须在启动前设置。→ 所有批次
 - 已发现的“注释与代码不符”（均已在注释中用“解释：”标出，代码未改）：`multimodal_inference.py` 的 “Force eager mode” 实际只设置了 `cudagraph_capture_sizes="[1]"`；`cuda_graph_sizes` 的 docstring 描述的是 vLLM 的规则；`CUDAGraphMode.NONE` 在原生 runner 中没有单独的判断，真正关闭捕获的是 `enforce_eager`。
+
+### 来自第 2 批
+
+- **AsyncIOProc 的回包规则**（`async_proc.py` 的 `busy_loop` / `call_func`）：runner 方法返回 None 时不回包，`wait_out=True` 调用它会卡住；所有 `call_func` 共用一个 FIFO，不等结果的调用必须返回 None，否则下一个等待的调用会拿到它的返回值。→ 第 5 批
+- **只有 TP rank 0 有主输出通道**：每个 rank 都执行 forward，但只有 rank 0 的结果回到 EngineCore，其余 rank 的返回值被丢弃。→ 第 5 批
+- **进程数是 TP × PCP**（不乘 PP：PP 的每个 stage 是独立的 EngineCore）。→ 第 5、9 批
+- **SIGTERM 的处理链**：AsyncIOProcManager 的 `init_exit_handler` 替换了 EngineCore 的 SIGTERM 处理，先走 `manager.exit()` 再走 EngineCore 的 `exit()`。→ 第 9 批
+- **前缀 hash 链在前端计算**：`ship_prompt_hash_chain`（受 `ATOM_FRONTEND_PREFIX_HASH` 控制），hash block 大小 = block_size × DCP；`_per_req_cache_model_types` 是 `has_per_req_cache` 的唯一来源，ModelRunner 启动时会核对。→ 第 4 批
+- **停止条件**：EOS 从 `stop_token_ids` 中去掉，所以调度器分别报告 "eos" 和 "stop_<id>"；stop 字符串用 `add_special_tokens=False` 分词后按 token 匹配，分词方式不同的文本匹配不到。→ 第 3 批
+- **在线服务绕过了 `LLMEngine.add_request` / `postprocess`**，自己从 `io_processor.requests` 中取结果。→ 第 2c 节
+- **调度器每步的输入输出**（`engine_core.py` 的 `_process_engine_step_inner`）：`schedule()` 返回 `(ScheduledBatch, {seq_id: Sequence})`，没有请求时返回 None；被拒绝的序列通过 `take_rejected()` 取出并作为已结束推送；只有 `req_ids` 非空时才调用 `postprocess(seqs.values(), fwd_out, stream_output_queue=…, batch=…)`；STREAM 输出总是排在已结束列表之前，CoreManager 的输出线程依赖这个顺序；新请求只在每轮循环开头通过 `scheduler.extend()` 进入调度器，调度器只被 busy_loop 线程访问。→ 第 3 批
+- **EngineCore 启动时对 ModelRunner 的调用顺序**：`get_num_blocks` → `allocate_kv_cache(num_blocks)` → （可选）`profile_dynamic_chunking` → `capture_cudagraph`（返回 cost、sizes、pool_bytes）→ `freeze_gc_heap`；`num_kvcache_blocks` 只回填到 EngineCore 自己的 Config 副本，主进程的 Config 仍是 -1（所以 READY 消息要带上 `max_pool_tokens`）；每一步调用 `forward(batch)`（`wait_out=True`），拿到 rank 0 的 `ScheduledBatchOutput`。→ 第 5 批
+- **DP dummy 执行**：只要任一 DP rank 有工作，空闲 rank 就调用 `dummy_execution`；全局变为空闲后还会多跑一步；DP 下 `PrefillDelayer` 挂在 gloo 组上，在 `schedule()` 内部做跨 DP 的 all_reduce。→ 第 3、5 批
+- **`--enable-dp-attention` 的配置改写**（v0.1.8 `engine_core_mgr.py` 约 584-596 行）：在 `iter_dp_rank_assignments` 已经按原 `-tp` 算完之后原地修改共享 Config：`data_parallel_size *= tp`，`data_parallel_size_local` 改为本地引擎数，多机时 `data_parallel_rank *= tp`，`tensor_parallel_size = 1`。→ 第 7、9 批
+- **在线服务的结果通道**：只走 `seq.stream_callback` + `_flush_stream_batch_fn`（由 api_server 接上）；DP 负载计数在第一次 STREAM 输出时释放 prefill token 的计费（`_mark_seq_prefill_complete`）；RL 使用 `collective_rpc`、`weight_sync_session` 和 FINISH/DISCARD 协议。在线路径上没有人调用 `get_output`，`outputs_queue` 中的已结束批次会一直堆积（疑似泄漏，注释中只陈述事实）。→ 第 10 批
+- **流式结果从引擎线程交给事件循环的机制**（`api_server.py`）：回调只把 chunk 存进 `StreamBatchDispatcher` 的 `threading.local` 列表；一个 step 的回调结束后，输出线程调用 `flush_stream_batch`，每个事件循环做一次 `call_soon_threadsafe(_deliver, items)`；反分词在事件循环里的 `StreamOutputCollector.get()` 中完成。非流式请求不走 dispatcher，每次回调直接 `call_soon_threadsafe(token_queue.put_nowait, ...)`。api_server 把 `engine.core_mgr._flush_stream_batch_fn` 设为 `flush_stream_batch`，离线运行时它为 None。→ 第 10 批
+- **客户端断开**：`cleanup_stream(aborted=True)` 或 `generate_async` 的 finally 调用 `core_mgr.abort_request`，向所有 DP rank 广播 `abort_request` 工具命令，调度器在下一步结束该序列。→ 第 3 批
+- **请求长度上限**：`_validate_pool_capacity` 对超过 `CoreManager.max_pool_tokens`（各 rank READY 消息中的最小值）的 prompt 返回 400；`RequestOutput.num_cached_tokens` 来自 `seq.prefix_cache_hit_tokens`，最终出现在 `usage.prompt_tokens_details.cached_tokens`。→ 第 4、5 批
+- **PD 分离时的 prompt 来源**：`protocol.resolve_prompt_token_ids` 从 `kv_transfer_params["prompt_token_ids"]` 取 prompt id 并跳过 chat template；`_engine_kv_transfer_params` 把它们剥掉后再交给引擎。→ 第 9 批
+- **采样默认值**：chat / completions 用 `protocol.py` 里的默认值（1.0 / -1 / 1.0），不读 `generation_config`；messages / responses 会读。强制投机接受率时，每个 token 的文本被替换成 `"synthetic "`。→ 第 5、7 批
+- **工具调用解析器与模型的对应**：各模型 parser 的文件头用【分支】标出了对应模型，注册名（各 parser 类的 `NAME`）为 `kimi_k3`、`kimi`、`dsml`、`dsml_v41`、`minimax`、`glm`、`qwen`；`kimi_k3_tokens.py` 被 `kimi_k3_tool_parser.py` 和 `reasoning_dialects.py` 共用；`multimodal/processing.py` 的 `expand_media_placeholders` 由 `kimi_k3_vl` 调用；DeepSeek-V4.1 是 `embedding_spans` 的唯一产生者。→ 第 8 批
+- **多模态与前缀缓存**：`multimodal_cache_seed` 参与前缀缓存 hash 链的种子（`block_manager.py`）；`multimodal_runtime.py` 与 `ModelRunner.vision_embeddings` 及 `run_model` 中的 span 路径对应。→ 第 4、5 批
+- **atomesh**：Rust 写的路由网关（同一份构建也是 PyO3 模块 `atomesh_runner`），`USE_ATOMESH_ENTRYPOINTS=1` 时启用；HTTP 由 Rust 处理，只有 chat / completions 进入 Python，没有 `/v1/messages`。→ 第 10 批
+- **TTFT 的口径**：`request_timing.py` 统计的 TTFT 包含预处理时间。→ 第 10 批

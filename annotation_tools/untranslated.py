@@ -9,7 +9,7 @@ Usage: python untranslated.py file1.py ...   Exit 1 if anything is missing.
 """
 import ast, re, sys
 
-CJK = re.compile("[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef\u2500-\u257f]")
+CJK = re.compile("[\u4e00-\u9fff\u3000-\u303f\uff01-\uff5b\uff5d-\uffef\u2500-\u257f]")
 CODE_HINT = re.compile(r"^#\s*(def |class |return\b|self\.|@\w|import |from \w+ import|\w+\s*=\s*\S|\)|\]|if .*:$|else:|for .* in .*:$)")
 PRAGMA = re.compile(r"#\s*(noqa|type:|fmt:|pragma|pylint|SPDX|Copyright|All rights reserved)", re.I)
 bad = 0

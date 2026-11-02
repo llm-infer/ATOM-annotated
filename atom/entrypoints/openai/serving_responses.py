@@ -9,6 +9,25 @@ Responses wire shape on the way out. Same role as ``serving_anthropic.py``
 for ``/v1/messages``.
 """
 
+# 【译】ATOM的OpenAI Responses API适配器，包括Codex的工具形态。
+#
+#   把 POST /v1/responses（以及Codex的 custom / namespace / tool_search 工具）翻译成ATOM内部的chat格式，
+#   返回时再还原成Responses的线上格式。它对 /v1/responses 的作用，与 serving_anthropic.py 对 /v1/messages 的作用相同。
+#
+# 【导读】/v1/responses（OpenAI Responses API，Codex CLI使用的协议）的协议适配层，只做格式转换，不接触引擎
+# 调用方：api_server.py 的 responses_create 路由（@app.post("/v1/responses")）
+# 与主干的关系：与 serving_anthropic.py 同构
+#   请求方向：unsupported_responses_parameter 拒绝本服务不支持的参数（background / previous_response_id / conversation：
+#     服务端不保存历史，对话历史必须放在input里）-> normalize_codex_request 把Codex特有的工具形态改写成普通function工具，
+#     改写记录存进 CodexToolContext -> responses_to_openai_messages / responses_tools_to_openai 转成chat的messages和tools，
+#     之后与 /v1/chat/completions 走同一条 chat template渲染 -> generate_async -> LLMEngine 的路径（本批）
+#   响应方向：引擎输出同样先经推理内容分离（reasoning.py）和工具调用解析器（tool_parser/），得到有序事件
+#     ("reasoning" / "content" / "tool_call_start" / "tool_call_args", 数据)
+#     非流式：serving_anthropic.read_whole_blocks 产出事件 -> build_responses_response 拼成完整的response对象
+#     流式：ResponseStreamEmitter 把事件变成 response.created -> response.output_item.added -> ...delta -> ...done ->
+#       response.completed 这一串SSE事件，最后发 data: [DONE]
+#   两个方向的出口都经过 CodexToolContext.rewrite_*，把function_call还原成Codex原来的 custom_tool_call / tool_search_call
+
 from __future__ import annotations
 
 import copy
@@ -40,9 +59,11 @@ _CONVERSATION_MESSAGE = (
 )
 
 
+# /v1/responses 的请求体模型；extra="allow" 让未声明的字段也能通过校验
 class ResponsesRequest(BaseModel):
     """Loose Responses body. Tools/input stay untyped so Codex shapes parse."""
 
+    # 【译】宽松的Responses请求体。tools / input 不做类型约束，这样Codex的各种形态都能解析通过。
     model_config = ConfigDict(extra="allow")
 
     model: str | None = None
@@ -66,8 +87,13 @@ class ResponsesRequest(BaseModel):
 
 
 # ── Codex tool-shape normalize / restore ────────────────────────────────
+# 【译】── Codex工具形态的归一化 / 还原 ─────────────────────────────────────
 
 
+# normalize_codex_request 留下的改写记录，响应时用它把function调用还原成Codex的形态
+#   kinds：工具名 -> "custom" / "tool_search"（不在表里的就是普通function）
+#   namespaces：工具名 -> 它原本所属的namespace分组名
+#   original_tools：请求里的原始tools，响应的tools字段原样还原
 @dataclass
 class CodexToolContext:
     kinds: dict[str, str] = field(default_factory=dict)
@@ -83,6 +109,7 @@ class CodexToolContext:
     def namespace(self, name: str) -> str | None:
         return self.namespaces.get(name)
 
+    # 还原整个响应：tools字段换回原始tools，output里每个function_call逐个还原
     def rewrite_response(self, response: dict) -> None:
         if self.original_tools is not None:
             response["tools"] = copy.deepcopy(self.original_tools)
@@ -92,6 +119,8 @@ class CodexToolContext:
                 if isinstance(item, dict):
                     self.rewrite_output_item(item)
 
+    # 还原一个输出项：custom工具 -> custom_tool_call（参数JSON里的input取回原始文本）；
+    #   tool_search -> tool_search_call（execution固定为client）；普通function只补上namespace
     def rewrite_output_item(self, item: dict) -> None:
         if item.get("type") != "function_call":
             return
@@ -115,8 +144,10 @@ class CodexToolContext:
                 item["namespace"] = namespace
 
 
+# 请求校验：返回不支持的原因（作为400错误信息），支持则返回None
 def unsupported_responses_parameter(body: dict) -> str | None:
     """Why this request cannot run on the Python Responses path, or None."""
+    # 【译】说明这个请求为什么不能在Python的Responses路径上运行；能运行则返回None。
     if body.get("background") is True:
         return _BACKGROUND_MESSAGE
     if body.get("previous_response_id"):
@@ -126,6 +157,8 @@ def unsupported_responses_parameter(body: dict) -> str | None:
     return None
 
 
+# 请求方向的第一步：先改写input里的历史项，再改写tools；顺序重要——
+#   tool_search_output / additional_tools 携带的工具会被追加到all_tools里，随后一起参与工具归一化
 def normalize_codex_request(body: dict) -> tuple[dict, CodexToolContext]:
     """Rewrite Codex tool/history shapes into function calls.
 
@@ -133,6 +166,11 @@ def normalize_codex_request(body: dict) -> tuple[dict, CodexToolContext]:
     response rewrite; it is not stuffed into metadata the way the mesh path
     has to, because nothing here goes through a typed protocol crate.
     """
+    # 【译】把Codex的工具 / 历史形态改写成function调用。
+    #
+    #   原地修改并返回 body。调用方保留 CodexToolContext 用于改写响应；它不像mesh路径那样必须塞进metadata，
+    #   因为这里没有任何东西要经过带类型的协议crate。
+    # 解释：mesh路径指 atomesh 入口（见 atomesh/ 与 atom/mesh 的Rust代码），那里的请求要经过Rust的强类型协议结构
     if not isinstance(body, dict):
         raise ValueError("Responses request must be a JSON object")  # noqa: TRY004
 
@@ -150,6 +188,8 @@ def normalize_codex_request(body: dict) -> tuple[dict, CodexToolContext]:
     return body, context
 
 
+# 改写历史输入项：custom_tool_call / tool_search_call -> function_call，它们的输出 -> function_call_output；
+#   tool_search_output 和 additional_tools 里带的工具追加到all_tools（additional_tools项本身不进历史）
 def _normalize_input_items(items: list, all_tools: list) -> list:
     normalized = []
     for item in items:
@@ -212,6 +252,9 @@ def _normalize_input_items(items: list, all_tools: list) -> list:
     return normalized
 
 
+# 改写工具列表：function原样保留；custom -> 只有一个字符串参数input的function；namespace -> 展开成子工具，
+#   描述前加"[namespace]"；客户端执行的tool_search -> 名为tool_search的function；
+#   web_search_preview / code_interpreter / mcp 原样保留；其余类型丢弃
 def _normalize_tools(tools: list, context: CodexToolContext) -> list[dict]:
     normalized: list[dict] = []
     for tool in tools:
@@ -258,6 +301,7 @@ def _normalize_tools(tools: list, context: CodexToolContext) -> list[dict]:
     return normalized
 
 
+# custom工具 -> function工具：参数固定为 {"input": 字符串}；如果custom工具带grammar格式，把语法定义附加到描述里
 def _custom_as_function(tool: dict, namespace: str | None) -> dict:
     description = tool.get("description") or ""
     if namespace:
@@ -287,6 +331,7 @@ def _custom_as_function(tool: dict, namespace: str | None) -> dict:
     }
 
 
+# 与 _custom_as_function 相反：从模型给出的参数JSON里取出 input 字段，还原成custom工具的原始文本
 def custom_tool_input(arguments: str) -> str:
     try:
         parsed = json.loads(arguments)
@@ -300,6 +345,7 @@ def custom_tool_input(arguments: str) -> str:
     return arguments
 
 
+# tool_search的参数：能解析成JSON就用JSON，否则把原文当作 {"query": 原文}
 def parse_tool_search_arguments(arguments: str) -> Any:
     try:
         return json.loads(arguments)
@@ -307,11 +353,13 @@ def parse_tool_search_arguments(arguments: str) -> Any:
         return {"query": arguments}
 
 
+# 取字典里的字符串字段，不是字符串就返回空串
 def _string_field(value: dict, key: str) -> str:
     field = value.get(key)
     return field if isinstance(field, str) else ""
 
 
+# 任意值 -> 文本：None -> ""，字符串原样，其他尝试json.dumps
 def _value_as_text(value: Any) -> str:
     if value is None:
         return ""
@@ -324,10 +372,14 @@ def _value_as_text(value: Any) -> str:
 
 
 # ── Responses → internal chat ───────────────────────────────────────────
+# 【译】── Responses -> 内部chat格式 ───────────────────────────────────────
 
 
+# Responses的工具是扁平的 {type, name, parameters}，chat template要的是嵌套的 {type, function: {...}}；
+#   只保留type为function的工具，web_search_preview等内置工具不进chat template
 def responses_tools_to_openai(tools: list | None) -> list[dict] | None:
     """Function tools in the nested shape ``apply_chat_template`` expects."""
+    # 【译】把function工具转成 apply_chat_template 期望的嵌套形态。
     if not tools:
         return None
     result = []
@@ -351,8 +403,12 @@ def responses_tools_to_openai(tools: list | None) -> list[dict] | None:
     return result or None
 
 
+# instructions -> system消息；input是字符串时作为一条user消息；是列表时逐项转换：
+#   message -> 对应role的消息，function_call -> 带tool_calls的assistant消息，
+#   function_call_output -> role=tool的消息，reasoning -> 带reasoning_content的assistant消息
 def responses_to_openai_messages(request: ResponsesRequest) -> list[dict]:
     """Convert a (already-normalized) Responses request to OpenAI messages."""
+    # 【译】把一个（已经归一化过的）Responses请求转换成OpenAI消息。
     messages: list[dict] = []
     if request.instructions:
         messages.append({"role": "system", "content": request.instructions})
@@ -427,12 +483,14 @@ def responses_to_openai_messages(request: ResponsesRequest) -> list[dict]:
     return messages
 
 
+# 只认 user / assistant / system 三种role，其他（如developer）一律当作user
 def _role_message(role: str, text: str) -> dict:
     if role in ("user", "assistant", "system"):
         return {"role": role, "content": text}
     return {"role": "user", "content": text}
 
 
+# 把content部件列表里的文本类部件（input_text / output_text / text）拼成一个字符串
 def _content_text(content: Any) -> str:
     if content is None:
         return ""
@@ -456,6 +514,7 @@ def _content_text(content: Any) -> str:
     return str(content)
 
 
+# 把reasoning项的内容部件（reasoning_text / summary_text）用换行拼起来
 def _reasoning_text(content: Any) -> str:
     if isinstance(content, str):
         return content
@@ -470,8 +529,10 @@ def _reasoning_text(content: Any) -> str:
 
 
 # ── Non-streaming response ──────────────────────────────────────────────
+# 【译】── 非流式响应 ─────────────────────────────────────────────────────
 
 
+# 非流式出口：有序事件 -> 完整的response对象（output、usage，以及回显请求里的参数），最后做Codex还原
 def build_responses_response(
     request_id: str,
     model: str,
@@ -485,6 +546,7 @@ def build_responses_response(
     created_at: int | None = None,
 ) -> dict:
     """One Responses object from ordered engine events, then Codex rewrite."""
+    # 【译】由有序的引擎事件构建一个Responses对象，然后做Codex改写。
     output = _output_items_from_events(events, request_id, context)
     response = {
         "id": request_id,
@@ -521,6 +583,8 @@ def build_responses_response(
     return response
 
 
+# 事件 -> output项列表：reasoning事件各成一个reasoning项；相邻的content合并进同一个message项；
+#   tool_call_start只记下id和name，等tool_call_args到来时才生成function_call项
 def _output_items_from_events(
     events: list, request_id: str, context: CodexToolContext
 ) -> list[dict]:
@@ -578,8 +642,10 @@ def _output_items_from_events(
 
 
 # ── Streaming ───────────────────────────────────────────────────────────
+# 【译】── 流式输出 ───────────────────────────────────────────────────────
 
 
+# 流式中一个工具调用的状态：output_index / item_id 在输出项被"added"时分配，参数逐段累加到accumulated_args
 @dataclass
 class _ToolCallState:
     output_index: int = -1
@@ -590,9 +656,16 @@ class _ToolCallState:
     added: bool = False
 
 
+# 流式出口：把有序事件翻译成Responses的SSE事件序列；每个事件带一个递增的sequence_number
+# 关键行为：
+#   推理内容先累积在reasoning_buffer里，等content或工具调用开始、或流结束时，才作为一个完整的reasoning项一次发出（added + done）
+#   文本：第一次出现时发 output_item.added（message）和 content_part.added，之后每段发 output_text.delta
+#   工具调用：call_id和name都已知时才发 output_item.added；普通function的参数逐段发 function_call_arguments.delta，
+#     custom / tool_search 的输入要等结束时才能还原，所以只在 finish_frames 里一次性发出
 class ResponseStreamEmitter:
     """Responses SSE sequence, including Codex custom / tool_search shapes."""
 
+    # 【译】Responses的SSE事件序列，包括Codex的 custom / tool_search 形态。
     def __init__(
         self,
         response_id: str,
@@ -619,6 +692,7 @@ class ResponseStreamEmitter:
         self.completed_items: list[dict] = []
         self.tool_call_items: list[_ToolCallState] = []
 
+    # 开场两帧：response.created 和 response.in_progress
     def opening_frames(self) -> list[str]:
         return [
             self._event(
@@ -650,12 +724,14 @@ class ResponseStreamEmitter:
             ),
         ]
 
+    # 一批引擎事件 -> 若干SSE帧（调用方：api_server.py 的流式循环，process和flush的结果都走这里）
     def frames_for_events(self, events: list) -> list[str]:
         frames: list[str] = []
         for etype, data in events:
             frames.extend(self._on_event(etype, data))
         return frames
 
+    # 结束：发出缓存的推理内容，收尾工具调用或文本消息，然后发 response.completed 和 data: [DONE]
     def finish_frames(
         self,
         *,
@@ -672,6 +748,7 @@ class ResponseStreamEmitter:
         frames.append(STREAM_DONE_MESSAGE)
         return frames
 
+    # error事件：流中途失败时使用，见文件末尾的 stream_failure_frames
     def error_frame(self, message: str, error_type: str = "api_error") -> str:
         return self._event(
             "error",
@@ -684,6 +761,7 @@ class ResponseStreamEmitter:
             },
         )
 
+    # 按事件类型分派；content或工具调用开始前，先把缓存的推理内容作为一个reasoning项发出去
     def _on_event(self, etype: str, data: Any) -> list[str]:
         if etype == "reasoning":
             if not data:
@@ -705,6 +783,7 @@ class ResponseStreamEmitter:
             return self._on_tool_args(data or {})
         return []
 
+    # 文本事件：必要时先打开message项和content part，再发 output_text.delta
     def _on_text(self, text: str) -> list[str]:
         frames: list[str] = []
         if self.current_item_id is None:
@@ -753,6 +832,7 @@ class ResponseStreamEmitter:
         )
         return frames
 
+    # 工具调用开始：按解析器给的index找到（或补齐）状态槽，记下id和name
     def _on_tool_start(self, data: dict) -> list[str]:
         index = int(data.get("index") or 0)
         while len(self.tool_call_items) <= index:
@@ -765,6 +845,7 @@ class ResponseStreamEmitter:
             state.name = fn["name"]
         return self._maybe_add_tool_item(state)
 
+    # 工具参数：累加；普通function的参数在项已added后立即作为delta发出
     def _on_tool_args(self, data: dict) -> list[str]:
         index = int(data.get("index") or 0)
         while len(self.tool_call_items) <= index:
@@ -789,6 +870,8 @@ class ResponseStreamEmitter:
             )
         return frames
 
+    # 第一次同时拿到call_id和name时，分配output_index并发 output_item.added；
+    #   id前缀按种类区分：ctc（custom）/ tsc（tool_search）/ fc（function）；已经累积的参数一并补发
     def _maybe_add_tool_item(self, state: _ToolCallState) -> list[str]:
         if state.added or not state.call_id or not state.name:
             return []
@@ -844,6 +927,8 @@ class ResponseStreamEmitter:
             )
         return frames
 
+    # 结束所有工具调用：先关闭打开的message项；custom还原原始输入并发 custom_tool_call_input.delta/done，
+    #   function发 function_call_arguments.done；每个调用最后发 output_item.done；缺id或name的调用被跳过
     def _finish_tool_calls(self) -> list[str]:
         frames: list[str] = []
         frames.extend(self._close_message_if_open())
@@ -927,6 +1012,7 @@ class ResponseStreamEmitter:
             frames.append(self._output_item_done(state.output_index, item))
         return frames
 
+    # 结束文本消息：output_text.done -> content_part.done -> output_item.done
     def _finish_message(self) -> list[str]:
         frames: list[str] = []
         if self.current_item_id is None:
@@ -973,11 +1059,13 @@ class ResponseStreamEmitter:
         self.current_item_id = None
         return frames
 
+    # 工具调用开始前，如果有打开的message项，先把它结束掉
     def _close_message_if_open(self) -> list[str]:
         if self.current_item_id is None:
             return []
         return self._finish_message()
 
+    # 把缓存的推理内容作为一个完整的reasoning项发出：一次 output_item.added 加一次 output_item.done
     def _flush_reasoning(self) -> list[str]:
         if not self.reasoning_buffer:
             return []
@@ -996,6 +1084,7 @@ class ResponseStreamEmitter:
             self._output_item_done(output_index, item),
         ]
 
+    # response.completed：output取所有已done的项（一个都没有时用累积的文本兜底），并回显请求参数，最后做Codex还原
     def _completed_frame(self, usage: dict | None) -> str:
         output = list(self.completed_items)
         if not output:
@@ -1047,11 +1136,13 @@ class ResponseStreamEmitter:
             },
         )
 
+    # 分配下一个output_index，并生成 "<前缀>_<uuid>" 形式的项id
     def _allocate(self, prefix: str) -> tuple[int, str]:
         index = self.next_output_index
         self.next_output_index += 1
         return index, f"{prefix}_{uuid.uuid4().hex}"
 
+    # response.output_item.added 帧
     def _output_item_added(self, output_index: int, item: dict) -> str:
         return self._event(
             "response.output_item.added",
@@ -1063,6 +1154,7 @@ class ResponseStreamEmitter:
             },
         )
 
+    # response.output_item.done 帧；同时把这一项存进completed_items，供 response.completed 使用
     def _output_item_done(self, output_index: int, item: dict) -> str:
         self.completed_items.append(copy.deepcopy(item))
         return self._event(
@@ -1084,6 +1176,7 @@ class ResponseStreamEmitter:
         return seq
 
 
+# 流式中途抛异常时的收尾帧：[还没发开场帧就补发] -> error -> data: [DONE]（调用方：api_server.py）
 def stream_failure_frames(
     exc: BaseException, emitter: ResponseStreamEmitter, *, opened: bool
 ):
@@ -1093,5 +1186,7 @@ def stream_failure_frames(
     yield STREAM_DONE_MESSAGE
 
 
+# 这一批事件是否产出了一个可用的工具调用（以参数而不是名字为准，含义同 serving_anthropic.completes_a_tool_call）
+# 注意：api_server.py 导入并使用的是 serving_anthropic 里的同名函数，本文件这个版本在 atom/ 内没有调用方
 def completes_a_tool_call(events) -> bool:
     return any(etype == "tool_call_args" for etype, _ in events)

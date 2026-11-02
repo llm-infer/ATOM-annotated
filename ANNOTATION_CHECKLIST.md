@@ -33,69 +33,69 @@
 
 ### 2a 离线引擎与多进程
 
-- [ ] **A** `atom/model_engine/llm_engine.py`（953 行）
-- [ ] **A** `atom/model_engine/engine_core_mgr.py`（2112 行）
-- [ ] **A** `atom/model_engine/engine_core.py`（1507 行）
-- [ ] **A** `atom/model_engine/async_proc.py`（1002 行）
-- [ ] **B** `atom/model_engine/engine_core_protocol.py`（35 行）
-- [ ] **B** `atom/model_engine/ipc_utils.py`（180 行）
-- [ ] **B** `atom/model_engine/engine_utility.py`（850 行）
-- [ ] **B** `atom/utils/network.py`（43 行）
-- [ ] **B** `atom/utils/numa_utils.py`（176 行）
-- [ ] **B** `atom/utils/gc_utils.py`（345 行）
-- [ ] **C** `atom/model_engine/collective_rpc.py`（204 行）
-- [ ] **C** `atom/model_engine/capabilities.py`（128 行）
-- [ ] **C** `atom/model_engine/engine_stats.py`（795 行）
-- [ ] **C** `atom/model_engine/run_labels.py`（105 行）
+- [x] **A** `atom/model_engine/llm_engine.py`（953 行）
+- [x] **A** `atom/model_engine/engine_core_mgr.py`（2112 行）
+- [x] **A** `atom/model_engine/engine_core.py`（1507 行）
+- [x] **A** `atom/model_engine/async_proc.py`（1002 行）
+- [x] **B** `atom/model_engine/engine_core_protocol.py`（35 行）
+- [x] **B** `atom/model_engine/ipc_utils.py`（180 行）
+- [x] **B** `atom/model_engine/engine_utility.py`（850 行）
+- [x] **B** `atom/utils/network.py`（43 行）
+- [x] **B** `atom/utils/numa_utils.py`（176 行）
+- [x] **B** `atom/utils/gc_utils.py`（345 行）
+- [x] **C** `atom/model_engine/collective_rpc.py`（204 行）
+- [x] **C** `atom/model_engine/capabilities.py`（128 行）
+- [x] **C** `atom/model_engine/engine_stats.py`（795 行）
+- [x] **C** `atom/model_engine/run_labels.py`（105 行）
 
 ### 2b 分词与多模态输入
 
-- [ ] **B** `atom/model_engine/multimodal_runtime.py`（139 行）
-- [ ] **B** `atom/multimodal/__init__.py`（33 行）
-- [ ] **B** `atom/multimodal/inputs.py`（103 行）
-- [ ] **B** `atom/multimodal/media/__init__.py`（69 行）
-- [ ] **B** `atom/multimodal/media/connector.py`（36 行）
-- [ ] **B** `atom/multimodal/media/image.py`（31 行）
-- [ ] **B** `atom/multimodal/parse.py`（66 行）
-- [ ] **B** `atom/multimodal/processing.py`（122 行）
-- [ ] **B** `atom/multimodal/registry.py`（105 行）
+- [x] **B** `atom/model_engine/multimodal_runtime.py`（139 行）
+- [x] **B** `atom/multimodal/__init__.py`（33 行）
+- [x] **B** `atom/multimodal/inputs.py`（103 行）
+- [x] **B** `atom/multimodal/media/__init__.py`（69 行）
+- [x] **B** `atom/multimodal/media/connector.py`（36 行）
+- [x] **B** `atom/multimodal/media/image.py`（31 行）
+- [x] **B** `atom/multimodal/parse.py`（66 行）
+- [x] **B** `atom/multimodal/processing.py`（122 行）
+- [x] **B** `atom/multimodal/registry.py`（105 行）
 
 ### 2c OpenAI 兼容服务层
 
-- [ ] **A** `atom/entrypoints/openai/api_server.py`（3092 行）
-- [ ] **A** `atom/entrypoints/openai_server.py`（27 行）
-- [ ] **B** `atom/entrypoints/chat_utils.py`（104 行）
-- [ ] **B** `atom/entrypoints/openai/__init__.py`（17 行）
-- [ ] **B** `atom/entrypoints/openai/chat_encoder_adapters.py`（175 行）
-- [ ] **B** `atom/entrypoints/openai/chat_encoders.py`（312 行）
-- [ ] **B** `atom/entrypoints/openai/protocol.py`（409 行）
-- [ ] **B** `atom/entrypoints/openai/serving_chat.py`（720 行）
-- [ ] **B** `atom/entrypoints/openai/serving_completion.py`（316 行）
-- [ ] **B** `atom/entrypoints/openai/sse.py`（55 行）
-- [ ] **B** `atom/entrypoints/openai/streaming_dispatch.py`（642 行）
-- [ ] **C** `atom/entrypoints/atomesh/atom_standalone_service.py`（1727 行）
-- [ ] **C** `atom/entrypoints/atomesh/server.py`（327 行）
-- [ ] **C** `atom/entrypoints/openai/deepseek_v41_encoder.py`（41 行）
-- [ ] **C** `atom/entrypoints/openai/kimi_k3_tokens.py`（97 行）
-- [ ] **C** `atom/entrypoints/openai/marker_scanner.py`（232 行）
-- [ ] **C** `atom/entrypoints/openai/metrics_setup.py`（28 行）
-- [ ] **C** `atom/entrypoints/openai/reasoning.py`（340 行）
-- [ ] **C** `atom/entrypoints/openai/reasoning_dialects.py`（411 行）
-- [ ] **C** `atom/entrypoints/openai/request_timing.py`（133 行）
-- [ ] **C** `atom/entrypoints/openai/serving_anthropic.py`（615 行）
-- [ ] **C** `atom/entrypoints/openai/serving_responses.py`（1097 行）
-- [ ] **C** `atom/entrypoints/openai/tool_parser/__init__.py`（81 行）
-- [ ] **C** `atom/entrypoints/openai/tool_parser/deepseekv41_tool_parser.py`（38 行）
-- [ ] **C** `atom/entrypoints/openai/tool_parser/deepseekv4_tool_parser.py`（370 行）
-- [ ] **C** `atom/entrypoints/openai/tool_parser/glm_tool_parser.py`（169 行）
-- [ ] **C** `atom/entrypoints/openai/tool_parser/kimi_k3_tool_parser.py`（282 行）
-- [ ] **C** `atom/entrypoints/openai/tool_parser/kimi_tool_parser.py`（196 行）
-- [ ] **C** `atom/entrypoints/openai/tool_parser/minimax_tool_parser.py`（213 行）
-- [ ] **C** `atom/entrypoints/openai/tool_parser/qwen3_tool_parser.py`（189 行）
-- [ ] **C** `atom/entrypoints/openai/tool_parser/registry.py`（247 行）
-- [ ] **C** `atom/entrypoints/openai/tool_parser/schema.py`（106 行）
-- [ ] **C** `atom/entrypoints/openai/tool_parser/stream.py`（786 行）
-- [ ] **C** `atom/entrypoints/openai/tool_parser/tool_parser.py`（487 行）
+- [x] **A** `atom/entrypoints/openai/api_server.py`（3092 行）
+- [x] **A** `atom/entrypoints/openai_server.py`（27 行）
+- [x] **B** `atom/entrypoints/chat_utils.py`（104 行）
+- [x] **B** `atom/entrypoints/openai/__init__.py`（17 行）
+- [x] **B** `atom/entrypoints/openai/chat_encoder_adapters.py`（175 行）
+- [x] **B** `atom/entrypoints/openai/chat_encoders.py`（312 行）
+- [x] **B** `atom/entrypoints/openai/protocol.py`（409 行）
+- [x] **B** `atom/entrypoints/openai/serving_chat.py`（720 行）
+- [x] **B** `atom/entrypoints/openai/serving_completion.py`（316 行）
+- [x] **B** `atom/entrypoints/openai/sse.py`（55 行）
+- [x] **B** `atom/entrypoints/openai/streaming_dispatch.py`（642 行）
+- [x] **C** `atom/entrypoints/atomesh/atom_standalone_service.py`（1727 行）
+- [x] **C** `atom/entrypoints/atomesh/server.py`（327 行）
+- [x] **C** `atom/entrypoints/openai/deepseek_v41_encoder.py`（41 行）
+- [x] **C** `atom/entrypoints/openai/kimi_k3_tokens.py`（97 行）
+- [x] **C** `atom/entrypoints/openai/marker_scanner.py`（232 行）
+- [x] **C** `atom/entrypoints/openai/metrics_setup.py`（28 行）
+- [x] **C** `atom/entrypoints/openai/reasoning.py`（340 行）
+- [x] **C** `atom/entrypoints/openai/reasoning_dialects.py`（411 行）
+- [x] **C** `atom/entrypoints/openai/request_timing.py`（133 行）
+- [x] **C** `atom/entrypoints/openai/serving_anthropic.py`（615 行）
+- [x] **C** `atom/entrypoints/openai/serving_responses.py`（1097 行）
+- [x] **C** `atom/entrypoints/openai/tool_parser/__init__.py`（81 行）
+- [x] **C** `atom/entrypoints/openai/tool_parser/deepseekv41_tool_parser.py`（38 行）
+- [x] **C** `atom/entrypoints/openai/tool_parser/deepseekv4_tool_parser.py`（370 行）
+- [x] **C** `atom/entrypoints/openai/tool_parser/glm_tool_parser.py`（169 行）
+- [x] **C** `atom/entrypoints/openai/tool_parser/kimi_k3_tool_parser.py`（282 行）
+- [x] **C** `atom/entrypoints/openai/tool_parser/kimi_tool_parser.py`（196 行）
+- [x] **C** `atom/entrypoints/openai/tool_parser/minimax_tool_parser.py`（213 行）
+- [x] **C** `atom/entrypoints/openai/tool_parser/qwen3_tool_parser.py`（189 行）
+- [x] **C** `atom/entrypoints/openai/tool_parser/registry.py`（247 行）
+- [x] **C** `atom/entrypoints/openai/tool_parser/schema.py`（106 行）
+- [x] **C** `atom/entrypoints/openai/tool_parser/stream.py`（786 行）
+- [x] **C** `atom/entrypoints/openai/tool_parser/tool_parser.py`（487 行）
 
 ## 第 3 批：调度器（2 个文件，5,885 行）
 

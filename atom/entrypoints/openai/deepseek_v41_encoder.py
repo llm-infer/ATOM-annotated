@@ -7,9 +7,20 @@ Prompt construction stays in the official encoder. These hooks only translate
 ATOM's common controls and attach top-level tool schemas to the system turn.
 """
 
+# 【译】为checkpoint自带的独立V4.1编码器做请求适配。
+#
+#   prompt的构造仍由官方编码器完成。这些钩子只负责翻译ATOM的通用控制参数，并把顶层的工具schema挂到system轮次上。
+#
+# 【导读】DeepSeek-V4.1不用Jinja chat template，而是随checkpoint附带一个Python编码器（encoding_dsv41）；
+#   本文件是这个编码器的两个前处理钩子
+# 调用方：chat_encoder_adapters.py的_PREPARERS["encoding_dsv41"]（只有hf config的model_type为deepseek_v41时才选用），
+#   chat_encoders.py渲染prompt前调用prepare_messages，编码器适配器调用prepare_kwargs
+# 与主干的关系：服务层prompt渲染的一个模型特化分支；【分支】DeepSeek-V4.1模型见第8批
+
 from typing import Any
 
 
+# 复制messages；有tools时挂到第一条system消息上（没有system消息就在开头插入一条只带tools的system消息）
 def prepare_messages(messages: list[dict], tools: list[dict] | None) -> list[dict]:
     prepared = [dict(message) for message in messages]
     if tools:
@@ -20,9 +31,11 @@ def prepare_messages(messages: list[dict], tools: list[dict] | None) -> list[dic
     return prepared
 
 
+# 把通用的thinking_effort改名为V4.1编码器认的reasoning_effort，并校验reasoning_effort / thinking_mode的取值
 def prepare_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
     # Explicit API effort is merged last under the common thinking_effort key;
     # it must also override a native reasoning_effort in template defaults.
+    # 【译】API显式给出的effort最后以通用的thinking_effort键合并进来；它也必须覆盖模板默认值里原生的reasoning_effort。
     if "thinking_effort" in kwargs:
         kwargs["reasoning_effort"] = kwargs.pop("thinking_effort")
     effort = kwargs.get("reasoning_effort")
