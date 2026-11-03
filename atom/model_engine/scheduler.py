@@ -17,6 +17,20 @@ Every scheduler here owns an :class:`~atom.model_engine.engine_stats.EngineStats
 (``self.engine_stats``); the class itself lives in ``engine_stats.py``.
 """
 
+# 【译】批处理prefill与decode请求的调度逻辑。
+#
+#   本模块提供：
+#
+#   - ScheduledBatch：为下一次forward选中的序列的冻结快照，连同它们的block table和元数据。
+#   - ScheduledBatchOutput：一个已完成batch的token级输出。
+#   - Scheduler：主调度循环，管理 waiting 和 running 两个队列，协调block分配，
+#     并与KV分离（disaggregation）connector集成，用于远端prefill/decode。
+#
+#   这里的每个调度器都拥有一个 EngineStats（self.engine_stats）；这个类本身定义在 engine_stats.py。
+# 解释：上面没提到的另外两个调度器 PrefillScheduler / DecodeScheduler 在文件末尾（RapidServe，见下方导读）
+
+# from __future__ import annotations：所有类型注解都推迟求值（PEP 563），注解里可以写运行时并未导入的名字，
+#   例如下面只在TYPE_CHECKING时导入的PrefillDelayer
 from __future__ import annotations
 
 import enum
@@ -61,14 +75,186 @@ from atom.model_engine.state_runtime import (
 )
 from atom.utils import envs
 
+# TYPE_CHECKING在运行时恒为False：这里的导入只给类型检查器看。PrefillDelayer的实例由EngineCore._init_prefill_delayer
+#   创建，再经set_prefill_delayer交给调度器，本文件运行时不需要导入它
 if TYPE_CHECKING:
     from atom.model_engine.prefill_delayer import PrefillDelayer
 
+# =============================================================================================
+# 【导读】scheduler.py：调度器，以及它与ModelRunner之间每步交换的两个数据对象
+# =============================================================================================
+# 一句话：每个engine step，调度器决定"这一步算哪些请求、每条算多少个token"，把决定连同算好的元数据打包成
+#   ScheduledBatch交给ModelRunner；forward之后再根据ScheduledBatchOutput把采样结果写回各条序列、判断谁结束了
+#
+# 在引擎里的位置（单DP；engine_core.py的busy_loop → _process_engine_step_inner，每轮循环是一步）：
+#
+#   EngineCore进程（CPU；只有busy_loop线程碰调度器）           TP worker进程 × TP（各占一张GPU）
+#   ┌──────────────────────────────────────────────────────────┐
+#   │ ① scheduler.extend(新请求)：新请求只在每轮开头进waiting  │
+#   │ ② scheduler.schedule() → ScheduledBatch                  │── pickle广播 ──► ModelRunner.forward(batch)
+#   │    （没有任何请求时返回None）                            │                  拼输入张量、跑模型、采样
+#   │    scheduler.take_rejected()：准入被拒的作为已结束输出   │                          │
+#   │ ③ scheduler.postprocess(seqs, out)                       │◄─ ScheduledBatchOutput ──┘（只有rank 0回传）
+#   │    追加token、判停、释放block，产出流式增量和已结束序列  │
+#   └──────────────────────────────────────────────────────────┘
+#   对应nano-vllm的LLMEngine.step()：schedule → model_runner.call("run") → postprocess（见engine_core.py文件头）
+#
+# 本文件里的类：
+#   ScheduledBatch / ScheduledBatchOutput  每步的"输入快照"和"结果"（字段总表、CPU→GPU数据流见ScheduledBatch类上方）
+#   Scheduler                              普通部署的调度器，每个DP rank的EngineCore里一个。调度策略、两个预算、队列图、
+#                                          类内阅读路线、与nano-vllm的逐条对比都写在Scheduler类上方，这里不重复
+#   PrefillScheduler / DecodeScheduler     【分支】RapidServe：同一组GPU上的PD分离，prefill、decode各一个EngineCore进程，
+#                                          各用一个调度器（第9批；原理图在engine_core.py文件末尾PrefillEngineCore上方）
+#
+# 全文件阅读路线（按代码顺序，用函数名作锚点）：
+#   主干 = 只开TP的普通部署每步都会走；【分支】= 打开某个特性才会走，括号里是细讲它的批次
+#   ① 文件开头 ~ Scheduler类之前（本导读所在的区域）
+#        ChunkKind、_prompt_tokens_of ............................... 主干小工具（ChunkKind只对动态分块有区别）
+#        ScheduledBatch（含produces_output）、ScheduledBatchOutput .. 主干：每个字段都有说明
+#        _offload_max_pending_saves ................................. 【分支】KV offload的状态层（第9批）
+#        _optimal_cu_fraction ....................................... 【分支】RapidServe的CU划分（第9批）
+#        _cut_floor、_scheduled_replay_until ........................ 【分支】状态checkpoint / 有界重放（第4、8批）
+#   ② Scheduler.__init__ ~ extend：初始化，以及准入、续算时用到的prefill辅助函数
+#        __init__ ................................................... 主干：预算、队列、BlockManager、投机解码宽度等
+#        _new_prefill_tokens、_resume_prefill、_partial_prefill_chunk、_prefill_room
+#          .......................................................... 主干：一块prefill从哪开始、最多算多少
+#        _wait_for_inflight_prefix、_local_prefill_pending_work、_can_admit_head_prefill、
+#          _estimate_prefill_chunk_cost / _balance_prefill_step 等 .. 【分支】PrefillDelayer的合批探测、DP成本均衡
+#                                                                     （本批prefill_delayer.py）
+#        publish_kv_events .......................................... 【分支】KV cache事件发布（第4批）
+#        is_finished / add / extend ................................. 主干
+#   ③ _deferred_sequence ~ _reconcile_stalled_deferred_saves ........ 【分支】请求结束后connector还在读它的block：
+#                                                                     延迟释放与超时回收（第9批）
+#   ④ _requires_atomic_prefill、_unschedulable_reason、take_rejected
+#     ............................................................... 主干：准入前"永远放不下"的检查
+#   ⑤ schedule / _schedule .......................................... 主干核心：Phase 1续算 → Phase 2准入 → 有prefill
+#                                                                     就返回prefill批，否则decode（开头有决策流程图）
+#   ⑥ _consume_state_forks ~ _schedule_first_decode_after_remote_kv：abort、远端KV、offload查询
+#        _reject_aborted_waiting、abort_request、_probe_hbm_prefix .. 主干：客户端断开、前缀缓存探测
+#        _resolve_waiting_remote_kv、_lookup_detach_*等offload查询、
+#          _schedule_first_decode_after_remote_kv ................... 【分支】远端KV等待 / KV offload / PD decode端（第9批）
+#        _consume_state_forks / _consume_first_decode ............... 【分支】状态分叉 / PD首个decode的一次性标志
+#                                                                     （第4、9批）
+#   ⑦ install_chunk_latency_model ~ _checkpoint_room：动态分块与chunk大小
+#        install_chunk_latency_model ~ _calibration_sweep_chunk ..... 【分支】动态分块的校准与预测（第9批）
+#        _chunked_prefill_size、_prefill_chunk_for_budget ........... 主干：chunk对齐与预算
+#        _finalize_prefill_chunk、_checkpoint_room .................. 入口在主干（对普通模型是空操作）；让chunk落在
+#                                                                     状态checkpoint阶梯上（【分支】第4批）
+#   ⑧ _assert_positive_prefill_chunk ~ register_prefill_hashes：prefill分配、状态load/store、抢占、PP在途
+#        _record_cache_reuse、_schedule_prefill_seq ................. 主干：记前缀命中、新请求进running
+#        _allocate_prefill_draft_lookahead、_check_draft_writes_allocated
+#          .......................................................... 【分支】投机解码的草稿KV（第7批）
+#        _notify_connector_after_prefill_alloc ~ _adjust_prefill_chunk_after_alloc（及其间的函数）
+#          .......................................................... 【分支】connector通知、状态load/store、
+#                                                                     为外部加载停车（第4、9批）
+#        _preempt_one_running、preempt .............................. 主干：抢占
+#        _advance_prefill_on_schedule、mark_pp_inflight、release_pp_inflight、
+#          register_prefill_hashes .................................. 【分支】PP下同时在途多个batch（第9批）
+#   ⑨ postprocess、_mark_finished ................................... 主干：写回token（覆盖延迟输出的占位）、
+#                                                                     判停、释放block
+#      compute_detailed_aggregates .................................. 【分支】profiling的注意力FLOP统计（第10批）
+#   ⑩ _connector_flag ~ _update_from_kv_xfer_finished ............... 【分支】KV传输完成 / 失败后更新序列（第9批）
+#      get_request_counts ~ _passed_delay ........................... 计数类查询；_passed_delay实现scheduler_delay_factor
+#   ⑪ PrefillScheduler、DecodeScheduler ............................. 【分支】RapidServe（第9批）
+#   第一遍建议：①的ScheduledBatch字段表 → Scheduler类上方的总览 → ⑤ → ⑨ → ⑧的preempt；其余【分支】先跳过
+#
+# 前置概念（本文件不重讲，指过去）：
+#   连续批处理、prefill计算受限 / decode带宽受限、延迟输出 .. engine_core.py文件开头【1】【2】【3】
+#   分页KV、block table ..................................... sequence.py BlockTable类上方"科普：KV cache分块"
+#   前缀缓存、block hash .................................... sequence.py Sequence类上方"科普：前缀缓存"
+#   chunked prefill ......................................... sequence.py is_partial_prefill处的科普；
+#                                                             arg_utils.py enable_chunked_prefill上方的【科普】
+#   抢占（重算式） .......................................... sequence.py SequenceStatus类上方"科普：抢占"
+#   投机解码（MTP） ......................................... sequence.py num_draft_tokens处的科普
+#   每请求状态、状态checkpoint、有界重放 .................... sequence.py has_per_req_cache处、Replay类上方的科普
+#   PD分离 / KV offload ..................................... arg_utils.py kv_transfer_config上方 / 文件开头的【科普】
+#   动态分块 ................................................ engine_core.py里enable_dynamic_chunking处的【科普】
+#
+# 调度器眼里的请求状态（完整的SequenceStatus状态机①~⑩见sequence.py SequenceStatus类上方；"序列此刻在哪个容器里"
+#   的图见Scheduler类上方。这里只列调度器每步要区分的几种情况）：
+#   waiting里：新请求；被抢占回来的（放在队头，prompt + 已生成的token整段重算）；
+#     【分支】等远端 / 外部存储送KV的（WAITING_FOR_REMOTE_KVS，送达后才往下走）
+#   running里：status一律是RUNNING——第一次被调度做prefill就进来（与nano-vllm不同）。其中is_partial_prefill=True
+#     的是chunk还没做完的，下一步由Phase 1优先续算；其余的每步decode
+#   离开：postprocess命中eos / stop / max_tokens（或客户端abort）→ FINISHED、移出running、释放block；
+#     准入时就判定永远放不下的 → _rejected → take_rejected()
+#
+# 对比nano-vllm（nanovllm/engine/scheduler.py；逐条展开见Scheduler类上方的"对比nano-vllm"）：
+#   ┌────────────────────┬────────────────────────────────┬────────────────────────────────────────────────────┐
+#   │ 维度               │ nano-vllm                      │ ATOM基类Scheduler                                  │
+#   ├────────────────────┼────────────────────────────────┼────────────────────────────────────────────────────┤
+#   │ prefill优先        │ 是：waiting里有能做的prefill， │ 是：Phase 1 / Phase 2排上任何一条prefill，         │
+#   │                    │ 这一步就只做prefill            │ 就直接返回prefill批                                │
+#   ├────────────────────┼────────────────────────────────┼────────────────────────────────────────────────────┤
+#   │ chunked prefill    │ 只有本步第一条能被切；         │ 哪一条都能切（向下对齐到max(block_size, 64)）；    │
+#   │                    │ 没算完的留在waiting队头        │ 没算完的留在running（is_partial_prefill），        │
+#   │                    │                                │ 下一步Phase 1先续算                                │
+#   ├────────────────────┼────────────────────────────────┼────────────────────────────────────────────────────┤
+#   │ 混合prefill/decode │ 不混                           │ 不混（源码里是TODO）；想让decode插进chunk之间，    │
+#   │                    │                                │ 要ATOM_PREFILL_DECODE_INTERVAL>0（PrefillDelayer） │
+#   ├────────────────────┼────────────────────────────────┼────────────────────────────────────────────────────┤
+#   │ 抢占               │ KV不够时抢running队尾，        │ 同样重算、从队尾找；跳过connector还在读block的     │
+#   │                    │ 释放block、日后重算            │ 序列（都抢不动就停止本步decode）；先删掉末尾的     │
+#   │                    │                                │ 占位token再释放                                    │
+#   ├────────────────────┼────────────────────────────────┼────────────────────────────────────────────────────┤
+#   │ 输出时机           │ 同步：postprocess拿到的是      │ 默认延迟一步：拿到的是上一步的token；              │
+#   │                    │ 本步采样的token                │ 先放占位token（eos_token_id），下一步原地覆盖      │
+#   ├────────────────────┼────────────────────────────────┼────────────────────────────────────────────────────┤
+#   │ 池 / 状态          │ 只有KV block                   │ BlockManager还管每请求状态槽位、状态checkpoint、   │
+#   │                    │                                │ 草稿lookahead；chunk要落在checkpoint阶梯上         │
+#   │                    │                                │ （_finalize_prefill_chunk，对普通模型是空操作）    │
+#   ├────────────────────┼────────────────────────────────┼────────────────────────────────────────────────────┤
+#   │ 交给runner的东西   │ list[Sequence] + is_prefill；  │ ScheduledBatch：CPU上抄好的扁平数组，              │
+#   │                    │ runner自己从Sequence算输入     │ worker看不到Sequence（见ScheduledBatch类上方）     │
+#   └────────────────────┴────────────────────────────────┴────────────────────────────────────────────────────┘
+#
+# 一个完整的例子（逐行对照_schedule、_chunked_prefill_size、postprocess的代码推算）：
+#   设定：只开TP、DP=1（不挂PrefillDelayer）、不开MTP、默认开延迟输出；block_size=16，max_num_batched_tokens=8192，
+#     max_num_seqs=512；前缀缓存里没有可复用的内容；long_prefill_token_threshold=0（不限单条）；
+#     chunk对齐单位 = max(block_size, 64) = 64（dynamic_chunking.chunk_alignment）
+#   三个请求同时到达：waiting = [A(prompt 1000), B(prompt 10000), C(prompt 300)]
+#
+#   step 1  schedule()：Phase 1：running里没有做到一半的prefill，跳过
+#             Phase 2  A：预算剩8192 ≥ 1000 → 整段1000；分配⌈1000/16⌉ = 63个block；A进running（status=RUNNING）
+#                      B：预算剩8192−1000 = 7192 < 10000 → 切一块：7192向下对齐到64的倍数 = 7168；
+#                         准入时按整条prompt分配⌈10000/16⌉ = 625个block（同nano-vllm）
+#                      C：预算只剩24，不到一个对齐单位 → 不切这一小段（_chunked_prefill_size返回0），
+#                         C放回waiting队头，停止接纳
+#             返回prefill批：req_ids=[A, B]，num_scheduled_tokens=[1000, 7168]（共8168），is_final_chunk=[True, False]
+#           forward：第一次forward，没有"上一步"的结果可交回
+#           postprocess：A.num_cached_tokens=1000，prefill完成，末尾追加1个占位token；
+#             B.num_cached_tokens=7168，is_partial_prefill=True
+#   step 2  schedule()：Phase 1  B续算剩下的10000−7168 = 2832
+#             Phase 2  C：预算剩8192−2832 = 5360 ≥ 300 → 整段300；分配⌈300/16⌉ = 19个block
+#             返回prefill批：req_ids=[B, C]，num_scheduled_tokens=[2832, 300]，num_cached_tokens=[7168, 0]，
+#               is_final_chunk=[True, True]
+#             A已经可以decode了，但这一步有prefill，于是只做prefill，A等一步（不混合）
+#           forward：交回step 1的采样结果（req_ids=[A, B]）
+#           postprocess：A的占位 ← A的第1个token，流式发给客户端；B那个是中间chunk的采样，丢弃；
+#             B、C的prefill完成，各追加1个占位
+#   step 3  schedule()：没有prefill可做 → decode段：running=[A, B, C]各算1个token
+#             B现在有10001个token（10000 + 1个占位），10001 % 16 = 1 → may_append补第626个block
+#             返回decode批：num_scheduled_tokens=[1, 1, 1]，context_lens=[1001, 10001, 301]
+#           forward：交回step 2的采样结果（req_ids=[B, C]）→ B、C的第1个token到达客户端；A、B、C各追加一个新占位
+#   step 4+ 每步decode [A, B, C]，postprocess收到的是上一步decode的结果；谁命中eos / stop / max_tokens，就在那次
+#           postprocess里被移出running、释放block
+#   读这个例子的要点：① 预算先给Phase 1，再按FIFO给新请求，队头放不下就停；② 第1个token比它所在的prefill晚一步
+#     才到客户端（延迟输出）；③ 只要还有prefill，已经可以decode的请求也得等
+#   这三步每个ScheduledBatch里各字段的具体取值见ScheduledBatch类上方
+
 logger = logging.getLogger("atom")
 
+# 【分支】动态分块（第9批）：每步记一次"有几个请求有prefill要做"（_record_prefill_supply，计到2封顶），只保留最近16步；
+#   这16步里每一步都至多1个prefill来源时，才按延迟模型缩小chunk（dynamic_chunking.has_sole_prefill；窗口为空时不算）
 _DYNAMIC_CHUNKING_SUPPLY_WINDOW = 16
 
 
+# ChunkKind：给prefill chunk定尺寸时（_chunked_prefill_size → _dynamic_chunk_limit）声明"这是哪一种chunk"
+#   三者只在【分支】动态分块里有区别（第9批；动态分块是什么见engine_core.py里enable_dynamic_chunking处的【科普】）；
+#   不开动态分块时都按固定的token预算切
+#   调用点：Phase 1续算半途prefill用NEXT；Phase 2的新请求用FIRST（多模态整块用WHOLE）；offload加载完回来的请求用NEXT
+#     （它停车前已经按FIRST量过一次）；PrefillDelayer的探测函数也按同样规则传
+#   enum.auto()：自动给成员编号，只关心名字、不关心值时用
 class ChunkKind(enum.Enum):
     """Which prefill chunk a sizing call is for, as dynamic chunking sees it.
 
@@ -76,17 +262,30 @@ class ChunkKind(enum.Enum):
     to say which one it is.
     """
 
+    # 【译】给chunk定尺寸的这次调用是为哪一种prefill chunk，按动态分块的视角。
+    #   每个定尺寸的调用点都必须显式给出，而不设默认值，这样新增调用点时就得说明自己是哪一种。
+
     # A new request's first chunk: takes the next calibration sweep arm.
+    # 【译】新请求的第一个chunk：取校准扫描的下一档。
+    # 解释：校准阶段（还没有拟合好的延迟模型时）新请求轮流取"满预算"和"预算/CALIBRATION_SWEEP_RATIO(=4)"两档，
+    #   让拟合能看到不同大小的chunk（_calibration_sweep_chunk）；请求真正准入后才切换档位（_commit_calibration_arm）
     FIRST = enum.auto()
     # A later chunk of a request already admitted: keeps the current arm.
+    # 【译】已准入请求的后续chunk：沿用当前档。
     NEXT = enum.auto()
     # A prefill that must go whole (`_requires_atomic_prefill`): never limited.
+    # 【译】必须整段做完的prefill（_requires_atomic_prefill）：从不限制。
+    # 解释：带多模态数据、又没有embedding_spans的prompt只能一次prefill完，否则视觉embedding会对不上位置
     WHOLE = enum.auto()
 
 
 # How often the stalled-save reconciler actually scans deferred_free_blocks. The
 # engine polls KV progress every millisecond (KV_IDLE_DRAIN_INTERVAL_S), so the
 # reconciler no-ops until this interval has passed.
+# 【译】"卡住的保存"对账器真正扫描deferred_free_blocks的频率。引擎每毫秒轮询一次KV进度（KV_IDLE_DRAIN_INTERVAL_S），
+#   所以在这个间隔过去之前，对账器什么也不做。
+# 【分支】KV传输（PD分离 / KV offload，第9批）：请求结束时若connector还在读它的block（PD发送、offload保存），block先停在
+#   deferred_free_blocks里，读完才释放；完成报告丢了的，由_reconcile_stalled_deferred_saves每5秒扫一次、超时回收
 _SAVE_RECONCILE_INTERVAL_S = 5.0
 
 # Release attempts a deferred request may fail after its save was abandoned
@@ -95,9 +294,15 @@ _SAVE_RECONCILE_INTERVAL_S = 5.0
 # read), so a claim nobody will ever retire no longer has a way out -- it has
 # to be visible instead. Deliberately well past the abandon timeout: a P/D send
 # that is merely slow must not trip it.
+# 【译】一个延迟释放的请求，在它的保存被放弃之后，允许释放失败多少次，_reconcile_stalled_deferred_saves才判定它"卡死"
+#   （wedged）。回收器选择重试而不是强制释放（被认领的源block可能正被一次活跃的RDMA读取），所以一个永远没人退还的
+#   认领就再也没有出路——只能让它变得可见。这个次数故意远超放弃超时：一次只是慢一点的P/D发送不能触发它。
+# 解释：12次 × 每5秒扫一次 ≈ 60秒后打出告警日志（见_reconcile_stalled_deferred_saves）
 _RELEASE_WEDGE_ATTEMPTS = 12
 
 # Memoised result of `_offload_max_pending_saves`, a process constant likewise.
+# 【译】_offload_max_pending_saves 的记忆化结果，同样是进程内常量。
+# 解释：None表示还没算过。envs.X每次访问都会重新读os.environ（见envs.py），这里只读第一次、之后固定
 _MAX_PENDING_OFFLOAD: int | None = None
 
 
@@ -110,6 +315,14 @@ def _offload_max_pending_saves() -> int:
     question about one resource. Two independent numbers would let an operator
     raise one and unknowingly double what a slow backend can pin.
     """
+    # 【译】引擎侧同时最多允许多少个offload传输未完成。
+    #   与KV那条腿的 OFFLOAD_MAX_PENDING_SAVES 共用，而不是单独给一个开关：KV保存和状态存储在运行期间都占着它们
+    #   正在从同一个池里读出的字节，所以队列深度是关于同一个资源的同一个问题。两个独立的数字会让运维调高其中一个，
+    #   却不知不觉让一个慢后端能钉住的量翻倍。
+    # 【分支】KV offload的状态层（第4、9批）：调用方是Scheduler._state_store_pending_cap——connector自己给出了
+    #   max_pending_saves就用connector的，否则才退回这里
+    #   取值：OFFLOAD_MAX_PENDING_SAVES未设置或为空 → 2；设了但无法解析（envs抛ValueError）→ 告警后用2；最小为1
+    #   global：函数里给模块级变量赋值，要先用global声明
     global _MAX_PENDING_OFFLOAD
     if _MAX_PENDING_OFFLOAD is not None:
         return _MAX_PENDING_OFFLOAD
@@ -134,6 +347,11 @@ def _prompt_tokens_of(result) -> int:
     generation side is counted in `postprocess`, from tokens actually
     committed.
     """
+    # 【译】从 _schedule() 的任意返回值中取出prompt token数。
+    #   三个调度器对"空"的表示不一致——Scheduler 和 DecodeScheduler 返回裸的 None，PrefillScheduler 返回 (None, {})——
+    #   所以在这里统一，而不是在每个调用方各处理一遍。decode batch的 total_tokens_num_prefill 为0，这正是吞吐窗口想要的：
+    #   它的生成侧在 postprocess 里按真正提交的token计数。
+    # 解释：调用方是Scheduler.schedule和PrefillScheduler.schedule，结果交给_record_throughput（状态行里的prompt吞吐）
     batch = result[0] if isinstance(result, tuple) else result
     return 0 if batch is None else batch.total_tokens_num_prefill
 
@@ -155,6 +373,20 @@ def _optimal_cu_fraction(
     Returns None when CU masking provides no benefit (no pending prefill,
     tiny prefill).
     """
+    # 【译】返回当前负载下prefill应占的CU比例；不做屏蔽时返回None。
+    #   由 DecodeScheduler 调用，它同时能看到decode的batch大小和 prefill_waiting 里排队的token总数。选出的比例写进共享内存，
+    #   供 PrefillScheduler 读取。
+    #   查找表来自在 DeepSeek-R1 tp=8 上对不同CU划分（prefill占30/50/60/70/80%）的实测。几乎所有情况下prefill的延迟
+    #   都占主导；在典型的batch大小下，decode对CU减少的容忍度很好。
+    #   CU屏蔽没有收益时（没有待处理的prefill、prefill很小）返回None。
+    # 【分支】RapidServe（同一组GPU上的PD分离，第9批；原理和CU划分图见engine_core.py文件末尾PrefillEngineCore上方的"代价①"）
+    #   CU（Compute Unit）：AMD GPU的计算单元，相当于NVIDIA的SM；CU mask让一个stream上的kernel只被派到指定的CU上
+    # 观察：实现与docstring有三处不符——
+    #   ① 两个调度器都调用它：DecodeScheduler._schedule传(本步decode token数, prefill_waiting的token总数)，
+    #      PrefillScheduler._schedule传(从共享内存读到的decode token数, 本批prefill token数)；写进共享内存的是decode token数，
+    #      不是比例，各自的结果只给自己的batch用（cu_stream_fraction）
+    #   ② "查找表"实际只剩一个阈值：有排队的prefill且decode_batch ≥ 64时返回0.5，否则None；没有单独判断"prefill很小"
+    #   ③ 参数名叫decode_batch，两个调用方传的却都是decode的token数（开MTP时是请求数 × (mtp_k+1)）
     assert prefill_waiting_tokens >= 0
     if prefill_waiting_tokens == 0 or decode_batch < 64:
         return None
@@ -162,6 +394,82 @@ def _optimal_cu_fraction(
         return 0.5
 
 
+# =============================================================================================
+# ScheduledBatch：调度器交给ModelRunner的"这一步的全部输入"
+# =============================================================================================
+# 是什么：Scheduler._schedule每步构造一个（prefill批、decode批各有一处），EngineCore用
+#   runner_mgr.call_func("forward", batch)把它pickle后广播给每个TP worker（async_proc.py；其中最大的block_tables只发
+#   增量，见block_table_codec.py），worker里的ModelRunner.forward(batch)据此拼出GPU上的输入、跑模型、采样。
+#   Sequence对象本身不发给worker（与nano-vllm不同，见sequence.py文件头）：worker能看到的只有这里抄出来的字段，
+#   所以构造函数要把ModelRunner用得到的每条序列的信息都抄成"按行对齐"的数组
+#   其他构造者：PrefillScheduler / DecodeScheduler的_schedule（RapidServe）；几种"假批"——ModelRunner.dummy_execution
+#     （DP陪跑）、warmup_model、dynamic_chunking_worker（启动时的profiling），它们is_dummy_run=True；
+#     pp_engine_core还会造只带connector元数据、seqs为空的批
+#
+# 约定：bs = len(seqs) = total_seqs_num；第i行 = seqs里第i个元素（dict保持插入顺序：prefill批里Phase 1续算的在前、
+#   Phase 2新准入的在后；decode批按running队列的顺序）。下面所有"每行一项"的数组都按这个顺序对齐
+#
+# 哪些字段在CPU上算好、再传给GPU？全部字段都在EngineCore进程里、在CPU上算好；
+#   worker收到后，先在CPU上把它们写进锁页（pinned）缓冲区（ModelRunner.forward_vars里各CpuGpuBuffer的.np），
+#   再H2D拷到GPU。按去向分：
+#
+#   ScheduledBatch的字段                            worker上变成的GPU张量（谁来算）
+#   scheduled_tokens ─────────────────────────────► input_ids（tokenIDProcessor.prepare_input_ids）
+#   num_scheduled_tokens ──前缀和─────────────────► cu_seqlens_q（注意力metadata builder，backends.py）
+#   context_lens ──前缀和─────────────────────────► cu_seqlens_k、context_lens
+#   context_lens − num_scheduled_tokens ──────────► prefill各token的positions（decode由context_lens推出）
+#   block_tables + positions ─────────────────────► block_tables张量、slot_mapping（每个新token的KV写进哪一格）
+#   temperatures / top_ks / top_ps ───────────────► 采样参数（ModelRunner.prepare_sample；整批相同时只传标量）
+#   scheduled_spec_decode_tokens ─────────────────► input_ids里的草稿列（【分支】MTP）
+#   state_slots*、last_block_num_tokens、mrope_*、next_token_ids ──► 各注意力后端 / 草稿模型自己的张量（【分支】）
+#   其余（total_*、is_final_chunk、is_dummy_run、num_spec_step、req_ids、return_logprobs等）只在CPU上做分支判断
+#   对比nano-vllm：nano-vllm的ModelRunner.prepare_prefill / prepare_decode拿着Sequence列表现算input_ids、positions、
+#     slot_mapping；ATOM把"从Sequence里抄什么"放在调度器一侧（就是这个构造函数），worker只做数组运算
+#
+# 字段速查（每个字段的来源、形状和读者，在__init__里赋值的地方逐个说明）：
+#   每行的token窗口（主干）：req_ids、num_scheduled_tokens、num_cached_tokens、context_lens、scheduled_tokens、
+#     is_final_chunk、block_tables、last_block_num_tokens
+#   采样（主干）：temperatures、top_ks、top_ps、needs_independent_noise、return_logprobs
+#   批级计数（主干）：total_tokens_num(_prefill / _decode)、total_seqs_num(_prefill / _decode)、is_dummy_run
+#   投机解码（【分支】第7批）：num_spec_step、scheduled_spec_decode_tokens、num_rejected、num_bonus、next_token_ids
+#   每请求状态（【分支】第4、8批）：state_rows、state_slots、state_slots_committed、state_fork_srcs、state_save_all、
+#     state_maintenance_ops、replaying
+#   其它【分支】：connector_meta_output、remote_kv_*、finished_recving_kv_req_ids、is_first_decode_without_local_prefill
+#     （PD / offload，第9批）；mrope_*、multimodal_data（多模态，第2、8批）；cu_stream_fraction（RapidServe，第9批）；
+#     pp_completion_ack（PP，第9批）；detailed_*、prefill_gpu_requests（指标，第10批）；external_request_ids（RL，第10批）
+#
+# 例：文件开头那个例子三步的batch（A、B、C的seq.id记作0、1、2；block_size=16；"A[0:1000]"指A.token_ids[0:1000]）
+#   ┌───────────────────────┬──────────────────────────┬──────────────────────────┬────────────────────────┐
+#   │ 字段                  │ step 1（prefill）        │ step 2（prefill）        │ step 3（decode）       │
+#   ├───────────────────────┼──────────────────────────┼──────────────────────────┼────────────────────────┤
+#   │ req_ids               │ [0, 1]                   │ [1, 2]                   │ [0, 1, 2]              │
+#   ├───────────────────────┼──────────────────────────┼──────────────────────────┼────────────────────────┤
+#   │ num_scheduled_tokens  │ [1000, 7168]             │ [2832, 300]              │ [1, 1, 1]              │
+#   ├───────────────────────┼──────────────────────────┼──────────────────────────┼────────────────────────┤
+#   │ num_cached_tokens     │ [0, 0]                   │ [7168, 0]                │ [1000, 10000, 300]     │
+#   │                       │                          │                          │ （decode行不看它）     │
+#   ├───────────────────────┼──────────────────────────┼──────────────────────────┼────────────────────────┤
+#   │ context_lens          │ [1000, 7168]             │ [10000, 300]             │ [1001, 10001, 301]     │
+#   ├───────────────────────┼──────────────────────────┼──────────────────────────┼────────────────────────┤
+#   │ is_final_chunk        │ [True, False]            │ [True, True]             │ None                   │
+#   ├───────────────────────┼──────────────────────────┼──────────────────────────┼────────────────────────┤
+#   │ scheduled_tokens      │ A[0:1000] + B[0:7168]    │ B[7168:10000] + C[0:300] │ [A[1000], 占位, 占位]  │
+#   │                       │ 共8168个                 │ 共3132个                 │ 共3个                  │
+#   ├───────────────────────┼──────────────────────────┼──────────────────────────┼────────────────────────┤
+#   │ 每行的block数         │ [63, 625]                │ [625, 19]                │ [63, 626, 19]          │
+#   ├───────────────────────┼──────────────────────────┼──────────────────────────┼────────────────────────┤
+#   │ last_block_num_tokens │ [8, 16]                  │ [16, 12]                 │ [9, 1, 13]             │
+#   ├───────────────────────┼──────────────────────────┼──────────────────────────┼────────────────────────┤
+#   │ total_tokens_num      │ 8168（全是prefill）      │ 3132（全是prefill）      │ 3（全是decode）        │
+#   ├───────────────────────┼──────────────────────────┼──────────────────────────┼────────────────────────┤
+#   │ produces_output()     │ True（A是最后一块）      │ True                     │ True                   │
+#   └───────────────────────┴──────────────────────────┴──────────────────────────┴────────────────────────┘
+#   worker侧（step 2）：cu_seqlens_q=[0, 2832, 3132]，cu_seqlens_k=[0, 10000, 10300]，positions=[7168..9999, 0..299]
+#     context_lens − num_scheduled_tokens = [7168, 0]里有正数 → 注意力走"带前缀"的prefill（AttnState.PREFILL_PREFIX，
+#     backends.py CommonAttentionBuilder.prepare_prefill）：续算的第2块和前缀缓存命中，在注意力kernel看来是一回事——
+#     前面已有一段KV躺在cache里，本步只算后面的新token
+#   slot_mapping：第i行位置p的token写进物理槽位 block_tables[i][p // 16] × 16 + p % 16（与nano-vllm相同）
+#   step 3里B、C的"占位"：CPU上还不知道它们的第1个token（延迟输出），ModelRunner用GPU上step 2的采样结果覆盖这两格
 class ScheduledBatch:
     """Immutable snapshot of sequences selected for a single forward pass.
 
@@ -178,6 +486,20 @@ class ScheduledBatch:
             speculative decoding (must not use a mutable default).
         state_maintenance_ops: State moves that must execute before this batch.
     """
+
+    # 【译】为一次forward选中的序列的不可变快照。
+    #   持有每条序列的元数据（block table、上下文长度、温度），以及为model runner准备好的展平token数组。
+    #   参数：
+    #     seqs：请求ID到 Sequence 的映射。
+    #     num_scheduled_tokens：每条序列的新token数。
+    #     total_tokens_num：所有被调度token之和（prefill + decode）。
+    #     connector_meta_output：本batch可选的KV connector元数据。
+    #     num_spec_step：投机解码的步数（0 = 关闭）。
+    #     scheduled_spec_decode_tokens：每个请求用于投机解码的草稿token ID（不能用可变默认值）。
+    #     state_maintenance_ops：必须在本batch之前执行的状态搬移。
+    # 解释："不可变"指构造时把各序列的值抄成独立的数组/列表，之后Sequence再变也不影响它。但它并非完全只读：block_tables里
+    #   放的是seq.block_table对象本身（引用）；ModelRunner的DSpark路径会改写num_scheduled_tokens、重新绑定scheduled_tokens
+    #   （_dspark_apply_ragged）；pp_completion_ack、detailed_*在构造之后才设置。worker收到的是pickle后的副本
 
     def __init__(
         self,
@@ -201,16 +523,28 @@ class ScheduledBatch:
         next_token_ids: list[int] | None = None,
         state_maintenance_ops: StateMaintenanceOps | None = None,
     ):
+        # 可变默认值的惯用写法：参数默认None，进函数后再换成新建的{}（docstring里"must not use a mutable default"说的就是它）
         if scheduled_spec_decode_tokens is None:
             scheduled_spec_decode_tokens = {}
+        # 【分支】PD分离的decode端（第9批）：本批"首个decode"（KV刚从prefill节点传来、is_first_decode=True）的序列用到的block，
+        #   由_schedule的decode段收集（remote_kv_blocks排序去重后的全部id / remote_kv_seq_blocks按seq.id分组）
+        # 观察：atom/下除了这里的赋值，没有任何地方读取batch.remote_kv_block_ids / remote_kv_seq_blocks
         self.remote_kv_block_ids = remote_kv_block_ids or []
         self.remote_kv_seq_blocks = remote_kv_seq_blocks or {}
 
+        # list[int] [bs]：行顺序的基准，seqs的key（= seq.id）依次就是第0、1、2……行
+        #   读者：ModelRunner到处用它对号入座——延迟输出时把上一步的采样结果对回本步的行（tokenIDProcessor.get_token_locations、
+        #   prepare_sampled_ids），ScheduledBatchOutput.req_ids也来自它；EngineCore用len(req_ids)判断要不要跑forward
         self.req_ids = list(seqs.keys())
+        # int32 [bs]：本步每行要forward的token数（prefill行 = 本chunk大小；decode行 = 1，本引擎验证草稿时 = mtp_k+1）
+        #   读者：注意力metadata builder用它的前缀和得到cu_seqlens_q（backends.py prepare_cu_seqlens_q），prefill的seqlens_q、
+        #   decode_spans；DSpark会把它改成每行实际要验证的长度（ModelRunner._dspark_apply_ragged）
         self.num_scheduled_tokens = np.asarray(num_scheduled_tokens, dtype=np.int32)
+        # float32 [bs]：采样温度（seq.temperature）。ModelRunner.prepare_sample：全为0就走greedy，否则拷进GPU的温度缓冲区
         self.temperatures = np.asarray(
             [seq.temperature for seq in seqs.values()], dtype=np.float32
         )
+        # list[bool] [bs]：是否要返回logprob；ModelRunner.postprocess里任一为True才计算log_softmax
         self.return_logprobs = [seq.return_logprobs for seq in seqs.values()]
         # `context_lens` is set further down, once `num_cached_tokens` is known:
         # a chunked prefill's context ends at this chunk, not at the whole
@@ -218,13 +552,27 @@ class ScheduledBatch:
         # Kept as a list too: the offset loop below reads it per sequence, and
         # `arr[i]` builds a numpy scalar where a list index does not. The list
         # is what `np.asarray` consumes anyway, so holding onto it is free.
+        # 【译】context_lens 在更下面、等 num_cached_tokens 确定之后才设置：chunked prefill的上下文结束在这个chunk处，而不是
+        #   整个prompt处，所以 seq.num_tokens 只对decode才正确。
+        #   （num_rejected）同时保留一份list：下面的offset循环逐条序列读取它，而 arr[i] 会构造一个numpy标量，list下标不会。
+        #   np.asarray 本来就要消费这个list，所以留着它不花任何代价。
         num_rejected = [seq.num_rejected for seq in seqs.values()]
+        # int32 [bs]：【分支】投机解码（第7批）上一步验证时被拒绝的草稿数（seq.num_rejected，由postprocess写入）；不开MTP时全为0
+        #   用途：① 下面切decode窗口时，窗口结束在num_tokens − num_rejected处；② ModelRunner.prepare_input_ids据此（与num_bonus
+        #   一起）把延迟输出的token放到正确位置
         self.num_rejected = np.asarray(num_rejected, dtype=np.int32)
+        # int32 [bs]：【分支】投机解码，上一步被接受的草稿数（seq.num_bonus_tokens）；读者：prepare_input_ids、DSpark
         self.num_bonus = np.asarray(
             [seq.num_bonus_tokens for seq in seqs.values()], dtype=np.int32
         )
         # By batch index, the seqs whose forward starts below where they
         # resumed; empty in almost every batch.
+        # 【译】按batch下标记录：forward从恢复点下方开始的那些序列；几乎所有batch里它都是空的。
+        # dict {行号: Replay}【分支】有界重放 / 状态replay（第4、8批；概念见sequence.py Replay类上方的科普）：seq.replay由
+        #   Scheduler._resume_prefill记下；本forward的起点seq.num_cached_tokens < replay.until，说明这一行要先重算
+        #   [起点, until)这段已在cache里的行来重建状态。读者：DeepSeek-V4.1 backend（deepseek_v41/backend.py）、vLLM插件的
+        #   v41_core_overrides.py；调度器postprocess经_scheduled_replay_until读回这一批当时的until
+        # dict推导式：{键: 值 for ... if ...}，与列表推导式同理
         self.replaying = {
             i: seq.replay
             for i, seq in enumerate(seqs.values())
@@ -239,6 +587,12 @@ class ScheduledBatch:
         # whose committed slot was never claimed carries the -1 sentinel in a
         # one-element list, which is truthy, and letting it through would shift
         # every list positionally aligned with this one.
+        # 【译】每个持有状态的seq一项：该seq的整组槽位，按分配顺序。[0]是已提交的状态，[1:]是投机解码的回滚槽位，每个投机token
+        #   一个。这些槽位组彼此不相邻，任何后端都不能用"基址 + 算术"去重建它们——见 StateSlotPool。
+        #   按 state_slot >= 0 筛选，而不是按列表非空：已提交槽位从未被认领的seq带着一个只含-1哨兵的单元素列表，它是真值；
+        #   放它进来，会让所有与本列表按位置对齐的列表错位。
+        # 【分支】每请求状态（GDN线性注意力、DeepSeek-V4的滑动窗口/压缩器等，第4、8批；概念见sequence.py has_per_req_cache处的
+        #   科普）：这类层除了分页KV还有一份每请求的定长状态，存在单独的状态池里，按"槽位"编号。下面五个列表只为持有状态的行建项
         state_rows: list[int] = []
         state_seqs: list[Sequence] = []
         for row, seq in enumerate(seqs.values()):
@@ -249,16 +603,28 @@ class ScheduledBatch:
         # state-holding seq; the token counts, `cu_seqlens` and the kernels'
         # rows are indexed by batch row. The two coincide only when every row
         # holds state, so a backend translating between them goes through this.
+        # 【译】每个持有状态的seq所在的batch行号。下面的每个列表都按"持有状态的seq"编号；而token计数、cu_seqlens和kernel的行
+        #   按batch行编号。只有每一行都持有状态时两者才一致，所以后端在两种编号之间换算时都要经过它。
+        # 例：bs=3，只有第0、2行持有状态 → state_rows=[0, 2]，下面各列表都只有2项。读者：gdn_attn.py
         self.state_rows = state_rows
+        # list[list[int]]：每个持有状态的seq的整组槽位（seq.state_slots，[已提交, 回滚1, 回滚2, ...]）；读者：gdn_attn.py
+        #   （投机解码路径要用回滚槽位）
         self.state_slots = [seq.state_slots for seq in state_seqs]
         # Column 0 broken out, because it is what every non-speculative backend
         # wants and rebuilding it per step in each of them would cost the same
         # Python loop several times over.
+        # 【译】单独拆出第0列，因为每个非投机后端要的都是它；在每个后端里每步重建一遍，就要为同一个Python循环付好几次钱。
+        # list[int]：每个持有状态的seq的已提交槽位（seq.state_slot）；读者：deepseek_v4_attn.py、deepseek_v41 backend、gdn_attn.py
         self.state_slots_committed = [seq.state_slot for seq in state_seqs]
         # Read-side twin of the committed column, positionally aligned with it:
         # the slot this forward takes its incoming state from. Differs only on
         # the one forward after a state fork; -1 elsewhere, which attention
         # backends read as "same as the write slot".
+        # 【译】已提交列的"读侧孪生"，与它按位置对齐：本次forward从哪个槽位读取输入状态。只在状态分叉之后的那一次forward上
+        #   与写入槽位不同；其余时候为-1，注意力后端把它理解为"与写入槽位相同"。
+        # 解释：状态分叉 = 从checkpoint恢复（读checkpoint那个槽位、写自己的新槽位，checkpoint原样留给别人复用），或保存一个
+        #   checkpoint。它只描述一次forward，所以_schedule构造完batch就调用_consume_state_forks把seq.state_fork_src清回-1。
+        #   读者：gdn_attn.py、deepseek_v4_attn.py
         self.state_fork_srcs = [seq.state_fork_src for seq in state_seqs]
         # Midstep checkpoints this forward must write, `[(slot, position)]` per
         # seq, positionally aligned with `state_slots` like the fork sources
@@ -267,33 +633,59 @@ class ScheduledBatch:
         # Positions are absolute prompt offsets; the backend rebases them onto
         # the step's own tokens, which is the only frame its intermediates are
         # in. Empty everywhere except a `readable_midstep` prefill.
+        # 【译】本次forward必须写出的中途checkpoint，每个seq一个 [(slot, position)] 列表，像上面的fork源一样与 state_slots
+        #   按位置对齐。每个seq是一个列表而不是一项：可读（readable）的后端会取这个chunk覆盖到的每一个位置，而不只是它结束处
+        #   的那一个。位置是prompt里的绝对偏移；后端把它们换算到本步自己的token上，那是它的中间结果唯一所在的坐标系。
+        #   除了 readable_midstep 的prefill，其余情况下处处为空。
+        # 解释：来源是seq.midstep_reservations（(slot, position, hash)三元组，这里去掉hash；由BlockManager.plan_midstep在_schedule
+        #   构造batch之前预留）；读者：gdn_attn.py
         self.state_save_all = [
             [(g, p) for g, p, _h in seq.midstep_reservations] for seq in state_seqs
         ]
         # Physical moves are drained once per real batch.
+        # 【译】物理搬移每个真实batch排空一次。
+        # 解释：StateMaintenanceOps（state_runtime.py）：BlockManager排队的状态槽位搬移（relocations）和checkpoint存/取拷贝，
+        #   调度器用take_state_maintenance_ops()一次取走；注意力metadata builder的build在本批forward之前、在计算流上执行它们
+        #   （backends.py）。decode批为空时调度器传None（空批不会被forward，取走的搬移就会丢），这里换成空的StateMaintenanceOps
+        #   三元表达式 a if 条件 else b：条件为真取a，否则取b
         self.state_maintenance_ops = (
             state_maintenance_ops
             if state_maintenance_ops is not None
             else StateMaintenanceOps()
         )
+        # int32 / float32 [bs]：top-k、top-p（-1 / 1.0表示不启用，见sampling_params.py）；ModelRunner.prepare_sample判断要不要
+        #   过滤：整批取值相同时只传一个标量，否则拷进GPU缓冲区
         self.top_ks = np.asarray([seq.top_k for seq in seqs.values()], dtype=np.int32)
         self.top_ps = np.asarray([seq.top_p for seq in seqs.values()], dtype=np.float32)
         # True if any seq in the batch is a fan-out child (SamplingParams.n>1)
         # and therefore requires fresh per-row random noise at the sampler
         # rather than the cached shared exponential tensor.
+        # 【译】若batch里有任何一个seq是扇出的子请求（SamplingParams.n>1），就为True，此时采样器要为每行生成新的随机噪声，
+        #   而不是用缓存的那份共享指数分布张量。
+        # 解释：实际存的是 bool [bs]（每行一个，seq.needs_independent_noise）；ModelRunner.prepare_sample用.any()归约成一个开关。
+        #   getattr(obj, 名字, 默认值)：没有这个属性时返回默认值（兼容没有该字段的Sequence替身）
         self.needs_independent_noise = np.asarray(
             [getattr(seq, "needs_independent_noise", False) for seq in seqs.values()],
             dtype=bool,
         )
 
+        # list[bool] [bs]：【分支】PD分离的decode端（第9批）：这一行是不是"KV从远端prefill节点传来之后的第一次decode"
+        #   （seq.is_first_decode）。读者：aiter_mla.py——这类行的block数直接取len(block_tables[i])，而不是按context_len推算
+        # 观察：基类Scheduler._schedule的decode段在构造本batch之前就已经把seq.is_first_decode置回False，所以基类调度器产出的
+        #   batch里这一列恒为False；只有DecodeScheduler._schedule（RapidServe）在构造之后才用_consume_first_decode清除它，
+        #   它的batch里才会出现True
         self.is_first_decode_without_local_prefill = [
             seq.is_first_decode for seq in seqs.values()
         ]
+        # 【分支】M-RoPE多模态（Qwen3.5等，第8批；概念见sequence.py mrope_positions处）：{seq.id: prompt各token的三维位置
+        #   [3, prompt_len]}；prefill时backends.py的_build_mrope_prefill_positions切出本chunk那一段
+        # 观察：decode批也会带上这整段数组（每步多pickle一份），而decode只用下面的delta
         self.mrope_positions_by_req = {
             seq.id: seq.mrope_positions
             for seq in seqs.values()
             if getattr(seq, "mrope_positions", None) is not None
         }
+        # {seq.id: 生成token的位置偏移}：decode时位置 = 线性位置 + delta（backends.py _build_mrope_decode_positions）
         self.mrope_position_deltas = {
             seq.id: getattr(seq, "mrope_position_delta", 0)
             for seq in seqs.values()
@@ -301,20 +693,44 @@ class ScheduledBatch:
         }
 
         # num_cached_tokens for chunked prefill support
+        # 【译】num_cached_tokens，用于支持chunked prefill
+        # list[int] [bs]：每行本次forward的起点——它之前的KV已经在cache里（前缀命中，或前面几块chunk算好的）
+        #   prefill批由调度器传入（_schedule里的num_cached_tokens_list，取的是推进之前的值）；decode批不传，取seq.num_cached_tokens：
+        #   它在prefill结束后停在prompt长度、decode时不再增长（见sequence.py的字段演化总表），decode窗口不看它
+        #   读者（主要在prefill路径上）：backends.py prepare_prefill断言它等于context_lens − num_scheduled_tokens；M-RoPE位置、
+        #   aiter_mla.py等；PP下调度器postprocess从这里起算hash（那时seq.num_cached_tokens已被_advance_prefill_on_schedule推进）
+        #   对比nano-vllm：nano-vllm的worker直接读seq.num_cached_tokens；ATOM的worker看不到Sequence，只能靠这里抄一份
         self.num_cached_tokens = (
             num_cached_tokens
             if num_cached_tokens is not None
             else [seq.num_cached_tokens for seq in seqs.values()]
         )
 
+        # list[bool] [bs] | None：prefill批里每行"本chunk是不是这次prefill欠的最后一块"。_schedule用推进之前的偏移、按num_tokens
+        #   （而不是num_prompt_tokens）判断：被抢占后重新准入的序列要把已生成的token也重算一遍，prefill会越过prompt边界
+        #   decode批和PrefillScheduler的批为None
+        #   读者：produces_output()（全是中间块时ModelRunner.forward跳过采样）；ModelRunner._record_kv_cache_ready（【分支】只为
+        #   最后一块的请求通知KV connector"KV已就绪"）；DeepSeek-V4.1 backend、bounded_replay.py；调度器postprocess据此维护
+        #   is_partial_prefill和_partial_prefill_count（中间块采样出的token被丢弃）
         self.is_final_chunk = is_final_chunk
         # Per seq, the token following this forward where the scheduler knows it
         # (a middle prefill chunk's successor prompt token), -1 where sampling
         # supplies it. A drafter runs one position ahead of the target, so this
         # is its anchor on the chunks that never reach sampling.
+        # 【译】每个seq一项：本次forward之后紧跟的那个token——调度器知道它时（中间prefill chunk的下一个prompt token）填它，
+        #   否则为-1（由采样提供）。草稿模型比目标模型靠前一个位置运行，所以在那些永远走不到采样的chunk上，这就是它的锚点。
+        # 解释：只有prefill批、且配置了需要它的草稿模型时才有（Scheduler.drafter_needs_next_token：开了投机解码且不是DSpark），
+        #   否则为None。读者：ModelRunner.forward里的drafter.compute_draft_kv和propose（【分支】第7批）
+        #   例：文件开头例子step 1里B的第1块算位置0~7167 → B这一项 = B.token_ids[7168]；A这块是最后一块 → -1
         self.next_token_ids = next_token_ids
 
         # context_lens: for prefill seqs, use num_cached_tokens + num_scheduled_tokens
+        # 【译】context_lens：对prefill序列，取 num_cached_tokens + num_scheduled_tokens
+        # int32 [bs]：本次forward之后每行"能看到的KV长度"（含本步新算的token）
+        #   prefill行 = 本chunk的结束位置（中间chunk只看到这里，不是整条prompt）；decode行 = seq.num_tokens（已经包含本步要
+        #   forward的最后那个token，开延迟输出时它可能还是占位）
+        #   读者：注意力metadata builder用它的前缀和得到cu_seqlens_k，并写进context_lens缓冲区（H2D）；prefill的positions由
+        #   context_lens − num_scheduled_tokens推出（backends.py prepare_prefill）
         self.context_lens = np.asarray(
             [
                 (
@@ -331,6 +747,12 @@ class ScheduledBatch:
         # per sequence: a numpy slice-assign costs ~245ns of dispatch whatever
         # its length, and at decode a window is a single token. `extend`
         # between two `array("i")` is a memcpy. 4x at bs=256.
+        # 【译】每条序列的窗口先暂存进同一个数组，而不是逐条赋值：numpy的切片赋值不管多长都要约245ns的分发开销，而decode时一个
+        #   窗口只有一个token。两个 array("i") 之间的 extend 是一次memcpy。bs=256时快4倍。
+        # 每行的窗口 = 本步要forward的token在seq.token_ids里的区间：
+        #   prefill行：[num_cached_tokens[i], num_cached_tokens[i] + num)
+        #   decode行： [num_tokens − num_rejected − num, num_tokens − num_rejected)；不开MTP时就是最后1个token（开延迟输出时它
+        #     还是占位，ModelRunner.prepare_input_ids再用GPU上一步的采样结果覆盖；开MTP时末尾占位的布局见第7批）
         staged = new_token_ids()
         for i, (seq, num) in enumerate(zip(seqs.values(), num_scheduled_tokens)):
             if seq.type == SequenceType.PREFILL:
@@ -341,6 +763,8 @@ class ScheduledBatch:
         # Checked here because nothing downstream will: the array below wraps
         # whatever length was staged, and a sequence too short to fill its
         # window would otherwise leave the batch quietly short.
+        # 【译】在这里检查，因为下游谁都不会检查：下面的数组按暂存的实际长度包装，若某条序列短于为它调度的窗口，batch就会
+        #   悄无声息地少几个token。
         if len(staged) != total_tokens_num:
             raise ValueError(
                 f"staged {len(staged)} tokens for a batch of {total_tokens_num}: "
@@ -348,8 +772,13 @@ class ScheduledBatch:
             )
         # Wrapped, not copied into a fresh array: consumers only ever read this
         # or rebind it, so the staging buffer can be the buffer.
+        # 【译】直接包装而不是拷贝进新数组：使用方只会读它或重新绑定它，所以暂存缓冲区本身就可以当最终的缓冲区。
+        # int32 [total_tokens_num]：所有行的窗口首尾相接；读者：tokenIDProcessor.prepare_input_ids把它写进input_ids缓冲区再H2D
+        #   np.frombuffer：零拷贝，numpy数组直接指向array("i")的那块内存（array支持缓冲区协议）
+        #   例：文件开头例子step 1 = A的1000个token后面接B的前7168个，共8168个
         self.scheduled_tokens = np.frombuffer(staged, dtype=np.int32)
 
+        # 【分支】投机解码（第7批）：本引擎自己验证草稿时（num_spec_step = mtp_k > 0），把各行的草稿整理成一个稠密矩阵
         if num_spec_step > 0 and scheduled_spec_decode_tokens is not None:
             # One row per sequence, in batch order. The caller's dict is keyed
             # by request id and holds only sequences that DO have drafts, so
@@ -364,6 +793,15 @@ class ScheduledBatch:
             # full width are padded rather than dropping the batch back to the
             # per-row form, because at a large batch a sequence joins decode
             # nearly every step and would take every other sequence with it.
+            # 【译】每条序列一行，按batch顺序。调用方的dict以请求id为键，只包含确实有草稿的序列，所以用 list(...values()) 把它
+            #   稠密化会丢掉其他序列，并把后面的每一行都挪到错误的序列上——使用方按batch位置索引它（prepare_input_ids），
+            #   这种错位就变成一条序列悄无声息地读到另一条序列的草稿。
+            #
+            #   各行先收集起来、一次写入：逐行写入要为这么短的一行付出约245ns的分发开销，所以这段整理的时间主要花在分发上
+            #   （bs=256时快3.7倍）。不满宽度的行补齐，而不是让整个batch退回逐行写法，因为batch很大时几乎每一步都有序列
+            #   刚加入decode，它会把其他所有序列一起拖回慢路径。
+            # 解释：三种行——草稿数正好num_spec_step的直接用；没有草稿（新进decode的、P/D producer）的用共享的全0行；
+            #   长度不对的拷一份补齐/截断，绝不改共享的那一行
             no_drafts = np.zeros(num_spec_step, dtype=np.int32)
             rows = []
             for req_id in self.req_ids:
@@ -373,56 +811,103 @@ class ScheduledBatch:
                 elif drafts is None or drafts.size == 0:
                     rows.append(no_drafts)
                 else:  # short or long: onto a row of its own, never the shared one
+                    # 【译】过短或过长：放到它自己的一行上，绝不写进共享的那一行
                     padded = no_drafts.copy()
                     padded[: min(drafts.size, num_spec_step)] = drafts[:num_spec_step]
                     rows.append(padded)
             # `concatenate` rejects an empty list, which a warmup batch is.
+            # 【译】concatenate 不接受空列表，而warmup batch就是空的。
             flat = (
                 np.concatenate(rows, dtype=np.int32)
                 if rows
                 else np.empty(0, dtype=np.int32)
             )
+            # int32 [bs, num_spec_step]；读者：tokenIDProcessor.prepare_input_ids（把新进decode的行的草稿写进input_ids的草稿列）
+            # 注意：num_spec_step == 0时根本不会创建这个属性，读它之前要先看num_spec_step（ModelRunner就是这么做的）
             self.scheduled_spec_decode_tokens = flat.reshape(len(seqs), num_spec_step)
+        # list[BlockTable]：每行的block table（逻辑block → 物理block id），只收block_table非空的行
+        #   放进去的是seq.block_table对象本身（引用，不拷贝）；发给worker时block_table_codec.py只发"比上次多出来的id"
+        #   读者：注意力metadata builder的prepare_block_tables（拼成[bs, max_blocks]的block_tables张量）、prefill的slot_mapping
+        #   注意：只要有一行是空表，后面各行就会和req_ids错位。实际的batch要么每行都有表，要么全都没有（warmup、profiling的
+        #   假批：不写KV，slot_mapping全填-1），backends.py用 len(batch.block_tables) >= scheduled_bs 断言前一种情况
         self.block_tables = [
             seq.block_table for seq in seqs.values() if seq.block_table
         ]
+        # list[int] [bs]：每行最后一个block里有几个token（seq.last_block_num_tokens，按当前num_tokens算、含占位，不是按本chunk
+        #   的结束位置算）；读者：aiter_mla.py的kv_last_page_lens
         self.last_block_num_tokens = [
             _seq.last_block_num_tokens for _seq in seqs.values()
         ]
 
         # Total number of tokens scheduled for all requests.
+        # 【译】为所有请求调度的token总数。
+        # total_tokens_num = len(scheduled_tokens)（上面已校验）；_prefill / _decode是其中prefill行 / decode行的token数，
+        #   基类调度器的批里两者必有一个为0。ModelRunner用 total_tokens_num_prefill > 0 判断"这是prefill步"（prepare_inputs、
+        #   注意力builder的build），用total_tokens_num定input_ids的长度、选CUDA Graph档位等
         self.total_tokens_num = total_tokens_num
         self.total_tokens_num_prefill = total_tokens_num_prefill
         self.total_tokens_num_decode = total_tokens_num_decode
 
         # Total number of reqs scheduled for all requests.
+        # 【译】为所有请求调度的请求（序列）总数。
+        # total_seqs_num = bs，ModelRunner把它当scheduled_bs（截断logits、采样的行数）。调用方必须显式传入：默认值0不会自动
+        #   等于len(seqs)
+        # 观察：几处代码对"混合批里谁在前"的假设不一致——backends.py prepare_prefill要求前total_seqs_num_prefill行是prefill行，
+        #   下面prefill_gpu_requests却按"前total_seqs_num_decode行是decode行"跳过；基类调度器从不混合，所以目前两者都成立
         self.total_seqs_num = total_seqs_num
         self.total_seqs_num_prefill = total_seqs_num_prefill
         self.total_seqs_num_decode = total_seqs_num_decode
 
+        # 【分支】KV connector（PD分离 / KV offload，第9批）本步的元数据（kv_connector.build_connector_meta()）：EngineCore在
+        #   forward之前单独用process_kvconnector_output RPC发给worker（触发异步KV加载/保存），ModelRunner.forward本身不读它；
+        #   PP时pp_engine_core把它随元数据一起转发
         self.connector_meta_output = connector_meta_output
+        # 观察：构造后一直是空列表，atom/下没有任何地方写入或读取batch.finished_recving_kv_req_ids
+        #   （调度器自己的self.finished_recving_kv_req_ids是另一个列表）
         self.finished_recving_kv_req_ids: list[int] = []
 
+        # True：不是调度器排出来的真实批，而是ModelRunner.dummy_execution（DP陪跑）、warmup、动态分块profiling造的假批；
+        #   ModelRunner和各注意力后端据此跳过GPU计时、PCP重排、草稿KV写入等只对真实请求有意义的步骤（调度器从不置True）
         self.is_dummy_run = is_dummy_run
+        # 【分支】投机解码：本批每个decode行要验证的草稿数（decode批 = mtp_k，本引擎不验证或prefill批 = 0），
+        #   决定max_seqlen_q = num_spec_step + 1
         self.num_spec_step = num_spec_step
         # Set by the PP head on a batch whose completion it waits for although
         # the batch produces no output. It travels with the metadata, so the
         # last stage acks exactly the batches the head waits on.
+        # 【译】由PP head在这样的batch上设置：这个batch不产生输出，head却要等它完成。它随元数据一起传递，所以最后一个stage
+        #   恰好为head等待的那些batch回ack。
+        # 【分支】流水线并行（第9批，pp_engine_core.py）
         self.pp_completion_ack = False
 
         # Detailed attention aggregates (set by Scheduler.compute_detailed_aggregates
         # when profiling is active and ATOM_ENABLE_DETAILED_ANNOTATION is set).
         # None on the normal path; consumed by ModelRunner.run_model to extend
         # the prefill[]/decode[] trace labels.
+        # 【译】详细的注意力聚合量（在profiling开启且设置了 ATOM_ENABLE_DETAILED_ANNOTATION 时，由
+        #   Scheduler.compute_detailed_aggregates 设置）。正常路径上为None；由 ModelRunner.run_model 读取，用来扩展
+        #   prefill[]/decode[] 的trace标签。
+        # 【分支】指标 / profiling（第10批）：EngineCore在forward之前调用compute_detailed_aggregates填这三个数
         self.detailed_sqsq: int | None = None  # sum N_Q^2
         self.detailed_sqsk: int | None = None  # sum N_Q*N_KV
         self.detailed_sk: int | None = None  # sum N_KV
+        # 【译】（上面三行的行尾注释）依次为 Σ N_Q²、Σ N_Q·N_KV、Σ N_KV；N_Q是该请求本步的query token数，N_KV是它的KV长度
 
         # Key into ModelRunner's stream pool for CU-masked disagg streams.
         # None means full-CU fallback (no mask).
+        # 【译】ModelRunner的stream池里"CU屏蔽的分离stream"的键。None表示退回整卡CU（不屏蔽）。
+        # 【分支】RapidServe（同一组GPU上的PD分离，第9批）：PrefillScheduler / DecodeScheduler用_optimal_cu_fraction算出
+        #   （目前只有None或0.5），ModelRunner按它挑一个只用部分CU的stream来发本批的kernel
         self.cu_stream_fraction = cu_stream_fraction
         # Explicit spans support arbitrary chunks. Retain the CPU payload on
         # the request for retry, and omit pixels after workers acknowledge it.
+        # 【译】显式的span支持任意切块。CPU侧的数据保留在请求上以便重试，worker确认之后就不再发送像素。
+        # 【分支】多模态（第2批2b；引擎侧的视觉缓存见multimodal_runtime.py开头）：{seq.id: 本次prefill要用的媒体数据}，只收prefill行
+        #   - 带embedding_spans的（可以任意切块）：prefill_media_payload只拷一份元数据；worker已缓存视觉编码结果
+        #     （seq.multimodal_cache_ready）之后连pixel_values也不再发；seq上的原数据保留，用于重试
+        #   - 不带的（只能整段prefill，见_requires_atomic_prefill）：整份交出去，并清空seq.multimodal_data
+        #   读者：ModelRunner.run_model（视觉编码 / embedding替换）、multimodal_runtime.py
+        #   注意：这是构造函数里少数会改Sequence的地方（清空seq.multimodal_data；下面prefill_gpu_*的计数同理）
         self.multimodal_data = {}
         for seq in seqs.values():
             data = getattr(seq, "multimodal_data", None)
@@ -435,6 +920,8 @@ class ScheduledBatch:
             else:
                 self.multimodal_data[seq.id] = data
                 seq.multimodal_data = None
+        # list[str | None] [bs]：每行的外部请求id（seq.external_request_id，HTTP层给的request_id）；
+        #   读者：【分支】RL rollout（第10批）的rollout/model_runner_ext.py
         self.external_request_ids = [seq.external_request_id for seq in seqs.values()]
 
         # Metrics reporting only: per-request prefill chunks for GPU timing.
@@ -442,6 +929,12 @@ class ScheduledBatch:
         # especially for short decode forwards; skip this bookkeeping when off.
         # Freeze request chunk boundaries before schedule-time advancement.
         # Workers receive copies of the batch, not the mutable Sequence objects.
+        # 【译】仅用于指标上报：按请求记录prefill的各个chunk，用于GPU计时。设备计时需要显式开启，因为记录GPU事件有开销，
+        #   对很短的decode forward尤其明显；关闭时跳过这部分记账。在调度时推进进度之前，先把请求的chunk边界冻结下来。
+        #   worker收到的是batch的拷贝，而不是可变的Sequence对象。
+        # 【分支】指标（第10批）：ATOM_ENABLE_METRICS_DEVICE_TIMER开启时，为每个"初次prefill"的chunk记一项
+        #   (seq.id, 这是第几个chunk, 是否最后一块)，metrics/gpu.py据此给每个请求的初次prefill计GPU时间
+        #   "是否最后一块"优先用调度器冻结的is_final_chunk，没有时按长度推算；同时更新seq.prefill_gpu_chunks / prefill_gpu_complete
         self.prefill_gpu_requests = []
         if (
             not is_dummy_run
@@ -453,6 +946,7 @@ class ScheduledBatch:
                     continue
                 # Re-prefill after generation has started is not initial prefill
                 # (also excludes D recomputation following a remote prefill).
+                # 【译】生成开始之后的重新prefill不算初次prefill（这也排除了远端prefill之后D端的重算）。
                 if seq.num_tokens > seq.num_prompt_tokens:
                     continue
                 final = (
@@ -467,12 +961,17 @@ class ScheduledBatch:
                     (seq.id, seq.prefill_gpu_chunks, final)
                 )
 
+        # 下面5行是被注释掉的调试日志（打印本批的草稿键、每行token数、context_lens、block table），不是说明文字
         # logger.info(f"{[el for el in scheduled_spec_decode_tokens.keys()]=}")
         # logger.info(f"{self.num_scheduled_tokens=}")
         # logger.info(f"{self.context_lens=}")
         # logger.info(f"{[len(blk)*16 for blk in self.block_tables]=}")
         # logger.info(f"{self.block_tables=}")
 
+    # 本批forward之后，"头"（单机时是EngineCore，PP时是head stage）要不要等 / 处理一个新token
+    #   读者：ModelRunner.forward（False时跳过ModelRunner.postprocess，即采样和propose，直接返回空的ScheduledBatchOutput）、
+    #     tokenIDProcessor.prepare_input_ids（False时不取MTP状态队列）、pp_engine_core.py
+    #   例：文件开头例子step 1的[A整段, B第1块] → True（A是最后一块）；若某一步只有B的第1块 → False
     def produces_output(self) -> bool:
         """True if this batch yields a token the head must consume.
 
@@ -484,13 +983,31 @@ class ScheduledBatch:
         dummy is what flushes the last real one. Skip its `postprocess` and
         the request waking up after it has an anchor on neither side.
         """
+        # 【译】若本batch产出一个head必须消费的token，返回True。
+        #
+        #   decode batch总是产出。纯prefill batch只有在至少一个seq处于最后一个chunk时才产出token；全是中间chunk的batch
+        #   什么也不产出。
+        #
+        #   DP同步用的dummy回答True，而且必须如此：上报晚一步，所以正是dummy把最后一个真实batch的结果冲刷出来。
+        #   若跳过它的 postprocess，在它之后被唤醒的请求在两边都没有锚点。
+        # 解释：dummy batch是decode形状（total_seqs_num_decode=1，见ModelRunner.dummy_execution），走第一个分支返回True。
+        #   延迟输出下第N步的token要到下一次forward才交回；空闲rank最后一个真实批之后接的就是dummy
         if self.total_seqs_num_decode > 0:
             return True
+        # is_final_chunk为None：PrefillScheduler的批（每条都整段prefill），或没带这个字段的调用方——按"产出"处理
         if self.is_final_chunk is None:
             return True
         return any(self.is_final_chunk)
 
 
+# 【分支】状态checkpoint的切点下界（第4批；概念见sequence.py Replay类上方"科普：状态checkpoint与有界重放"）
+#   调用方：Scheduler._finalize_prefill_chunk（传resume=start）/ _preview_prefill_chunk；结果交给
+#     BlockManager.checkpoint_cut(seq, floor, end)，后者在(floor, end]里找最早的checkpoint阶梯位置
+#   floor = max(本forward起点start, 恢复点resume, seq.replay_until)：恢复点以下是"为重建状态而重算的已缓存行"，在那里切出的
+#     checkpoint没有价值；DeepSeek-V4有界重放（seq.replays_hit）到恢复点时状态已完整重建，所以floor减1，允许切点正好落在
+#     恢复点上
+#   例：重放起点start=12291，seq.replay_until=12800 → floor=12800，普通情况切点要 > 12800；V4有界重放时floor=12799，
+#     切点可以 = 12800
 def _cut_floor(seq: Sequence, start: int, resume: int) -> int:
     """Where a checkpoint cut of a forward from `start` must land above: where
     the seq resumed (`resume`, or the `until` of the replay the forward
@@ -499,21 +1016,47 @@ def _cut_floor(seq: Sequence, start: int, resume: int) -> int:
     bounded replay has rebuilt the state whole by that point, so a cut may land
     right on it, and a later branch at the same hit restores from there instead
     of replaying again."""
+    # 【译】一次从 start 开始的forward，其checkpoint切点必须落在什么位置之上：序列恢复的位置（resume，或这次forward所延续的
+    #   那次重放的 until），因为在它下方，重算已缓存行的forward（BlockManager.replay_start）不持有任何值得保留的状态。
+    #   DeepSeek-V4的有界重放到那一点时已经把状态完整重建，所以切点可以正好落在它上面，之后在同一命中处分出来的请求
+    #   就能从那里恢复，而不必再重放一次。
     floor = max(start, resume, seq.replay_until)
     if seq.replays_hit and floor > start:
         floor -= 1
     return floor
 
 
+# 【分支】有界重放 / 状态replay（第4、8批）：给BlockManager.hash_blocks的replay_until参数
+#   调用方：Scheduler.postprocess、register_prefill_hashes——重放段[起点, until)是重算的已缓存行，hash_blocks不为它们重新
+#   登记hash；用batch里冻结的值，而不是seq上活的值（见下面的docstring）
+#   getattr(batch, "replaying", None) or {}：batch没有这个字段（或为None）时当作空dict
 def _scheduled_replay_until(batch, i: int) -> int:
     """Where batch entry `i`'s forward resumed if it started below that point
     (`ScheduledBatch.replaying`), as scheduled, 0 otherwise. Under pipeline
     parallelism a later chunk's scheduling may already have moved the live
     `Sequence.replay` by the time this batch is post-processed."""
+    # 【译】若batch第i项的forward从它的恢复点下方开始（ScheduledBatch.replaying），返回调度时记录的那个恢复点，否则返回0。
+    #   流水线并行下，等这个batch被postprocess时，后面某个chunk的调度可能已经改动了活的 Sequence.replay。
     replay = (getattr(batch, "replaying", None) or {}).get(i)
     return 0 if replay is None else replay.until
 
 
+# =============================================================================================
+# ScheduledBatchOutput：ModelRunner.forward交回调度器的"这一步的结果"（只有TP rank 0的那份回到EngineCore）
+# =============================================================================================
+# 谁构造：ModelRunner.postprocess（采样、投机验证之后）；全是中间chunk的batch（以及PP的非末级stage）不采样，
+#   ModelRunner.forward直接返回token_ids=[]的空结果
+# 谁读：Scheduler.postprocess，按get_idx(seq.id)找到每条序列在结果里的那一行
+# 为什么按请求id、而不是按行号对齐：开延迟输出时（默认，原理见engine_core.py文件开头【3】），第N次forward交回的是
+#   上一个"产出token的batch"的采样结果，它的行顺序和本步的batch不同。用文件开头的例子：
+#     第几步             1                           2                             3
+#     本步的batch        prefill [A整段, B第1块]     prefill [B第2块, C整段]       decode [A, B, C]
+#     交回的req_ids      []（第一次forward）         [A, B]（step 1的）            [B, C]（step 2的）
+#     postprocess做的事  给A放1个占位                A的占位 ← A的第1个token；     B、C的占位 ← 各自的第1个token；
+#                                                    B那个是中间块的采样，丢弃；   A不在结果里，跳过；
+#                                                    给B、C各放1个占位             A、B、C各放1个新占位
+#   这就是"postprocess为什么要处理延迟一步的输出"：结果总是晚一步，所以要先占位、再按id把晚到的token填回去
+# 对比nano-vllm：nano-vllm的run()直接返回本步token的list[int]，与seqs按位置一一对应，不需要这个类
 class ScheduledBatchOutput:
     """Token-level results from a single forward pass.
 
@@ -524,6 +1067,15 @@ class ScheduledBatchOutput:
         num_bonus: Per-request count of bonus accepted tokens.
         is_deferred_out: Whether output was deferred from a previous step.
     """
+
+    # 【译】一次forward的token级结果。
+    #   属性：
+    #     token_ids：请求ID -> 被接受的token ID。
+    #     draft_token_ids：投机草稿token（每个请求一行）。
+    #     num_rejected：每个请求被拒绝的投机token数。
+    #     num_bonus：每个请求额外被接受的token数。
+    #     is_deferred_out：输出是否是从上一步延迟过来的。
+    # 解释：token_ids实际是与req_ids按位置对齐的list[tuple[int, ...]]，不是dict；"请求ID → token"的映射要经get_idx
 
     def __init__(
         self,
@@ -537,24 +1089,43 @@ class ScheduledBatchOutput:
         logprobs=None,
         dspark_ell: np.ndarray | None = None,
     ):
+        # list[int]：这些结果属于哪些请求（开延迟输出时是上一个产出token的batch的req_ids；第一次forward时为空）
         self.req_ids = req_ids
+        # list[tuple[int, ...]]，与req_ids按位置对齐：每个请求这一步新得到的token。不开MTP时每个tuple只有1个；
+        #   开MTP时是被接受的草稿加上主模型自己的那1个（1 ~ mtp_k+1个）
         self.token_ids = token_ids
+        # 【分支】投机解码（第7批）：每个请求一行草稿token（按req_ids对齐），postprocess存进seq.spec_token_ids，下一次decode
+        #   拿去验证；ModelRunner没跑propose时（如P/D producer、中间chunk的空结果）为None
         self.draft_token_ids = draft_token_ids
+        # 【分支】投机解码：int32数组，每个请求被拒 / 被接受的草稿数；postprocess写回seq.num_rejected / num_bonus_tokens，并据此
+        #   算出这次真正追加了几个token、要覆盖几个占位；中间chunk的空结果里为None
         self.num_rejected = num_rejected
         self.num_bonus = num_bonus
+        # 是否开着延迟输出（= ModelRunner的tokenID_processor.is_deferred_out）：True时postprocess原地覆盖之前放好的占位token，
+        #   而不是直接追加；并且跳过本步刚做prefill的序列（它们的结果下一步才回来）
         self.is_deferred_out = is_deferred_out
+        # 观察：ModelRunner构造ScheduledBatchOutput时从不传这个参数，atom/下也没有地方读它，恒为False
         self.is_prev_prefill = is_prev_prefill
+        # {req_id: 采样token的logprob}：只有batch里有请求要logprobs时才有，否则None（行尾的英文是类型标注）
         self.logprobs = logprobs  # Optional[dict[int, float]]
         # DSpark Phase 2: {req_id: ell_r} from this step's propose() — the
         # scheduler-chosen verify length per request. Rides back to the
         # (main-process) scheduler so the NEXT step can size each request's
         # verification to ell_r+1. None when DSpark scheduling is off.
+        # 【译】DSpark第二阶段：本步 propose() 得到的 {req_id: ell_r}——调度器为每个请求选定的验证长度。它随结果回到
+        #   （主进程里的）调度器，让下一步把每个请求的验证长度定为 ell_r+1。DSpark调度关闭时为None。
+        # 【分支】DSpark（块并行草稿，第7批）
+        # 观察：类型标注写的是np.ndarray | None，实际传入、使用的都是dict（dspark_verify.py的ell_nonblocking返回dict，
+        #   postprocess里用dspark_ell.get(seq.id)）
         self.dspark_ell = dspark_ell
         # O(1) lookup: req_id -> index (lazy-built on first access)
+        # 【译】O(1)查找：req_id -> 下标（第一次访问时才构建）
         self._req_id_to_idx: dict[int, int] | None = None
 
     def get_idx(self, req_id: int) -> int | None:
         """O(1) lookup of request index by id."""
+        # 【译】按id以O(1)查找请求的下标。
+        # 返回None：这个请求不在本结果里（例如它本步刚做prefill、结果下一步才回来），postprocess遇到None就跳过该序列
         if self._req_id_to_idx is None:
             self._req_id_to_idx = {rid: i for i, rid in enumerate(self.req_ids)}
         return self._req_id_to_idx.get(req_id)
