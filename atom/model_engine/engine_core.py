@@ -185,7 +185,8 @@ from atom.utils.gc_utils import (
 #     GPU1：没收到第N步，停在别处 ──✗
 #   所以EngineCore只调度一次，把同一个ScheduledBatch经共享内存MessageQueue广播给每个worker（async_proc.py），
 #     每个rank执行完全相同的forward，只有rank 0把结果送回
-#   用进程而不是线程：每个rank独占一张GPU、各自发射大量kernel，Python里的kernel发射是CPU密集的，多线程会被GIL串行化；
+#   用进程而不是线程：每个rank独占一张GPU、各自发射大量kernel，Python里的kernel发射是CPU密集的，多线程会被GIL（CPython的全局解释器锁：
+#     同一时刻只有一个线程在执行Python代码）串行化；
 #     RCCL/NCCL的惯例也是一个进程一个rank。EngineCore自己也不兼任rank 0（nano-vllm是主进程兼任rank 0），
 #     于是调度/postprocess不会和rank 0的kernel发射争同一个GIL
 #   DP>1时还要跨DP rank锁步，见下面的DPEngineCoreProc
@@ -255,7 +256,7 @@ class EngineCore:
     #     单是MLP的gate/up输出 [16384, 2×28672] BF16 就 ≈ 1.9GB。KV cache只能分配在这个峰值之外，否则运行中一次满额prefill就会OOM
     #   CUDA Graph的私有内存池：录图时forward里的中间张量都从一个专用池分配，地址被写死进graph、回放时原地复用，
     #     所以这块显存录完后一直被占着、不能再分给KV（各个batch尺寸的graph共用一个池，图解见utils/__init__.py里
-    #     weak_ref_tensor上方；CUDA Graph本身见config.py里CUDAGraphMode上方的【科普】）
+    #     _ATOM_WEAKREF_OP上方的"覆盖复用"；CUDA Graph本身见config.py里CUDAGraphMode上方的【科普】）
     #
     # 为什么启动顺序必须是 加载权重 → warmup → 测显存算block数 → 分配KV → 捕获CUDA Graph → 建Scheduler：
     #   ① warmup（ModelRunner.__init__末尾的_maybe_warmup → warmup_model）：先reset_peak_memory_stats，再跑一次
@@ -271,7 +272,7 @@ class EngineCore:
     #     而block数就是调度器的准入上限（BlockManager没有空闲block时请求只能等待或被抢占），所以必须测完才能建Scheduler
     #   ④ CUDA Graph在KV分配之后捕获：graph里记录的是kernel参数中的显存地址，KV cache必须已经在它最终的地址上；
     #     graph私有内存池占的显存已经在②里用_estimate_cudagraph_overhead预留
-    #   ⑤ 最后冻结GC（_freeze_after_startup）：启动期要活一辈子的对象此时都已建好，见gc_utils.py
+    #   ⑤ 最后冻结GC（_freeze_after_startup）：启动期要活一辈子的对象此时都已建好（分代GC与gc.freeze见gc_utils.py文件开头的【科普】）
     #
     # 启动流程图（单DP、非PD分离；每一格右边是"在哪个进程里做"）：
     #   ┌───────────────────────────────────────────────┐

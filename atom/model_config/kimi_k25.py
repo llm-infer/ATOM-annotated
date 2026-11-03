@@ -20,7 +20,7 @@ A video-chunk is the smallest independently processable unit of video.
 # 原生ATOM路径不用这个类：config.get_hf_config对model_type="kimi_k25"只抽出text_config，
 #   按text_config的model_type经_CONFIG_REGISTRY映射（如kimi_k2 -> deepseek_v3）后解析，见本批config.py；
 #   原生的models/kimi_k25.py只跑文本主干，加载时跳过视觉塔和投影器的权重（与Qwen3.5不同，见qwen3_5.py科普①）
-# 【分支】vLLM插件见第10批；DeepSeek-V3结构（MLA、MoE）见第7批（"第N批"指仓库根目录ANNOTATION_PLAN.md里的阅读批次）
+# 【分支】vLLM插件见第10批；DeepSeek-V3结构（MLA、MoE；是什么见下方【科普】①②）见第7批（"第N批"指仓库根目录ANNOTATION_PLAN.md里的阅读批次）
 #
 # =====================================================================================
 # 【科普】文本部分：DeepSeek-V3结构（text_config是DeepseekV3Config）
@@ -28,12 +28,18 @@ A video-chunk is the smallest independently processable unit of video.
 # 和你熟悉的"MHA + dense FFN"Transformer相比，DeepSeek-V3改了两处：注意力换成MLA，FFN换成MoE。
 #
 # ① MLA（Multi-head Latent Attention，多头潜在注意力）——目的：把KV cache压到极小
+#   （MLA入门——只缓存576个数、所有q头读同一份、相当于只有1个KV头所以TP按头切不开——的规范位置是
+#    model_engine/arg_utils.py EngineArgs.tensor_parallel_size下方的【科普】MLA；那里和config.py的k-pool科普都把
+#    "完整推导"指到本节，所以这里从MHA一步步推到底）
 #   MHA每层每个token要缓存 num_heads 份K和V。DeepSeek-V3有128个头，K每头192维、V每头128维，
 #     一个token一层就是 128 x (192 + 128) = 40960 个数，长上下文时KV cache会非常大。
-#   MLA的做法：不直接存K、V，而是先把hidden压缩成一个很短的"潜在向量"c（kv_lora_rank=512维），只缓存它；
-#     用的时候再用两个上投影矩阵从c还原出每个头的K和V（"低秩分解"，lora_rank即低秩维度）。
-#   RoPE的麻烦：RoPE要对K按位置旋转，旋转后就没法再和上投影矩阵"合并"了。所以MLA把K拆成两部分：
-#     - 不带位置的部分（qk_nope_head_dim=128）：从c还原
+#   第1步，低秩压缩：不直接存K、V，而是先把hidden压缩成一个很短的"潜在向量"c（kv_lora_rank=512维），只缓存它；
+#     用的时候再用两个上投影矩阵W_UK、W_UV从c还原出每个头的K和V（"低秩分解"，lora_rank即低秩维度）。
+#   第2步，权重吸收（decode时的技巧）：q·k = q·(W_UK c) = (W_UKᵀ q)·c，即把K的上投影矩阵合并进Q、把V的上投影合并进输出投影，
+#     注意力直接在512维的c上算，不必真的把每个头的K、V还原出来。
+#   第3步，RoPE的麻烦：RoPE按位置旋转q和k，旋转后的点积 = qᵀ·R(两token的相对位置)·W_UK·c，中间夹着一个随位置变化的
+#     旋转矩阵，W_UK就没法事先合并进Q了。所以MLA把K拆成两部分：
+#     - 不带位置的部分（qk_nope_head_dim=128）：从c还原，可以照第2步吸收
 #     - 带位置的部分（qk_rope_head_dim=64）：所有头共享一份，单独算、单独缓存
 #   于是每个token每层只缓存 512 + 64 = 576 个数，约为MHA的1/71。
 #   图示（某一层、一个token要往KV cache里存什么；数字是DeepseekV3Config的默认值）：
@@ -44,14 +50,14 @@ A video-chunk is the smallest independently processable unit of video.
 #           算注意力时：c ──kv_b_proj（W_UK）──> 128个头各自的k_nope（128维），k = [k_nope ; k_rope]
 #                       c ──kv_b_proj（W_UV）──> 128个头各自的v（128维）
 #   GQA是"少存几个头"，MLA是"存一个压缩后的向量、用时再展开"，所以能比GQA省得更多
-#   decode时还有个技巧（"权重吸收"）：q·k_nope = q·(W_UK c) = (W_UKᵀ q)·c，即把K的上投影矩阵合并进Q、把V的上投影合并进输出投影，
-#     注意力直接在512维的c上算，不必真的把每个头的K、V还原出来。ATOM的实现见第7批 attention_mla.py。
+#   decode时用第2步的权重吸收在c上直接算注意力（k_nope部分吸收、k_rope部分照常点积）。ATOM的实现见第7批 attention_mla.py。
 #   Q也做了类似的压缩（q_lora_rank），主要为了省参数和计算，与KV cache无关。
 #
 # ② MoE（混合专家）——目的：参数多、算得少
 #   通用原理和图示见 qwen3_next.py 文件头科普⑤（路由专家 + 共享专家）。DeepSeek-V3的数字（DeepseekV3Config默认值）：
 #     256个路由专家里每个token挑8个，另有1个共享专家；开头 first_k_dense_replace=3 层仍是普通的dense FFN。
-#     Kimi-K2沿用这个结构，只是专家更多（384个）。
+#     Kimi-K2 / K2.5沿用这个结构，主要差别是路由专家更多（384个，每个token仍挑8个）、注意力头更少（64个），
+#     见recipes/Kimi-K2.md的Architecture Details；MLA每token缓存的576个数与头数无关，所以头数减半不改变KV cache大小。
 #   ATOM的实现见第7批 moe.py、topK.py。
 #
 # 顺带一提（本文件用不到，但DeepSeek家族常见）：
@@ -67,6 +73,8 @@ A video-chunk is the smallest independently processable unit of video.
 #   和其他多模态模型一样（可参考 qwen3_5.py 文件头科普①）：图片切成14x14像素的patch -> 过ViT（视觉Transformer）
 #     -> 相邻2x2个patch合并（merge_kernel_size）-> 投影器（mm_projector）映射到文本hidden维度 ->
 #     替换prompt里的占位token（media_placeholder_token_id）。
+#   例：一张448x448的图 -> 14x14像素的patch共32x32 = 1024个 -> 2x2合并后256个视觉token
+#     （Qwen3.5的patch是16x16，同一张图是28x28 = 784个patch、合并后196个视觉token）
 #   视频按"video-chunk"处理：几帧连续画面作为一个单元，ViT里同时做空间和时间维的注意力（video_attn_type），
 #     合并时除了2x2空间合并，还把同一位置不同帧的特征取平均（merge_type="sd2_tpool"，tpool = temporal pooling，
 #     时间维池化），所以一段视频不会因为帧多而产生成倍的视觉token。

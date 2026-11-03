@@ -19,7 +19,7 @@
 # 【译】Qwen3.5-MoE模型配置
 #
 # 本文件是qwen3_5.py的MoE版本：Qwen3_5MoeTextConfig、Qwen3_5MoeVisionConfig、Qwen3_5MoeConfig，
-#   与dense版逐字段对应，只是文本配置把dense FFN（intermediate_size）换成了MoE的一组字段
+#   与dense版逐字段对应，只是文本配置把dense FFN（intermediate_size）换成了MoE的一组字段（MoE是什么见下方【科普】）
 #   共有字段（layer_types、linear_*、RoPE、v4覆盖问题等）的解释见qwen3_5.py，这里只注释差异
 # 调用方：models/qwen3_5.py用Qwen3_5MoeTextConfig做类型标注并再导出Qwen3_5MoeConfig；
 #   与dense版一样，仓库里没有地方直接实例化这些类，运行时的hf_config来自config.get_hf_config
@@ -27,11 +27,13 @@
 #   （"第N批"指仓库根目录ANNOTATION_PLAN.md里的阅读批次）
 #
 # 【科普】MoE（混合专家）一句话：把每层的一个大FFN换成很多小FFN（专家），每个token由路由器挑top-k个来算，
-#   参数总量大但每个token的计算量小。详细说明见 qwen3_next.py 文件头科普⑤；
+#   参数总量大但每个token的计算量小。详细说明（路由器、路由专家 + 共享专家、专家内部的SwiGLU）见 qwen3_next.py 文件头科普⑤；
 #   多模态、M-RoPE见 qwen3_5.py 文件头科普①②；GDN线性注意力见 qwen3_next.py 文件头科普②（混合层排布见③）。
 # 和dense版的对比（默认值）：
 #   dense：hidden 4096、32层，每层一个 4096 -> 12288 -> 4096 的FFN
 #   MoE：  hidden 2048、40层，每层256个 2048 -> 512 -> 2048 的小专家（每个token用8个）+ 1个共享专家
+#   按SwiGLU的3个矩阵算参数：dense每层 3 × 4096 × 12288 ≈ 1.51亿，32层 ≈ 48亿，每个token全部用到；
+#     MoE每个专家 3 × 2048 × 512 ≈ 315万，每层256个 ≈ 8.05亿，40层 ≈ 322亿，但每个token每层只用 8 + 1 个 ≈ 2830万
 from transformers.configuration_utils import PretrainedConfig, layer_type_validation
 
 
@@ -40,7 +42,7 @@ class Qwen3_5MoeTextConfig(PretrainedConfig):
     model_type = "qwen3_5_moe_text"
     keys_to_ignore_at_inference = ["past_key_values"]
 
-    # 科普：gate_up_proj是什么——现代FFN是SwiGLU：FFN(x) = down( silu(gate(x)) * up(x) )，
+    # gate_up_proj是什么：专家FFN是SwiGLU（FFN(x) = down( silu(gate(x)) * up(x) )，见qwen3_next.py科普⑤），
     #   gate和up是两个同形状的投影，常把它们拼成一个矩阵gate_up_proj一次算完（ATOM也这样融合，第6批）
     # HF的张量并行方案（ATOM运行时不读）：experts.gate_up_proj是"packed_colwise"，
     #   说明HF把所有专家的gate/up权重打包成一个张量；ATOM加载时用detect_fused_expert_format区分

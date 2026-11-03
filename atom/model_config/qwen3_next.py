@@ -21,6 +21,7 @@
 # 本文件给Qwen3-Next定义HF配置类Qwen3NextConfig（改编自transformers / vLLM，见文件头版权行）
 # Qwen3-Next = 混合注意力 + MoE：默认每4层里前3层是Gated DeltaNet线性注意力、第4层是全注意力（默认带输出门attn_output_gate），
 #   FFN是"路由专家 + 共享专家"的MoE；它也是Qwen3.5（qwen3_5.py）的结构基础
+#   （GDN、混合排布、输出门、MoE / 共享专家分别见下方科普②③④⑤）
 # 调用方：
 #   models/qwen3_next.py、models/qwen3_next_mtp.py：用它标注atom_config.hf_config的类型
 #   plugin/vllm/models/qwen3_next.py：同样只做类型标注
@@ -94,6 +95,10 @@
 #          │                                                                     ├──> 相加 = 这一层MoE的输出
 #          └──> 共享专家（2048->512->2048，每个token都过）× sigmoid(shared_expert_gate) ┘
 #       512个路由专家只算了10个（约2%），这就是"参数多、算得少"
+#   每个专家（以及共享专家）都是nano-vllm里Qwen3的MLP那种SwiGLU：FFN(x) = down( silu(gate(x)) * up(x) )，
+#     gate、up是两个 2048->512 的投影（常拼成一个gate_up_proj一次算完，ATOM也这样融合，第6批），down是 512->2048。
+#     所以一个专家 = 3 × 2048 × 512 ≈ 315万参数；一层512个 ≈ 16.1亿，48层 ≈ 773亿——名字里"80B"的绝大部分是路由专家；
+#     每个token每层只用10个再加共享专家（11 × 315万 ≈ 3460万），48层合计约16.6亿，这是"A3B"里MoE那一块
 #   共享专家（shared expert）：一个所有token都必经的FFN，学通用知识，路由专家学专门知识，两者输出相加。
 #     Qwen3-Next的共享专家输出还会乘一个sigmoid门（shared_expert_gate）。
 #   norm_topk_prob=True：选出的k个专家的权重重新归一化，使它们加起来等于1。

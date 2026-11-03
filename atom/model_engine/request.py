@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional
 # 例：prompt后依次生成"Hello"" world""!"三个token（非投机、非延迟输出），回调大致收到三次：
 #   ([id_Hello], finished=False) -> ([id_world], False) -> ([id_!], True, finish_reason="eos"或"max_tokens")
 #   投机解码一步可能接受多个token，这时一次回调的output_tokens会有多个元素
+#     （投机解码：草稿模型先猜几个token、主模型一次forward验证，见sequence.py num_draft_tokens处的科普）
 #
 # 时序图：一个在线流式请求的RequestOutput怎样回到客户端（已核对scheduler.py / engine_core.py /
 #   engine_core_mgr.py / api_server.py / streaming_dispatch.py）
@@ -76,7 +77,7 @@ class RequestOutput:
     #   CoreManager为未运行就返回的序列兜底填"rejected"（leave_reason为空时），因为空原因在OpenAI协议里表示"仍在生成"
     finish_reason: Optional[str] = None
     # 【分支】PD分离：prefill节点返回给路由层的KV传输信息，decode节点据此拉取KV，见第9批
-    #   （PD分离是什么见sequence.py的SequenceStatus；"第N批"指ANNOTATION_PLAN.md里的阅读批次）
+    #   （PD分离是什么见sequence.py SequenceStatus类上方、状态图之前的"科普：PD分离"；"第N批"指ANNOTATION_PLAN.md里的阅读批次）
     kv_transfer_params_output: Optional[Dict[str, Any]] = None
     # 前缀缓存命中的token数，用于在usage里统计cached tokens
     # 注意：它取自seq.prefix_cache_hit_tokens（Scheduler.postprocess构造时传入），而不是seq.num_cached_tokens；

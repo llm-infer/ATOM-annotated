@@ -22,6 +22,7 @@
 #   Qwen3_5Config（顶层），改编自transformers / vLLM的同名配置（见文件头版权行）
 # Qwen3.5的文本部分是混合架构：默认每4层里前3层是线性注意力（Gated DeltaNet，GDN），第4层是全注意力，
 #   所以除了常规注意力字段，还多了一组linear_*字段描述线性注意力层；结构与Qwen3-Next（qwen3_next.py）相同
+#   （GDN是什么、为什么3层GDN配1层全注意力，见qwen3_next.py文件头科普②③）
 # 调用方：
 #   models/qwen3_5.py：用Qwen3_5TextConfig做类型标注，并把Qwen3_5Config再导出给vLLM插件
 #   plugin/vllm/models/qwen3_5.py：从models/qwen3_5.py导入Qwen3_5Config做类型标注
@@ -77,7 +78,7 @@
 #
 # ③ dense 与 MoE
 #   本文件是dense版：每层的FFN是一个普通MLP（intermediate_size）。qwen3_5_moe.py 是MoE版，
-#     把FFN换成路由专家 + 共享专家，其余（注意力、GDN、视觉部分）完全一样。
+#     把FFN换成路由专家 + 共享专家（见qwen3_next.py科普⑤），其余（注意力、GDN、视觉部分）完全一样。
 # =====================================================================================
 from transformers.configuration_utils import PretrainedConfig, layer_type_validation
 
@@ -112,7 +113,8 @@ class Qwen3_5TextConfig(PretrainedConfig):
     # 字段速查：
     #   全注意力层：num_attention_heads、num_key_value_heads（GQA）、head_dim、attention_bias、rope_parameters
     #   GDN线性注意力层：linear_*（含义见qwen3_next.py科普②）
-    #   dense FFN：intermediate_size、hidden_act（SwiGLU里的激活函数silu）
+    #   dense FFN：intermediate_size、hidden_act（SwiGLU里gate分支的激活函数silu；SwiGLU见qwen3_next.py科普⑤）
+    #     例（默认值）：每层 gate、up 各 4096->12288，down 12288->4096，共 3 × 4096 × 12288 ≈ 1.51亿参数，每个token全部用到
     #   层排布：layer_types（或config.json里的full_attention_interval）
     #   训练专用：initializer_range、attention_dropout
     def __init__(
