@@ -189,8 +189,9 @@ def _is_offload_connector(cfg: object) -> bool:
 #   注①：ATOM的基础调度器一步只做prefill或只做decode、从不混合，而且做到一半的chunked prefill下一步优先续算
 #     （scheduler.py _schedule的Phase 1），所以正在decode的请求要等这条prompt的全部chunk做完；想让decode
 #     在chunk之间插进来，要设ATOM_PREFILL_DECODE_INTERVAL>0（PrefillDelayer的decode保护，见envs.py【调度】）
-#     生效条件（engine_core.py 创建PrefillDelayer处）：DP=1、PP=1、ATOM_ENABLE_PREFILL_DELAYER=1（默认开）、
-#     不是RapidServe；其他部署下这个间隔不起作用
+#     生效条件：先要有PrefillDelayer（ATOM_ENABLE_PREFILL_DELAYER=1，默认开；不是RapidServe），它在两种情况下创建
+#     （engine_core.py）：DP>1 时每个DP rank总会创建（跨DP对齐模式，间隔同样生效）；DP=1 时只有 PP=1 且
+#     ATOM_PREFILL_DECODE_INTERVAL>0 才创建（本地模式）。详见 prefill_delayer.py 文件头【导读】④
 # 例（小模型、16GB卡、显存紧张，来自recipes/Qwen3-8B-FP8.md）：
 #   python -m atom.entrypoints.openai_server --model Qwen3-8B-FP8 --level 0 --kv_cache_dtype bf16 \
 #     --block-size 64 --max-model-len 19456 --gpu-memory-utilization 0.9 -tp 1

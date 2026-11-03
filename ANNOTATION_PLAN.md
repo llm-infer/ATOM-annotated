@@ -376,7 +376,7 @@ C 级示例：
 
 ### 已核实的关键事实（第 1、2 批通读时统一，后续批次注释与之保持一致）
 
-- **一步只做 prefill 或只做 decode**：基础调度器 `_schedule` 排了 prefill 就直接返回，不把 prefill chunk 和 decode 拼进同一个 batch（混合批在源码中仍是 TODO）；做到一半的 chunked prefill 下一步优先续算。想让 decode 插进 chunk 之间，需 `ATOM_PREFILL_DECODE_INTERVAL>0`，且 DP=1、PP=1、`ATOM_ENABLE_PREFILL_DELAYER=1`、非 RapidServe（`engine_core.py` 创建 PrefillDelayer 处）。
+- **一步只做 prefill 或只做 decode**：基础调度器 `_schedule` 排了 prefill 就直接返回，不把 prefill chunk 和 decode 拼进同一个 batch（混合批在源码中仍是 TODO）；做到一半的 chunked prefill 下一步优先续算。想让 decode 插进 chunk 之间，需 `ATOM_PREFILL_DECODE_INTERVAL>0` 且存在 PrefillDelayer（`ATOM_ENABLE_PREFILL_DELAYER=1` 默认开、非 RapidServe）：DP>1 时每个 rank 总会创建（`DPEngineCoreProc` 调 `_init_prefill_delayer(config, dp_group)`），DP=1 时仅在 PP=1 且间隔>0 时创建本地模式（`engine_core.py`）。
 - **CUDA Graph**：原生模式下 `--cudagraph-mode NONE` 仍走整图捕获（`_piecewise_cg_active()` 为 False → 手动 FULL 路径），真正关闭捕获的是 `--enforce-eager`（它不关 torch.compile）；FULL_AND_PIECEWISE 在原生模式下等同 PIECEWISE。
 - **延迟输出**默认开启，条件是 `not is_pipeline_parallel and not hands_off_recurrent_state`（`model_runner.py`）。
 - **原生多模态**：`get_hf_config` 把 `text_config` 当 hf_config，完整 config 存进 `_multimodal_config`；Qwen3.5、Kimi-K3 原生会构建视觉塔，Mistral3、Kimi-K2.5、GLM-5.3 原生只跑文本。
