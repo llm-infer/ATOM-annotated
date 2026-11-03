@@ -4270,6 +4270,7 @@ class Config:
         #                再用索引器（DSA式，见glm5_kpool_block_size上方【科普】②）在压缩行里挑top-k
         #                （recipes/DeepSeek-V4.md：1024）做注意力，外加滑动窗口
         #     ratio 128：HCA：每128个token压成1行，不用索引器、看全部压缩行，外加滑动窗口
+        #   （V4-Pro是30个CSA层 + 31个HCA层 + 1个纯窗口层，见model_ops/attentions/deepseek_v4_attn.py文件头）
         #   m = 4、m' = 128 就是这两种压缩率（models/deepseek_v4.py的DeepseekV4Attention）：
         #
         #       原始token:  0 1 2 3 | 4 5 6 7 | ...... | 252 253 254 255    （一个KV block = 256个原始token）

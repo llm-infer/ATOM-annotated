@@ -1859,7 +1859,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #       当前token"学"往回看3个token，取各阶n-gram（n = 2..4）:  "大学"  "京大学"  "北京大学"
     #         每个n-gram x 每个hash头 ──hash──> 行号 ──> 在巨大的嵌入表里取一行 ──> 投影 + 门控 ──> 加到残差上
     #
-    #   hash之前先把token id映射到一个更小的"规范化词表"（大小写、重音、空白不同的token算同一个，mapping.py的CompressedTokenizer）。
+    #   hash之前先把token id映射到一个更小的"规范化词表"（大小写、重音、空白不同的token算同一个，model_ops/engram/mapping.py的CompressedTokenizer）。
     #   表非常大（两张表合计约188.83GiB，E4M3数值 + E8M0 scale），所以放在主机内存里，每步只取用到的那几行。
     #   因为要往回看3个token，前缀命中后的重放也要带上命中点之前的3个token（config.py的replay_history_tokens = engram_max_ngram_size - 1）
     # 【模型】ATOM_ENGRAM_*（下面4个）：DeepSeek-V4.1的Engram（n-gram记忆，表放在主机内存里）相关开关；读取方：model_ops/engram/
