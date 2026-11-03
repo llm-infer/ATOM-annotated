@@ -68,6 +68,14 @@ def new_token_ids(token_ids=()) -> array.array:
 _block_table_versions = count()
 
 
+# 科普：KV cache分块（paged attention）
+#   标准Transformer解码时，每个token在每层都要留下K、V向量供后续token做注意力，这就是KV cache。
+#   如果给每条请求预留一整段"最大长度"的连续显存，短请求会浪费大量空间。分页做法是把显存切成
+#   固定大小的block（每个block存block_size个token的KV），请求按需一块一块地领，块之间不必相邻；
+#   注意力kernel通过block table找到每个token的KV在哪个物理block里。
+#   例：block_size=4，10个prompt token -> 需要3个block（4+4+2），可能领到物理block [5, 9, 2]：
+#     token 0~3在block 5，token 4~7在block 9，token 8~9在block 2（还剩2个空位，留给后续生成的token）
+#   分配/释放在BlockManager（block_manager.py：allocate / may_append / deallocate）
 # 一条序列的block table：逻辑block -> 物理block id的映射（同nano-vllm，类似操作系统的页表）
 #   例如[5, 9, 12]：第0~15个token的KV在物理block 5，第16~31个在block 9，以此类推（block_size=16）
 # 对比nano-vllm：nano-vllm用list，每步把整张表重新发给其他rank；ATOM做了两点优化
@@ -259,7 +267,18 @@ class Replay(NamedTuple):
 #   ATOM在第一次被调度做prefill时就变成RUNNING并进入running队列，
 #   chunked prefill没算完的序列留在running里（is_partial_prefill=True），下一步由调度器的Phase 1继续
 # 客户端断开：WAITING/RUNNING -> ABORTED，调度器在下一步按正常结束路径释放资源 -> FINISHED
+#
+# 科普：抢占（preemption）
+#   KV block不够用时（例如很多序列同时decode、每条都要再领一个新block），调度器会把某条RUNNING序列
+#   "踢回"等待队列：Scheduler.preempt把状态改回WAITING，删掉末尾的占位token，
+#   BlockManager.deallocate释放它的全部block（block_table清空、num_cached_tokens归0），再放到waiting队首。
+#   ATOM采用"重算"而不是"换出到CPU"：重新调度时把prompt+已生成的token整体当作prompt再prefill一遍
+#   （若它原来的block还在前缀缓存里没被覆盖，可以直接命中，少算很多）
 class SequenceStatus(Enum):
+    # 科普：PD分离（prefill/decode disaggregation）
+    #   prefill是一次算很多token（算力瓶颈），decode是每步算1个token（显存带宽瓶颈），混在同一组GPU上会互相拖累。
+    #   PD分离把两者放到不同节点：prefill节点算完prompt的KV，通过RDMA等方式（atom/kv_transfer/disaggregation/，
+    #   如mooncake、moriio connector）传给decode节点，decode节点直接从第一个生成token开始解码。
     # 【分支】PD分离的decode端：等待prefill节点把KV传过来（KV offload从外部加载时也会停在这里），见第9批
     WAITING_FOR_REMOTE_KVS = auto()
     # 在等待队列中，还没开始prefill（新请求、或被抢占后重新排队）
@@ -424,6 +443,25 @@ class OffloadJointRecord:
 #   GPU算完第N步之前，CPU就要调度第N+1步，此时第N步采样出的token还不知道，
 #   postprocess先往token_ids末尾追加占位token（值为eos_token_id），等下一步拿到真实token后原地覆盖
 #   num_placeholder_tokens记录末尾有几个这样的占位，抢占时要先把它们删掉
+#
+# 第二个小例子（block_size=4，prompt 10个token，不考虑延迟输出的占位）：
+#   创建：num_tokens=10 -> num_blocks=3，last_block_num_tokens=2
+#   准入：BlockManager查前缀缓存。只有"填满的block"才有hash（token 0~3、4~7两块；token 8~9不满不算），
+#         假设两块都没命中 -> num_cached_tokens=0，block_table=[5,9,2]
+#   prefill（预算够，一次算完10个）-> postprocess：hash_blocks登记两个满block的hash，num_cached_tokens=10，
+#         追加第1个生成token -> num_tokens=11（block 2里有3个token）
+#   再decode 1步 -> num_tokens=12，block 2填满；hash_decode_blocks把它也登记进前缀缓存（num_hashed_tokens跟着增长）
+#   再decode 1步 -> 需要第13个位置，调度前BlockManager.may_append追加一个新block -> block_table=[5,9,2,7]
+#   若此时被抢占：block全部释放、block_table=[]、num_cached_tokens=0，token_ids里的12个真实token保留，
+#         重新准入时这12个token都按prompt处理再prefill一次
+#   同一prompt的第二个请求到来：前两块的hash命中 -> num_cached_tokens=8，只需算token 8~9
+#
+# 科普：前缀缓存（prefix caching）与block hash
+#   很多请求共享开头（system prompt、多轮对话的历史），它们的KV完全相同，可以直接复用而不是重算。
+#   做法：每个填满的block算一个"链式hash"：hash_i = H(hash_{i-1}, 本block的token)，第0块的前缀是cache_seed。
+#   链式保证"内容相同且前面所有内容也相同"才会命中（同样的4个token出现在不同上下文里hash不同）。
+#   BlockManager维护hash -> 物理block的索引，新请求准入时从头逐块查，命中多少块就跳过多少块的计算
+#   （实现：block_manager.py的compute_hash / hash_blocks / can_allocate，hash函数在prefix_hash.py）
 class Sequence:
     # 类变量，所有实例共享：全局自增器，为每条序列分配唯一id
     counter = count()
@@ -466,7 +504,10 @@ class Sequence:
         # 每个KV block容纳的token数，用于计算num_blocks和last_block_num_tokens
         # 对比nano-vllm：nano-vllm是类变量（所有序列共用），ATOM由调用方传入
         self.block_size = block_size
-        # 引擎内部的序列id；调用方可以指定（例如n>1扇出时），否则自增
+        # 引擎内部的序列id；调用方可以指定，否则自增
+        # 核对代码：正常请求（包括n>1扇出的兄弟序列）都不传id，走自增；显式传id的只有不进调度器的
+        #   假序列——ModelRunner的dummy decode（id=-1）和dynamic_chunking_worker的计时扫描（id=-2）
+        # 注意写法是`id or ...`：传id=0也会被当成"没传"而自增
         self.id = id or next(Sequence.counter)
         # 用户侧的请求id（API层的request_id），用于日志和追踪
         self.external_request_id = request_id
@@ -476,8 +517,17 @@ class Sequence:
         self.type = SequenceType.DUMMY
         # 全部token id：prompt + 已生成的token（array("i")，见new_token_ids）
         self.token_ids = new_token_ids(token_ids)
-        # 最后一个token，decode时作为模型输入
+        # 最后一个（已追加的）token，decode时作为模型输入；append_token时同步更新
+        # 注意：延迟输出模式下末尾可能是占位token，postprocess原地覆盖token_ids时并不更新它
         self.last_token = token_ids[-1]
+        # 科普：投机解码（speculative decoding / MTP）
+        #   decode每步只产出1个token，GPU大部分时间在等显存读权重。投机解码先让一个便宜的"草稿模型"
+        #   （MTP是挂在主模型后面的小预测头）一口气猜k个token，再让主模型一次forward同时验证这k个：
+        #   从左往右逐个比对，第一个猜错的位置用主模型自己的结果替换，后面的丢弃；全对还能多得1个。
+        #   例：k=3，草稿猜[a,b,c]，主模型认可a、b，c处主模型给出d -> 本步新增3个token[a,b,d]
+        #     -> num_bonus_tokens=2（被接受的草稿数），num_rejected=1（=k-接受数），num_tokens += 3
+        #     全部接受时新增k+1=4个token，num_rejected=0；一个都不接受时也至少新增1个（主模型自己的那个）
+        #   验证在atom/model_ops/rejection_sampler.py，结果回写在Scheduler.postprocess
         # 【分支】投机解码：每步的草稿token数（MTP的k），0表示不开投机解码，见第7批
         self.num_draft_tokens = num_draft_tokens
         # `has_per_req_cache=True` means this seq's attention type maintains
@@ -489,9 +539,23 @@ class Sequence:
         #   有状态缓冲区（例如GDN的递归状态，以及将来DeepseekV4的环形缓冲区+压缩器状态）。
         #   它会让 BlockManager 在 allocate() 中分配一个每请求缓存槽位，在 deallocate() 中释放。
         # 解释：这类状态大小固定、不随token数增长，存在单独的状态池里，见第4批
+        # 科普：线性注意力/状态空间模型（GDN、Mamba等）的"每请求状态"
+        #   标准注意力要保存每个历史token的K、V（随长度线性增长，可以分页）；线性注意力把全部历史压缩成
+        #   一个固定大小的状态（例如每个head一个d×d矩阵），每来一个token就原地更新一次。
+        #   因此：1. 它不能按token切成block，只能每条请求占一个"槽位"（state_slots）；
+        #         2. 状态会被原地覆盖，前缀缓存想复用"前N个token之后的状态"，就必须在N处另存一份快照（checkpoint），
+        #            这就是下面一串checkpoint_*字段存在的原因；
+        #         3. 投机解码猜错要回滚，所以每个草稿位置多留一个回滚槽位（state_slots[1:]）
+        #   混合模型（如Qwen3-Next：部分层GDN、部分层全注意力）两种缓存同时存在：KV走block_table，状态走state_slots
         self.has_per_req_cache = has_per_req_cache
+        # 科普：多模态输入
+        #   图片先被视觉编码器变成一串向量，prompt里为每张图预留一段占位token（几百到上千个），
+        #   prefill时把这些位置的词嵌入替换成视觉向量，之后与普通文本token一样参与注意力和KV cache。
+        #   详见atom/model_engine/multimodal_runtime.py开头的说明
         # 【分支】多模态（图像等）输入，见第2批2b
         self.multimodal_data = multimodal_data
+        # 视觉编码结果是否已在ModelRunner侧缓存好：首次prefill成功后由调度器置True，
+        #   之后调度器只发span元数据、不再发像素张量（见multimodal_runtime.py）
         self.multimodal_cache_ready = False
         # Immutable content identity survives payload release and preemption.
         # 【译】不可变的内容标识，在多模态数据被释放和序列被抢占后仍然保留。
@@ -504,6 +568,9 @@ class Sequence:
             if self.cache_seed is None:
                 self.cache_seed = multimodal_cache_seed(multimodal_data)
         # 【分支】Qwen3.5等多模态模型的M-RoPE位置（文本/图像的三维位置编码），见第8批
+        # mrope_positions：prompt部分每个token的三维位置，由InputOutputProcessor.preprocess（get_mrope_input_positions）算好
+        # mrope_position_delta：prompt之后的位置偏移。图片的占位token在M-RoPE下"不占满"线性位置，
+        #   所以生成token的位置 = 线性位置 + delta（见atom/model_ops/attentions/backends.py里的start + delta）
         self.mrope_positions = mrope_positions
         self.mrope_position_delta = mrope_position_delta
         # 当前总token数（prompt + 已生成）
@@ -527,6 +594,9 @@ class Sequence:
         # 已算好KV并写入KV cache的token数（同nano-vllm）
         # 来源：前缀缓存命中的部分 + 本序列各step计算过的部分
         # 一般在Scheduler.postprocess里累加；流水线并行时在调度时就累加（第9批）
+        # 用途：调度器用num_tokens - num_cached_tokens算"还有多少token要prefill"，并据此切chunk
+        # 归零的地方：BlockManager.deallocate（结束/抢占），以及若干放弃已认领前缀的路径
+        # 注意它不是"前缀缓存命中数"：命中数单独记在prefix_cache_hit_tokens里（见下方）
         self.num_cached_tokens = 0
         # The prefill forward scheduled last, where it backed off below the
         # point it resumed at (`BlockManager.replay_start`); None when it did
@@ -658,6 +728,8 @@ class Sequence:
         #   它从这里开始计算间距。
         self.last_checkpoint_pos = 0
         # 前缀缓存命中的token数（PD分离时由prefill端通过kv_transfer_params带过来，见下方）
+        # 本地请求由调度器在准入、分配block之后写成当时的num_cached_tokens；
+        #   最终随RequestOutput.num_cached_tokens报给客户端（usage里的cached tokens）
         self.prefix_cache_hit_tokens = 0
         # True iff this seq is mid-prefill (chunked prefill produced KV for
         # some prompt tokens but not all). Maintained by the scheduler:
@@ -665,6 +737,12 @@ class Sequence:
         # cleared when prefill completes or seq is preempted. Used to discard
         # garbage sampled tokens from intermediate chunks and to skip the
         # scheduler's Phase 1 scan when no partials exist.
+        # 科普：分块prefill（chunked prefill）
+        #   一个很长的prompt（如3万token）如果一次prefill完，这一步会很久，同batch里正在decode的请求都要干等。
+        #   分块prefill把它切成若干chunk，每步只算一块（受每步token预算限制），和decode序列拼在同一个batch里。
+        #   中间chunk结束时模型也会"顺手"采样出一个token，但它不是真正的下一个token，必须丢弃——这个标志就是干这个的。
+        #   例：prompt 10个token、每步预算4：第1步算0~3、第2步算4~7（这两步is_partial_prefill=True），
+        #     第3步算8~9，之后置False，第3步采样出的token才是第一个生成token
         # 【译】当且仅当这条序列处于prefill中途时为True（chunked prefill只为部分prompt token算出了KV）。
         #   由调度器维护：postprocess中推进后仍有prompt token剩余时置位，prefill完成或序列被抢占时清除。
         #   用来丢弃中间chunk采样出的无效token，并在没有半途prefill时跳过调度器的Phase 1扫描。
@@ -707,7 +785,8 @@ class Sequence:
         #   收拢在一起，联合重置时就不会漏掉字段；见 OffloadJointRecord。
         self.offload_joint = OffloadJointRecord()
         # ---------------- 主干字段：采样参数 ----------------
-        # 把请求的采样参数拷贝到序列上，ModelRunner.prepare_sample按batch批量读取，拼成张量
+        # 把请求的采样参数拷贝到序列上：ScheduledBatch构造时（scheduler.py）把各序列的值收集成numpy数组，
+        #   ModelRunner.prepare_sample再拷进GPU缓冲区；各参数含义与数值例子见sampling_params.py
         self.temperature = sampling_params.temperature
         self.top_k = sampling_params.top_k
         self.top_p = sampling_params.top_p
@@ -782,7 +861,8 @@ class Sequence:
         self.arrive_time = 0.0
         self.first_token_time = 0.0
         self.leave_time = 0.0
-        # 结束原因："eos"、"max_tokens"、"stop_sequence"、"stop_<token_id>"、"aborted"等
+        # 结束原因："eos"、"max_tokens"、"stop_sequence"、"stop_<token_id>"、"aborted"，
+        #   以及准入失败时的"unschedulable: <原因>"（如prompt超过max_model_len），由Scheduler写入
         self.leave_reason = ""
 
         # kv_transfer params

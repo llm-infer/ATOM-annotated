@@ -102,6 +102,13 @@ documented at the bottom of this file but NOT managed here.
 #     ATOM_FWD_DUMP_*（5个）、ATOM_WEIGHT_DUMP_*（3个）、ATOM_DEBUG_TOPK / _PATH、ATOM_MONO_CHECK / TRACE / TIMELINE / DEBUG、
 #     ATOM_STATE_CHECKPOINT_CHECK_BLOCKS、OFFLOAD_PROFILE
 # 对比nano-vllm：nano-vllm没有环境变量，所有配置都在Config里；ATOM要在不同GPU架构、不同模型之间切换大量kernel路径，才有这张表
+# 怎么用（补充上面的机制说明）：
+#   设置：在启动命令前加，例如 `ATOM_MONO_ENABLE=0 AITER_LOG_LEVEL=WARNING python -m atom.entrypoints.openai_server ...`
+#   读取：代码里写 `from atom.utils import envs` 然后 `envs.ATOM_MONO_ENABLE`，拿到的是lambda转换后的Python值（bool/int/str...）
+#     而不是原始字符串；`envs.is_set("ATOM_X")`（定义在文件末尾）用来判断"用户到底有没有显式设置"
+#   多进程：ATOM用spawn启动EngineCore / ModelRunner等子进程，子进程继承父进程的环境变量，所以只要在启动命令里设一次即可；
+#     反过来，服务起来以后再改os.environ，已在模块导入时读过的开关不会变
+#   每个变量的权威说明表在 docs/environment_variables.md（含类型、默认值、适用条件），本文件的注释与之互为补充
 import logging
 import math
 import os
@@ -228,6 +235,10 @@ def _finite_float_env(name: str, default: float, *, allow_zero: bool) -> float:
 
 # 变量名 -> 无参lambda；lambda里读os.getenv并转换成需要的类型（bool/int/float/str/tuple/None）
 environment_variables: dict[str, Callable[[], Any]] = {
+    # 科普·forward元数据H2D：每一步decode/prefill前，CPU上的调度器要算出一批小张量（positions、slot_mapping、block_tables、
+    #   各序列长度等，nano-vllm里在ModelRunner.prepare_*里构建）再拷到GPU。几十个小张量各拷一次，每次都有固定开销；
+    #   "packed"把它们先拼进一块连续的pinned内存，一次H2D拷完，再由一个Triton kernel把各段scatter到各自固定的GPU地址。
+    #   实现见atom/utils/h2d.py（发布/检查协议）、utils/packed_h2d.py（打包拷贝）
     # 【图/编译】ATOM_H2D_BACKEND：每步forward的元数据怎么从CPU传到GPU，"packed"（默认）或"direct"，其他值启动时报错
     #   读取方：model_runner.py；机制见utils/h2d.py（第5批）
     # Forward metadata transport: direct or packed. Both keep source checks.
@@ -235,10 +246,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 【译】forward元数据的传输方式：direct或packed。两者都保留对数据源的检查。
     #   单成员的组和带步长的绑定仍然保持直接拷贝。
     "ATOM_H2D_BACKEND": lambda: os.getenv("ATOM_H2D_BACKEND", "packed"),
+    # 科普·PD分离（Prefill/Decode disaggregation）：prefill是算力密集、decode是访存密集，放在同一组GPU上会互相拖累；
+    #   PD分离让一组GPU（P节点）只做prefill，算完把KV cache通过RDMA网络传给另一组GPU（D节点）继续decode。
+    #   Mooncake / MoRI-IO是负责这次KV传输的传输引擎；HCA即RDMA网卡。实现见atom/kv_transfer/disaggregation/（mooncake/、moriio/）
     # 【PD/offload】ATOM_MOONCAKE_MATCHED_RAILS：Mooncake传输引擎使用哪些RDMA网卡（HCA）；空=不启用；读取方：mooncake_connector.py
     # Opt-in single-HCA engine pool: "auto" or explicit comma-separated HCAs.
     # 【译】可选的单HCA引擎池："auto"，或显式给出逗号分隔的HCA列表。
     "ATOM_MOONCAKE_MATCHED_RAILS": lambda: os.getenv("ATOM_MOONCAKE_MATCHED_RAILS", ""),
+    # 科普·MLA（Multi-head Latent Attention，DeepSeek-V2/V3、Kimi、GLM-5等使用）：标准MHA每个token要缓存2*头数*head_dim个数，
+    #   MLA把K/V先压成一个所有头共享的低维latent向量（DeepSeek是512维 + 64维RoPE部分 = 576维）只缓存它，计算时再用
+    #   kv_b_proj展开（或把展开矩阵"吸收"进q）。KV cache因此小一个数量级。实现见atom/model_ops/attention_mla.py、attentions/aiter_mla.py
+    # 科普·DCP（Decode Context Parallel）：长上下文decode时，把同一条序列的KV cache按token分散存到DCP组的多张卡上，
+    #   每张卡只对自己那份KV算部分注意力，再用log-sum-exp合并结果；省的是每卡KV显存。实现见atom/distributed/dcp_utils.py、model_ops/dcp_ops
     # 【PD/offload】ATOM_PD_MLA_STAGING：prefill端把某个DCP decode rank需要的MLA KV先聚到GPU暂存槽，再按整页发送（默认开）
     # Prefill (`kv_producer`, plain `mooncake`) only: gather the MLA tokens a
     # DCP decode rank owns into a GPU staging slot and send whole destination
@@ -266,6 +285,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PD_FAILED_WRITE_HOLD_S": lambda: float(
         os.getenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
     ),
+    # 科普·前缀缓存：和nano-vllm一样，KV cache按固定大小的block分页管理，每个满block按"前一个block的hash + 本block的token"算hash；
+    #   新请求的prompt前缀如果和以前某个请求相同（同一个system prompt、多轮对话的历史），就直接复用那些block，跳过这部分prefill。
+    #   空闲但仍保留内容的block组成可淘汰池，下面的POLICY决定先淘汰谁。实现见atom/model_engine/block_manager.py
     # 【前缀缓存】ATOM_PREFIX_CACHE_POLICY：空闲KV block的淘汰策略，"lru"（默认）或"slru"；读取方：block_manager.py -> block_pool.py
     #   slru（分段LRU）：被前缀命中复用过的block进"受保护段"，不会被一次性的长prefill扫描冲掉
     # Protect reused KV prefixes from one-off prefill scans. Opt-in.
@@ -275,6 +297,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PREFIX_CACHE_PROTECTED_RATIO": lambda: float(
         os.getenv("ATOM_PREFIX_CACHE_PROTECTED_RATIO", "0.5")
     ),
+    # 背景：DeepSeek-V4的注意力有滑动窗口和"压缩器"（把每compress_ratio个相邻token的KV压成一条），它们的中间状态不是逐token存放的，
+    #   所以前缀命中只复用KV block还不够，还要恢复这些状态；下面这个开关提供"只重算一小段感受野"的恢复方式（状态checkpoint概念见下文【状态缓存】）
     # 【状态缓存】ATOM_DSV4_STATE_REPLAY：DeepSeek-V4前缀命中时用"有界重放"重建压缩状态（默认关）；读取方：config.py、deepseek_v4_replay.py
     # DeepSeek-V4 bounded replay: when the compressed history hits further than
     # the nearest state checkpoint by more than the window's receptive field,
@@ -284,6 +308,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #   保留整个命中，只重算这段感受野（W + (L-1)(W-1)个token），从而精确重建每一层的窗口状态和压缩器状态。
     "ATOM_DSV4_STATE_REPLAY": lambda: os.getenv("ATOM_DSV4_STATE_REPLAY", "0").lower()
     in {"1", "true", "yes", "on"},
+    # 科普·KV offload：GPU显存放不下的KV cache（例如很久以前的对话前缀）下放到CPU内存 / 本地盘 / 远端存储，下次前缀命中时再加载回GPU，
+    #   相当于给前缀缓存加了一层更大更慢的"二级缓存"。LMCache和Mooncake Store是两个外部存储实现。实现见atom/kv_transfer/offload/
     # 【PD/offload】ATOM_KV_OFFLOAD：不写--kv-transfer-config也能开启KV offload；读取方：kv_transfer/offload/__init__.py、arg_utils.py
     # KV offload without --kv-transfer-config: "lmcache" (in-process LMCache),
     # "lmcache_mp" (standalone `lmcache server`) or "mooncake_store" (a Mooncake
@@ -302,6 +328,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # --- Data Parallelism ---
     # 【译】--- 数据并行 ---
+    # 科普·DP与DP attention：DP（数据并行）= 起多份完整的引擎副本，各自服务不同请求，CoreManager按负载把请求分给某个DP rank。
+    #   对MoE大模型常用"DP attention"：注意力部分每个rank只算自己的请求、存自己的KV（DP），而MoE部分所有rank合起来做专家并行（EP），
+    #   因此所有rank必须每步同步一起forward（没活的rank也要跑一个空/填充batch），这也是下面prefill对齐、填充行等开关存在的原因
     # 【并行】ATOM_DP_RANK / ATOM_DP_RANK_LOCAL / ATOM_DP_SIZE / ATOM_DP_SIZE_LOCAL：本进程的DP rank（全局 / 本机）和DP规模（全局 / 本机）
     #   ATOM_DP_MASTER_IP / ATOM_DP_MASTER_PORT：DP进程组rendezvous的主节点地址和端口
     #   config.py的ParallelConfig.__post_init__：这些变量显式设置了才覆盖对应字段，否则以程序里的配置为准
@@ -368,6 +397,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Prefix for process titles set via set_process_title (shown in ps/top/rocm-smi)
     # 【译】通过set_process_title设置的进程标题的前缀（会显示在ps/top/rocm-smi里）
     "ATOM_PROCESS_NAME_PREFIX": lambda: os.getenv("ATOM_PROCESS_NAME_PREFIX", "ATOM"),
+    # 科普·插件模式：ATOM除了自己的openai_server，还能作为vLLM / SGLang的"模型后端插件"运行——调度、API由vLLM/SGLang负责，
+    #   模型forward和kernel用ATOM的实现。代码在atom/plugin/（vllm/、sglang/）。下面ATOM_SGLANG_*只在SGLang插件模式下生效
+    # 科普·PCP（Prefill Context Parallel）：把一个很长prompt的token切成几段分给多张卡同时prefill（每卡算1/W的token），
+    #   注意力时再交换K/V，从而缩短超长prompt的TTFT。实现见atom/distributed/pcp_utils.py
     # 【插件】ATOM_SGLANG_PCP_SIZE：SGLang插件里prefill上下文并行（PCP）的规模；读取方：plugin/config.py
     # SGLang's GLM-5.2 and DeepSeek V4 prefill CP paths still force
     # attention TP size to 1.
@@ -377,6 +410,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #   ATOM把SGLang的world重新映射成内部的TP x PCP组。
     #   0表示未设置。
     "ATOM_SGLANG_PCP_SIZE": lambda: int(os.getenv("ATOM_SGLANG_PCP_SIZE", "0") or "0"),
+    # 科普·torch.compile与CUDA Graph：torch.compile（Dynamo抓图 + Inductor生成融合kernel）减少Python开销和小算子；
+    #   CUDA Graph把一整串kernel launch"录像"下来，之后每步只需一次replay，省掉CPU逐个launch的时间（decode时这部分很可观），
+    #   代价是输入形状必须固定，所以按batch大小分档（bucket）录多张图、不足的用padding补齐。PIECEWISE = 在注意力等"切分算子"处把图切开，分段录图（ATOM level 3的默认）。
+    #   ATOM里见atom/utils/decorators.py（support_torch_compile）、docs/compilation_cudagraph_guide.md
     # 【插件】ATOM_SGLANG_PREFILL_COMPILE_ONLY：SGLang插件的prefill只编译、不捕获CUDA Graph（实验性）
     # Keep SGLang's tc_piecewise/Inductor compilation path for prefill, but
     # bypass its per-bucket CUDA Graph capture, static-buffer staging, and token
@@ -386,6 +423,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_SGLANG_PREFILL_COMPILE_ONLY": lambda: (
         os.getenv("ATOM_SGLANG_PREFILL_COMPILE_ONLY", "0") == "1"
     ),
+    # 科普·投机解码：用一个便宜的draft模型（或模型自带的MTP头）一次猜出k个后续token，再让大模型（target）在一次forward里并行验证，
+    #   猜对的直接接受，从而一次forward产出多个token。EAGLE3 / MTP / DSpark是三种draft方式（DSpark一次并行猜出一整块，见recipes/DSpark.md）。
+    #   实现见atom/spec_decode/、model_ops/rejection_sampler.py
     # 【插件】ATOM_SGLANG_EAGLE3_TP_VERIFY_BROADCAST：SGLang插件里EAGLE3验证结果从TP rank 0广播，保证各rank一致（默认关）
     # Broadcast EAGLE3 verification predictions and acceptance decisions from
     # TP rank 0 so every tensor-parallel rank advances with identical results.
@@ -398,6 +438,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_SGLANG_EAGLE3_TP_VERIFY_BROADCAST": lambda: (
         os.getenv("ATOM_SGLANG_EAGLE3_TP_VERIFY_BROADCAST", "0") == "1"
     ),
+    # 科普·PP（流水线并行）：把模型的层按顺序切给几组GPU（stage），一个batch像流水线一样依次流过各stage。
+    #   长prompt的prefill被切成多个chunk送进流水线，"动态分块"按已有上下文长度调整每个chunk的大小，让各chunk耗时接近，减少流水线气泡
     # 【并行】ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR：PP动态分块prefill的平滑系数（默认0.75）；读取方：config.py、arg_utils.py
     #   【分支】动态分块PP prefill见第9批 dynamic_chunking.py
     # Dynamic CPP follows SGLang's quadratic chunk-size predictor. This factor
@@ -413,17 +455,32 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # --- Compilation & Execution ---
     # 【译】--- 编译与执行 ---
     # （这个分节下实际是GEMM、MLA、MoE等各种kernel选择开关，与torch.compile无关）
+    # 科普·kernel后端（本文件大量开关都是在它们之间选）：
+    #   AITER：AMD的算子库（ATOM的主要依赖），里面同一个算子常有多种实现：ASM（手写汇编，最快但只支持特定形状/架构）、
+    #     CK（Composable Kernel，C++模板）、Triton（Python写的GPU kernel，可移植、易改）、gluon（Triton的底层方言）、FlyDSL（另一种kernel DSL）；
+    #     OPUS也是aiter里的一类kernel实现。一般规律：ASM/FlyDSL快但条件苛刻，Triton通用，常作为后备或A/B对照
+    #   GPU架构名：gfx942 = MI300X/MI325X，gfx950 = MI350X/MI355X，gfx1250是更新一代的架构（wave32）；很多开关只在某个架构上生效
     # 【GEMM】ATOM_USE_TRITON_GEMM：Linear用aiter的Triton GEMM（含FP4 preshuffle GEMM），也会影响MoE是否走Triton；读取方：linear.py、moe.py
     "ATOM_USE_TRITON_GEMM": lambda: os.getenv("ATOM_USE_TRITON_GEMM", "0") == "1",
+    # 科普·FP8与block-scale量化：FP8只有8位，能表示的范围很窄，所以要配"scale"：实际值 ≈ fp8值 * scale。
+    #   per-tensor = 整个张量一个scale；per-token = 每行一个；block-scale = 每128x128的权重块一个scale（DeepSeek-V3的FP8格式），
+    #   粒度越细精度越好、开销越大。scale本身可以存成FP32，也可以存成E8M0（只有指数位，即只能是2的幂，硬件处理更省）
     # 【GEMM】ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE：FP8 block-scale量化的scale用E8M0（2的幂）格式
     #   显式设置时以它为准；没设置时config.py按checkpoint的scale_fmt（"ue8m0"）和GPU架构自动判断
     "ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE": lambda: (
         os.getenv("ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE", "0") == "1"
     ),
     # 【GEMM】ATOM_GROUP32_WEIGHT_PRESHUFFLE：gfx950上按32行分组量化的FP8权重是否做preshuffle（gfx1250总是做），默认开；读取方：linear.py
+    #   更正：linear.py里这个开关只在gfx950上起作用，代码中没有"gfx1250总是做"的分支；"总是做"的是模块自己声明了
+    #   needs_preshuffled_weight的权重（DeepSeek-V4.1的分组wo_a），与架构无关。"group32"指原生FP8 32x32分组scale的权重（DeepSeek-V4.1）
+    #   科普·preshuffle：加载时把权重矩阵按kernel读取的顺序预先重排一次，GEMM运行时就能用连续、对齐的方式读取，换来更高带宽；
+    #   代价是权重不再是普通的行主序，只有认这种布局的kernel能用，所以preshuffle开关和kernel选择必须配套
     "ATOM_GROUP32_WEIGHT_PRESHUFFLE": lambda: (
         os.getenv("ATOM_GROUP32_WEIGHT_PRESHUFFLE", "1") == "1"
     ),
+    # 科普·MXFP4与aXwY命名：MXFP4是OCP的"微缩放"4位浮点格式——每32个元素共享一个E8M0 scale，每个元素只有4位（e2m1），
+    #   权重体积约为BF16的1/4，MI355X（gfx950）有原生FP4矩阵指令。kernel名里的a8w4 = 激活8位、权重4位，a4w4 = 都是4位，a16w4 = 激活BF16。
+    #   权重格式由checkpoint的量化配置决定（atom/quant_spec.py），这些开关只决定用哪个kernel去算
     # 【注意力】ATOM_USE_TRITON_MXFP4_BMM：MLA里的批量矩阵乘（bmm）用aiter Triton的MXFP4 kernel（默认关）；读取方：attention_mla.py、config.py
     "ATOM_USE_TRITON_MXFP4_BMM": lambda: (
         os.getenv("ATOM_USE_TRITON_MXFP4_BMM", "0") == "1"
@@ -450,9 +507,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
             and os.getenv("ATOM_USE_TRITON_MLA_SHUFFLE_KV", "0") == "1"
         )
     ),
+    # 科普·MoE：把FFN换成很多个"专家"FFN，router为每个token选top-k个专家（如256选8），只算被选中的，参数量大而每token计算量小。
+    #   "路由专家"是被选的那些；DeepSeek等还有每个token都会经过的"共享专家"。fused_moe = 把"按专家重排token + 两个GEMM + 激活 + 加权求和"
+    #   合成少数几个kernel。实现见atom/model_ops/moe.py、fused_moe/
     # 【MoE】ATOM_USE_TRITON_MOE：路由专家改用aiter的Triton/gluon MoE kernel（否则用FlyDSL fused_moe）
     #   注意：lambda的默认值"0"只在显式读取时有意义；moe.py先用envs.is_set判断——未设置时按架构自动决定
     #   （非EP且gfx94x，或gfx95x且ATOM_USE_TRITON_GEMM=1时开启），设置了才以设置值为准
+    #   准确地说（moe.py）：use_triton_moe = 非EP and (gfx94x or (gfx95x and ATOM_USE_TRITON_GEMM))，"非EP"对两种架构都适用
     # Run the routed experts with the aiter Triton/gluon MoE kernels instead of
     # FlyDSL fused_moe, on prefill and decode alike. For SiLU models on gfx1250
     # this selects the a8w4 GUGU (gate/up-interleaved) kernel -- the default --
@@ -500,6 +561,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_TRITON_MOE_A4W4": lambda: (
         os.getenv("ATOM_USE_TRITON_MOE_A4W4", "0") == "1"
     ),
+    # 科普·EP与all2all：EP（专家并行）把不同专家放在不同GPU上。每层MoE要先把每个token发到它选中的专家所在的卡（dispatch），
+    #   算完再发回原卡加权求和（combine），这两次都是all-to-all通信。MoRI是AMD的通信库，提供这套dispatch/combine kernel；
+    #   下面几个开关调它的版本（v1/v2）和传输精度（发FP8/FP4能省带宽，但有量化误差）。实现见atom/model_ops/fused_moe/mori_*.py
     # 【MoE】ATOM_DISABLE_MORI_EP：DP attention + EP时不用MoRI的all-to-all，改走集合通信的后备路径（做A/B对比用）
     # Force DP-attention + EP through the collective fallback even when mori is
     # installed. This is useful for controlled A/B tests and for deployments
@@ -572,7 +636,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #   所以填充不产生任何传输和GEMM开销。设为0保留不做mask的路径。
     "ATOM_MEGA_MASK_PAD_ROWS": lambda: os.getenv("ATOM_MEGA_MASK_PAD_ROWS", "1") == "1",
     # 【注意力】ATOM_MLA_PAGE_SIZE：MLA KV cache的页大小（token数），默认1；>1时AiterMLABackend用它作block_size（DCP的部分路径要求<=1）
+    #   核实（attention_mla.py）：非Triton MLA路径上>1表示用分段（seg）kernel，并且必须恰好等于64、同时kv_cache_block_size也为64，
+    #   否则启动报错；dcp_utils.py里DCP的persistent kernel和非persistent稀疏prefill要求它<=1
     "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
+    # 读取方：model_ops/attention_mha.py，以及SGLang插件的full_attention_backend.py。这里的FMHA就是flash-attention式的融合注意力kernel；
+    #   转FP8算prefill注意力更快，代价是少量精度损失，怀疑精度问题时可设0做A/B
     # 【注意力】ATOM_AITER_FP8_PREFILL_ATTN：gfx950上MHA prefill把Q/K/V转成FP8，用AITER head_dim=256的FMHA kernel（默认开）
     # Match SGLang's gfx950 prefill fast path, with or without a cached prefix:
     # cast Q/K/V to FP8 and use AITER's head-dim-256 per-tensor FMHA kernel.
@@ -582,6 +650,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_AITER_FP8_PREFILL_ATTN": lambda: (
         os.getenv("ATOM_AITER_FP8_PREFILL_ATTN", "1") == "1"
     ),
+    # 科普·mHC（Manifold-Constrained Hyper-Connections）：DeepSeek-V4把普通的"x + f(x)"单条残差流扩成几条并行残差流，
+    #   每层进出时用小矩阵在这几条流之间混合（models/deepseek_v4.py里的mhc_pre/mhc_post）。下面的开关决定这部分小计算用FP32还是BF16 hi/lo拆分
     # 【模型】ATOM_MHC_USE_BF16：DeepSeek-V4的mHC（超连接）模块加载后打包fn权重、用BF16 hi/lo计算（默认开）；读取方：models/deepseek_v4
     # Pack mHC fn weights once after loading and use BF16 hi/lo computation.
     # Set to 0 before model loading to retain FP32 fn and FP32 mHC computation.
@@ -589,6 +659,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_MHC_USE_BF16": lambda: os.getenv("ATOM_MHC_USE_BF16", "1") == "1",
     # --- Kernel Fusion Toggles ---
     # 【译】--- kernel融合开关 ---
+    # 科普·kernel融合：一次kernel launch有固定开销（几微秒），而且每个kernel都要把结果写回显存（HBM）、下一个再读出来。
+    #   把RMSNorm、RoPE、量化、写KV cache等相邻小算子合成一个kernel，中间结果留在寄存器里，省launch也省显存往返；decode时batch小，收益最明显。
+    #   下面的"融合"开关默认值一般就是推荐值；关掉它们主要用于怀疑精度回归时做A/B
+    # 读取方：model_ops/v4_kernels/fused_compress.py（DeepSeek-V4压缩器：把每RATIO个相邻token的KV压成一条）
     # 【融合】ATOM_FUSED_COMPRESS_USE_FLYDSL：DeepSeek-V4（V4-Pro）压缩器的融合kernel用Triton还是FlyDSL：auto / always / never
     # fused_compress_attn: switch between Triton (default historical) and a
     # flydsl drop-in for V4-Pro Compressor (Main BF16 + Indexer FP8) paths.
@@ -602,6 +676,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FUSED_COMPRESS_USE_FLYDSL": lambda: os.getenv(
         "ATOM_FUSED_COMPRESS_USE_FLYDSL", "auto"
     ).lower(),
+    # 读取方：model_ops/attention_mla.py。背景：命中前缀缓存后，prefill要对缓存里的latent做kv_b_proj展开成完整K/V，这一步先gather再GEMM
     # 【融合】ATOM_USE_FLYDSL_GATHER_KV_B_PROJ：MLA缓存前缀的展开（gather + kv_b_proj）用FlyDSL的a8w8 gather-GEMM（默认开）
     # gather_kv_b_proj (the MLA cached-prefix expansion): swap the Triton op for
     # the flydsl a8w8 gather-GEMM. Added 2026-09-09.
@@ -623,6 +698,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION", "0") == "1"
     ),
+    # 读取方：model_ops/attention_mha.py
     # 【融合】ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS：上面融合的token数上限（默认8192），超过就拆回分开的kernel
     # With that fusion on, batches above this token count run the Gemma q/k
     # norm, RoPE and cache write as separate kernels: the one-kernel version
@@ -633,6 +709,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS": lambda: int(
         os.getenv("ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS", "8192")
     ),
+    # 科普·DSA（DeepSeek Sparse Attention，DeepSeek-V3.2 / GLM-5系 / DeepSeek-V4使用）：每个query不再attend全部历史token，
+    #   先由一个轻量的"indexer"（少量小头、FP8计算）给所有历史token打分，选出top-k（例如2048个），主注意力（MLA）只算这k个。
+    #   长上下文下注意力从O(L)降到O(k)；indexer有自己的一份"index cache"（FP8的key）。实现见models/deepseek_v2.py的Indexer、
+    #   model_ops/sparse_indexer_*.py
     # 【融合】下面4个ATOM_ENABLE_DS_*是DeepSeek系（models/deepseek_v2.py，覆盖V3 / V3.2 / GLM-5）的融合开关，默认都开，模块导入时读取：
     #   INPUT_RMSNORM_QUANT_FUSION：层输入RMSNorm + 量化；QKNORM_QUANT_FUSION：MLA的q/kv低秩分支norm + 量化（DeepSeek-V4也读）；
     #   QKNORM_FUSION：q/kv低秩分支norm融合；INDEXER_QK_ROPE_CACHE_FUSION：DSA indexer的q/k RoPE + 写index cache融合
@@ -648,6 +728,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION", "1") == "1"
     ),
+    # 科普·线性注意力 / 递归状态（GDN、KDA）：Qwen3-Next / Qwen3.5的Gated DeltaNet（GDN）、Kimi的Kimi Delta Attention（KDA）这类层
+    #   不保存逐token的K/V，而是每个头维护一个固定大小的状态矩阵，每来一个token就更新一次（像RNN）。好处是显存不随长度增长；
+    #   坏处是前缀复用时没法"取前N个token的KV"，只能复用在第N个token处保存下来的状态快照，这就是"状态checkpoint"。
+    #   这些模型通常是线性注意力层与普通注意力层混合。实现见model_ops/attention_gdn.py、attentions/gdn_attn.py、fla_ops/
     # 【状态缓存】ATOM_STATE_CHECKPOINT_DEMAND：前缀命中因没有合适的状态checkpoint而被拒绝时，是否按需补放一个checkpoint（默认开）
     #   背景：线性注意力层没有逐token的KV，前缀复用要靠在某些位置保存的递归状态快照（checkpoint），见第4批；读取方：block_manager.py
     # Set to 0 to stop a refused state-cache hit from placing a checkpoint of
@@ -741,6 +825,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #   pynccl的gather按rank为主序落地，所以紧随其后的dim=1 reshape还要把整个gather来的q拷回token为主序；这样做省掉了这两步。
     #   代价是每个prefill token多一次组范围的q GEMM + W_K bmm。默认关闭。
     "ATOM_DCP_PREFILL_QREP": lambda: os.getenv("ATOM_DCP_PREFILL_QREP", "0") == "1",
+    # 科普·persistent kernel：普通kernel按工作量发很多个block，GPU调度完就结束；persistent kernel只发"刚好占满所有计算单元"那么多block，
+    #   每个block循环领取任务，需要事先算好一份"work metadata"（任务划分表）。它对不规则负载更均衡，但多了准备metadata的开销
     # 【并行】ATOM_DCP_SPARSE_PREFILL_NONPS：DCP稀疏prefill用非persistent的fp8 gqa64 MLA kernel（默认开）
     # DCP sparse prefill: use the non-persistent fp8 gqa64 MLA kernel, which
     # needs no work metadata. On by default; needs an aiter with ROCm/aiter#6132.
@@ -785,6 +871,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #   所以这是精确的A/B：它用每层一次all-to-all换取block scorer满额的MMA占用率，在batch*context约1M token以上时更快，
     #   以下时更慢。未设置时不改动该配置字段。
     "ATOM_M3_INDEXER_CP": lambda: os.getenv("ATOM_M3_INDEXER_CP"),
+    # 科普·Mono融合decode：常规decode每层要launch几十个kernel（norm、GEMM、注意力、MoE、TP all-reduce...），小batch时launch和同步开销占大头。
+    #   Mono把一整层（或层的一大段）写成一个大kernel，多卡之间的all-reduce也在kernel内部通过对端显存里的"mailbox"完成，
+    #   一层一次launch。只对实测过的模型（MiniMax-M3、DeepSeek-V4.1、Kimi-K3、GLM-5.2）、TP规模和decode宽度启用，其他情况自动走普通路径。
+    #   公共机制在atom/mono/，各模型的kernel在atom/models/<model>/mono/；读取方即这些目录下的config.py / dispatch.py
     # 【Mono】ATOM_MONO_ENABLE：Mono融合decode总开关（默认开）；只对测过的模型/部署/step形状生效，其他情况走生产路径
     #   【分支】Mono融合decode见第9批 atom/mono/
     # Fused decode for measured model/deployment/step geometries. Unsupported
@@ -834,6 +924,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Debug: run each mono layer next to the original one and log the difference
     # (atom/models/minimax_m3/mono/check.py). Use with --enforce-eager.
     # 【译】调试：把每个mono层与原始层并排运行并记录差异（atom/models/minimax_m3/mono/check.py）。配合--enforce-eager使用。
+    #   核实：除了minimax_m3/mono/check.py，DeepSeek-V4.1（models/deepseek_v41/mono/check.py、runner.py）也读这个开关
     "ATOM_MONO_CHECK": lambda: os.getenv("ATOM_MONO_CHECK", "0") == "1",
     # 【调试】ATOM_MONO_TRACE：把每个mono step的输入和top-2 logits追加写到这个文件
     # Debug: append every mono step's input tokens, positions and top-2 logits to
@@ -845,6 +936,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # token count saved under this path prefix (mono/timeline.py). Use with
     # --enforce-eager.
     # 【译】调试：mono层kernel的各阶段时间戳，每种decode token数保存几个step，存到这个路径前缀下（mono/timeline.py）。配合--enforce-eager使用。
+    #   注：英文里的mono/timeline.py实际路径是atom/mono/runtime/timeline.py；DeepSeek-V4.1和MiniMax-M3的mono runner会读它
     "ATOM_MONO_TIMELINE": lambda: os.getenv("ATOM_MONO_TIMELINE"),
     # 【调试】ATOM_MONO_DEBUG：mono kernel的mailbox等待加10秒上限，超时报错而不是让GPU挂死
     # Debug: the mono kernels bound every mailbox wait (10 s): a wait that gives up
@@ -854,6 +946,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 【译】调试：mono kernel对每次mailbox等待都设上限（10 s）：放弃等待时记录它的区域、配对和标签，
     #   runner在step结束时（mono/runner.py的finish_step）带着这些信息抛错，而不是让GPU挂住。配合--enforce-eager使用。
     "ATOM_MONO_DEBUG": lambda: os.getenv("ATOM_MONO_DEBUG", "0") == "1",
+    # 科普·CUDA/HIP stream：GPU上的一条任务队列，同一stream里的kernel按顺序执行，不同stream里的kernel可以并发。
+    #   把互不依赖的分支（如共享专家和路由专家、压缩器和indexer）放到"旁路stream"（alt_stream）上，可以让它们重叠执行，
+    #   但需要额外的event同步；分支本身很小时，同步开销可能抵消收益（下面这个变量默认0就是这个原因）
     # 【模型】ATOM_DSV41_SIDE_STREAMS：DeepSeek-V4.1注意力层有几个分支放到旁路stream上并行（0/1/2，默认0）
     # DeepSeek-V4.1: how many of an attention layer's branches leave the main
     # stream. 0 none; 1 the compressor, on the MoE's `alt_stream`, waited at
@@ -898,6 +993,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DSPARK_FUSED_CTX_KV": lambda: (
         os.getenv("ATOM_DSPARK_FUSED_CTX_KV", "1") == "1"
     ),
+    # 科普·TP all-reduce：张量并行把一个Linear的权重切到多卡，每卡算出部分和，注意力输出投影和FFN第二个GEMM之后都要all-reduce求和。
+    #   all-reduce后紧接着就是"残差相加 + 下一个RMSNorm"，把三者合成一个kernel可省一次显存往返和launch。
+    #   这些模型文件在模块导入时就把值存进模块级常量ENABLE_ALLREDUCE_RMSNORM_FUSION，所以必须在启动前设置
     # 【融合】ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION：TP的all-reduce与随后的残差加 + RMSNorm融合（默认开）
     #   读取方：models/deepseek_v2.py、qwen3_moe.py、glm4_moe.py、minimax_m2.py等模型文件（模块导入时读取）
     "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION": lambda: (
@@ -1193,6 +1291,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_LOADER_STRICT_COVERAGE": lambda: (
         os.getenv("ATOM_LOADER_STRICT_COVERAGE", "true").lower() == "true"
     ),
+    # 科普·在线量化：checkpoint是BF16，但想用FP8/FP4跑时，ATOM可以在加载时现场量化（而不是事先离线转换checkpoint）。
+    #   默认做法是先把BF16权重整个加载到显存再量化，峰值显存高；"流式"则逐模块加载即量化即释放。读取方：model_loader/online_quant_streaming.py、quant_spec.py
     # 【加载】ATOM_ONLINE_QUANT_STREAMING：在线量化时边加载边量化，降低显存峰值（默认关）
     # Quantize eligible modules as they load to reduce peak memory. Streaming
     # quantizes local TP shards, so results may differ slightly from offline.
@@ -1376,6 +1476,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_MORI_COMBINE_QUANT": lambda: os.getenv("ATOM_MORI_COMBINE_QUANT", "none"),
     # --- EPLB ---
     # 【译】--- EPLB ---
+    # 科普·EPLB（Expert Parallel Load Balancing）：EP下有些专家特别"热"，它所在的卡就成了瓶颈。EPLB统计各专家负载，
+    #   给热专家多放几份冗余副本，并周期性地重新安排专家到卡的映射（重排要搬权重，有开销）。实现见atom/model_ops/eplb.py
     # 【MoE】ATOM_EPLB_MAX_REBALANCES：EPLB（专家并行负载均衡）最多重排几次，之后固定专家放置（默认0=不限）；读取方：eplb.py
     # Stop periodic EPLB rebalancing after this many rebalances have run and
     # keep that expert placement for the rest of the process. Rebalances the
@@ -1647,6 +1749,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PREFIX_FAST_WALK": lambda: (os.getenv("ATOM_PREFIX_FAST_WALK", "1") == "1"),
     # --- TBO prefill ubatch splitting ---
     # 【译】--- TBO prefill微批拆分 ---
+    # 科普·TBO（Two-Batch Overlap）：把一个batch拆成两个微批（ubatch）A、B交替执行：A在做all2all / all-reduce通信时，B在GPU上计算，
+    #   反之亦然，用计算掩盖通信。前提是两个微批工作量差不多，所以拆分要尽量对半；batch太小时拆了反而不划算（见下面的MIN_TOKENS）。
+    #   实现见atom/utils/tbo/
     # 【并行】ATOM_TBO_PREFILL_TOKEN_SPLIT：TBO（two-batch overlap：两个微批的计算与通信互相重叠）拆prefill时按token数精确对半切（默认开）
     #   【分支】TBO见第9批 utils/tbo/
     # Split prefill ubatches at the exact token midpoint (vLLM-DBO style),
@@ -1689,6 +1794,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_TBO_TP_AR_MODE": lambda: os.getenv("ATOM_TBO_TP_AR_MODE", "overlap"),
     # --- NUMA binding ---
     # 【译】--- NUMA绑定 ---
+    # 科普·NUMA：多路CPU服务器上每个CPU插槽有自己"近"的内存和PCIe设备；GPU worker进程如果跑在离它的GPU"远"的CPU上，
+    #   H2D拷贝和CPU侧调度都会变慢。NUMA绑定把进程固定到GPU所在节点的CPU核与内存上
     # 【并行】ATOM_NUMA_BIND：把每个GPU worker绑到离该GPU最近的NUMA节点的CPU核与内存上（默认关）；读取方：utils/numa_utils.py
     # Master switch: pin each GPU worker to its GPU-local NUMA node's CPU cores
     # and preferred memory. Default off so baseline/pinned A/B stays clean.

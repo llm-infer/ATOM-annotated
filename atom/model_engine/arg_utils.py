@@ -43,6 +43,14 @@ logger = logging.getLogger("atom")
 # 对比nano-vllm：nano-vllm没有命令行层，直接LLM(path, **kwargs)，kwargs原样传给Config
 # 除了命令行参数，ATOM还有两百多个ATOM_*环境变量（kernel路径选择、优化开关、调试开关），
 #   按功能分组的索引见utils/envs.py文件开头
+#
+# 谁用本文件（已grep核实）：
+#   add_cli_args + from_cli_args：entrypoints/openai/api_server.py（在线服务）、entrypoints/atomesh/server.py、
+#     examples/simple_inference.py；tests/test_arg_utils_spec.py 测试它
+#   kv_offload_connector_config / compose_kv_offload_config：只在本文件的_get_engine_kwargs里调用
+# 调参排错技巧：启动日志里有一行"Engine kwargs: {...}"（_get_engine_kwargs末尾打印），
+#   可以确认命令行参数最终变成了什么；但Config.__post_init__之后还会再改一些值（如index_cache_dtype），
+#   那行日志打印的是改之前的值
 
 
 # 把"[1,2,4,8]"这样的字符串解析成Python列表（用于--cudagraph-capture-sizes）
@@ -61,6 +69,10 @@ def parse_size_list(size_str: str) -> list[int]:
 # ---------------- 【分支】KV offload：把KV cache卸载到CPU内存/外部存储，见第9批 ----------------
 # 通过环境变量ATOM_KV_OFFLOAD开启，最终会被折叠进--kv-transfer-config（见_get_engine_kwargs末尾）
 
+# 【科普】KV offload：GPU显存放不下的KV cache先"存"到CPU内存或远端存储（LMCache / Mooncake Store），
+#   以后同样前缀的请求再来时直接读回来，而不必重新prefill。相当于给前缀缓存加了一层更大、更慢的二级缓存。
+#   例：多轮对话中，用户隔了几分钟才回复，GPU里的KV早已被淘汰，offload层还能命中，省掉整段历史的prefill。
+#   实现在 atom/kv_transfer/offload/
 # ATOM_KV_OFFLOAD value -> the offload connector it selects.
 # 【译】ATOM_KV_OFFLOAD 的取值 -> 它选择的offload connector。
 _KV_OFFLOAD_MODES = {
@@ -170,14 +182,29 @@ class EngineArgs:
 
     # ---------------- 并行（第9批详解；第1~8批只需关心tensor_parallel_size） ----------------
     # 张量并行（TP）：每层的权重切分到多张GPU，每张GPU一个ModelRunner进程，层内通过all-reduce合并结果
+    # 【科普】直觉：Y = X·W，把W按列（或按行）切成tp份，每张卡只存、只算1/tp，再用通信把结果拼/加起来。
+    #   注意力层按head切：例如32个head、-tp 8，每卡算4个head。
+    #   例：70B模型bf16权重约140GB，-tp 8后每卡约17.5GB；代价是每层1~2次all-reduce，卡越多通信占比越大。
+    #   实现在 model_ops/linear.py（ColumnParallelLinear / RowParallelLinear 等）
     tensor_parallel_size: int = 1
     # 【分支】decode上下文并行（DCP）：把一个请求的KV按token切分到TP组内的多张卡上，必须整除TP
+    # 【科普】为什么需要：MLA这类模型KV只有1个"头"，TP切head切不动KV，于是TP组里每张卡都存一整份KV（重复）。
+    #   DCP让这几张卡各存一部分token的KV，各自算局部注意力，再用LSE合并结果。
+    #   例：-tp 8 -dcp 8，每张卡只存1/8的token的KV，同样显存能放约8倍长的上下文；代价是每层多一次通信。
+    #   不增加卡数（复用TP的卡）。实现见 distributed/dcp_utils.py、model_ops/dcp_ops.py，文档docs/context_parallel_guide.md
     decode_context_parallel_size: int = 1
     # 【分支】流水线并行（PP）：按层切分模型，每个stage负责一段连续的层
+    # 【科普】例：61层模型 -pp 2，stage0算前约一半层、stage1算后一半，中间只传一次hidden state（通信远少于TP），
+    #   适合跨机；代价是"流水线气泡"：一个batch在stage0时stage1空闲，要靠多个batch交错填满。
+    #   每个stage是一个独立的EngineCore进程，实现在 model_engine/pp_engine_core.py、distributed/pp_transport.py
     pipeline_parallel_size: int = 1
     # 【分支】prefill上下文并行（PCP）：prefill时把一条长序列切到多张卡上计算
+    #   例：一条128K token的prompt、-pcp 2，每张卡各算64K token，缩短首token时间（TTFT）；
+    #   与DCP不同，它会增加卡数（总卡数 = tp x pcp），见 distributed/pcp_utils.py
     prefill_context_parallel_size: int = 1
     # 数据并行（DP）：起多个EngineCore，每个有自己的调度器和一份完整模型（每份内部仍可TP），请求在它们之间分发（第2批）
+    #   例：8张卡 -tp 2 -dp 4 = 4份模型副本、每份2卡；与 -tp 8 相比，单请求延迟更高（每份算力少），
+    #   但没有跨8卡的all-reduce，总吞吐往往更高。前提是一份模型能放进tp张卡
     data_parallel_size: int = 1
     # 以下5个是多机DP用的：本节点跑几个DP rank、本节点第一个全局rank号、协调节点的地址和端口
     data_parallel_size_local: int | None = None
@@ -188,17 +215,40 @@ class EngineArgs:
 
     # ---------------- 执行方式、KV cache、调度 ----------------
     # 强制eager模式：不捕获CUDA Graph（调试时用，性能会明显下降）
+    #   CUDA Graph是什么、为什么能加速decode，见config.py里CUDAGraphMode上方的【科普】
+    #   注意：它只关CUDA Graph，不关torch.compile（--level仍生效）；CLAUDE.md提醒：被编译的函数里加调试代码
+    #   即使--enforce-eager也会破坏Dynamo追踪
     enforce_eager: bool = False
     # 前缀缓存：不同请求的相同前缀（如系统提示词）复用已算好的KV block（第4批）
+    # 【科普】做法：把prompt按block切开，每个block算一个"连同前面所有token"的链式hash；新请求的前几个block
+    #   hash命中，就直接复用那些物理block，只prefill剩下的部分。
+    #   例：2000 token的系统提示词 + 50 token的用户问题，第二个请求只需prefill约50 token。
+    #   实现在 model_engine/prefix_hash.py（hash链）和 block_manager.py（命中/复用/淘汰）
     enable_prefix_caching: bool = True
     # 引擎内部通信端口：ModelRunner用它设置MASTER_PORT，作为TP进程组的集合点；不是HTTP服务端口
+    #   更正/补充：torch.distributed主进程组的init_method用的其实是data_parallel_base_port
+    #   （model_runner.py里get_distributed_init_method(master_ip, data_parallel_base_port)）；
+    #   MASTER_PORT=port 是给读这个环境变量的组件用的（据utils/__init__.py的说明，custom all-reduce的
+    #   rendezvous TCPStore绑在MASTER_PORT上）。HTTP端口是api_server的--server-port。
+    #   同一台机器起两个ATOM实例时，--port要错开，否则会抢同一个端口
     port: int = 8006
     # KV cache的数据类型：bf16或fp8；fp8让KV cache占用减半，同样显存能容纳约两倍的token
+    # 【科普】每个token的KV字节数 = 2(K和V) x 层数 x kv_head数 x head_dim x 每元素字节数。
+    #   例：32层、8个kv head、head_dim 128：bf16是 2x32x8x128x2 = 128KB/token，fp8是64KB/token；
+    #   60GB的KV空间，bf16约放49万token，fp8约放98万token。fp8写入时量化、读出时乘scale反量化，
+    #   有轻微精度损失；decode又是读KV受限的，读的字节少一半通常还更快。CLAUDE.md的启动示例都带--kv-cache-dtype fp8
     kv_cache_dtype: str = "bf16"
     # 【分支】DSA稀疏注意力索引器的缓存类型（DeepSeek-V3.2/V4等），None表示跟随kv_cache_dtype，见第7、8批
+    #   更正：None不总是跟随kv_cache_dtype——Config.__post_init__里：DeepSeek-V4原生单节点默认fp4（gfx942上fp8），
+    #   V4插件模式或有KV传输时fp8，V4.1固定默认fp8，其他模型才等于kv_cache_dtype
+    # 【科普】DSA（DeepSeek Sparse Attention）：每个query不看全部历史token，而是先用一个很小的"索引器"
+    #   给所有历史token打分，挑出top-k（如2048个）再做真正的注意力。索引器自己也要缓存每个token的key，
+    #   这就是"索引缓存"，与主KV cache分开存放。实现见 model_ops/sparse_indexer_*.py 等
     index_cache_dtype: str | None = None
     # 每个KV block容纳的token数（对比nano-vllm：nano-vllm默认256，ATOM默认16）
     #   block越小，内部碎片越少、前缀缓存的命中粒度越细，但block table越长、管理开销越大
+    #   例：一条1000 token的序列，block_size 16需要63个block、最后一块浪费8个槽位；block_size 256需要4个block、浪费24个
+    #   注意：部分模型会被Config强制改写，例如DeepSeek-V4.1强制128（见config.py __post_init__）
     block_size: int = 16
     # 最大上下文长度（prompt+生成）；None表示使用模型config的max_position_embeddings
     max_model_len: int | None = None
@@ -206,11 +256,18 @@ class EngineArgs:
     #   调大：权重读取、kernel启动等固定开销被更多token摊薄，吞吐更高；
     #         但单步更慢（decode请求的ITL变大）、激活显存更大（可用KV block变少）
     #   调小：反之；配合chunked prefill，长prompt会被切成更多块
+    #   它还限制了能录的CUDA Graph尺寸：ModelRunner会丢掉大于 min(max_num_seqs, 本值//(k+1)) 的捕获尺寸
+    #   （k是投机token数，见model_runner.py capture_cudagraph前的检查）
     max_num_batched_tokens: int = 16384
     # chunked prefill时单个请求每步最多prefill多少token；0表示不限制（只受max_num_batched_tokens约束）
     #   调小可以让长prefill和decode更均匀地穿插，降低decode的ITL
     long_prefill_token_threshold: int = 0
     # MLA注意力内部做chunked prefill时的token预算（第7批）
+    #   具体是：prefill时若"已缓存的前缀"（前缀缓存命中的部分或前面chunk已算的部分）超过这个token数，
+    #   MLA要把压缩的latent KV解压成完整的K/V，就按这个大小分段解压、分段算注意力；
+    #   它也决定了预分配的k/v workspace大小（aiter_mla.py里形状为[本值, head数, head_dim]）
+    #   调大：分段少、更快，但workspace显存更大；调小：反之。<=0时不分配workspace
+    #   help里说"默认使用max_num_batched_tokens"，实际是两者默认值都等于16384，并不联动
     attn_prefill_chunk_size: int = 16384
     # 【分支】带每请求状态的模型（DeepSeek-V4、GDN等），每隔N个token保存一次状态checkpoint，
     #   以后前缀命中时可以从checkpoint恢复；0关闭，-1只在"有需要的位置"和prompt末尾保存，见第4批
@@ -221,6 +278,10 @@ class EngineArgs:
     enable_decoder_swa_bounded_replay: bool = True
     enable_encoder_swa_bounded_replay: bool = True
     # chunked prefill：长prompt放不进单步预算时切成多块，分多个step算完
+    # 【科普】不切的话，一条很长的prompt要独占一整个step，期间所有decode请求都停下等它（ITL出现尖峰）；
+    #   切开后每步只算一块，剩余预算留给decode。
+    #   例：max_num_batched_tokens=16384、一条40000 token的prompt，大约分3步：16384 + 16384 + 7232。
+    #   切分逻辑在 model_engine/scheduler.py
     enable_chunked_prefill: bool = True
 
     # ---------------- 日志与统计 ----------------
@@ -241,19 +302,27 @@ class EngineArgs:
     dynamic_chunking_min_chunk_size: int = 4096
 
     # 调度延迟因子：在调度下一个prompt之前等待"上一个prompt延迟 x 因子"，攒更多请求一起prefill；0表示不等待
+    #   例：上一次prefill耗时200ms、因子0.5，则新prompt至少等100ms再调度。用TTFT换吞吐（scheduler.py的_passed_delay）
     scheduler_delay_factor: float = 0.0
     # 单个step最多调度的序列数，主要影响decode
     #   decode是访存受限的：每步主要开销是读一遍权重，batch里多一条序列几乎是白赚一个token
     #   上限实际还受可用KV block约束：KV不够时调度器会抢占
+    #   另外：sampling等buffer按它预分配（model_runner.py的max_bs），CUDA Graph捕获尺寸也会被它截断
     max_num_seqs: int = 512
     # 允许ATOM使用的显存比例：扣除权重和激活峰值后，剩余部分分配给KV cache（第5批）
+    #   例：192GB的卡、0.9 -> 预算约172.8GB；若权重占40GB、激活峰值和CUDA Graph等占10GB，KV cache约得到122GB
+    #   调高：KV更多、能并发更多请求；太高可能OOM（其他进程或碎片也要显存）
     gpu_memory_utilization: float = 0.9
 
     # ---------------- 编译与CUDA Graph（第5批） ----------------
     # decode阶段捕获CUDA Graph的batch size列表（字符串形式，_get_engine_kwargs里解析成列表）
     #   运行时batch向上取整到最近的捕获尺寸并回放；超过最大值的batch以eager模式运行
+    #   （向上取整用np.searchsorted，见utils/forward_context.py；例：实际9条序列 -> 补到16条回放）
+    #   列表越密，padding浪费越少，但录图时间和图占的显存越多
     cudagraph_capture_sizes: str = "[1,2,3,4,5,6,7,8,16,32,48,64,128,256,512]"
     # torch.compile编译级别：0=eager，1=torch.compile，2=dynamo只追踪一次，3=分段编译（默认）
+    #   分段（piecewise）编译的含义见config.py CUDAGraphMode上方【科普】④；编译结果缓存在 /root/.cache/atom/，
+    #   CLAUDE.md要求改代码后重启前清掉它，否则可能静默用到旧的编译结果
     level: int = 3
     # CUDA Graph模式：NONE、FULL（整个forward捕获成一张graph，默认）、PIECEWISE（按编译切出的片段
     #   分别捕获，attention走eager，需要--level 3）、FULL_AND_PIECEWISE、AF_PIECEWISE（attention也单独捕获）
@@ -263,6 +332,10 @@ class EngineArgs:
 
     # ---------------- MoE与专家并行（第7批） ----------------
     # 专家并行（EP）：MoE的专家分布到不同GPU上，token通过all-to-all发送到专家所在的GPU
+    # 【科普】MoE：把Transformer的FFN换成很多个"专家"FFN，每个token由router只选其中top-k个（如256选8），
+    #   参数量大但每个token的计算量小。EP：例如256个专家、8张卡，每卡放32个完整专家（而不是每个专家切成8份的TP）；
+    #   每层要先把token发给它选中的专家所在的卡（dispatch），算完再收回来（combine），这两次就是all-to-all。
+    #   实现在 model_ops/moe.py、model_ops/fused_moe/（mori/rccl的prepare_finalize）
     enable_expert_parallel: bool = False
     # 用均匀分布的假router logits替换真实路由，测量专家负载完全均衡时的性能上限
     fake_eplb: bool = False
@@ -274,19 +347,38 @@ class EngineArgs:
     # DP时CoreManager把请求分给哪个rank：least_requests（默认）、round_robin、least_tokens（第2批）
     dp_load_balance: str = DP_LB_DEFAULT
     # 【分支】TBO（Two-Batch Overlap）：把一个batch拆成两个微batch，让通信和计算重叠，见第9批
+    #   例：微batch A在做MoE的all-to-all通信时，GPU同时算微batch B的注意力，通信时间被"藏"起来；
+    #   代价是每个微batch更小、kernel效率略降。实现在 utils/tbo/
     enable_tbo: str | None = None
     # MoE的all-to-all通信后端：MORI的高吞吐/低延迟模式、RCCL，或none（退回到all-gather/reduce-scatter）
+    #   取值取舍：high-throughput适合prefill的大batch；low-latency适合decode的小batch；
+    #   none时每张卡收集全部token再各自只算本卡专家，通信量大但不依赖MORI。
+    #   _get_engine_kwargs里拆成enable_low_latency + moe_all2all_backend两个Config字段
     all2all_backend: str | None = None
     # MoE实现：standard（prepare/GEMM/finalize三段）或mega（FlyDSL融合的MegaMoE）
     moe_backend: str = "standard"
 
     # ---------------- 投机解码（第7批） ----------------
     # 投机解码方法：mtp、eagle3、dspark；None表示不开启
+    # 【科普】投机解码：decode每步只出1个token但要读一遍全部权重，很浪费。于是先用一个很小的"草稿模型"
+    #   快速猜k个token，再让大模型一次forward同时验证这k个（相当于k+1个token的小prefill），猜对的全部接受。
+    #   例：k=3，草稿猜"的 天气 很"，大模型验证前两个对、第三个错，则这一步得到2个草稿token + 大模型自己给出的1个
+    #   = 3个token，而大模型只跑了1次。输出分布与不开投机解码一致（拒绝采样保证）。
+    #   mtp：用模型checkpoint自带的MTP（Multi-Token Prediction）层当草稿（DeepSeek-V3等）；
+    #   eagle3：单独训练的EAGLE-3草稿小模型，复用大模型的hidden state；两者都由spec_decode/eagle_proposer.py实现。
+    #   dspark：块并行一次出多个草稿token，实现在 spec_decode/dspark_proposer.py（选择逻辑见spec_decode/factory.py）
     method: str | None = None
     # 每步草稿模型自回归生成几个草稿token（MTP的k）
+    #   调大：猜对时一步收获更多token；但接受率随位置递减，验证的计算量和KV预留都按k+1增长，
+    #   猜错的部分白算。常用1~3。设为0等于不开启（_get_engine_kwargs里method和k都非零才建SpeculativeConfig）
     num_speculative_tokens: int = 1
 
     # 【分支】KV传输配置（JSON字符串），用于PD分离、KV offload，见第9批
+    # 【科普】PD分离（Prefill/Decode Disaggregation）：prefill算力受限、decode访存受限，混在一起会相互干扰。
+    #   于是用两组机器：prefill节点（kv_role=kv_producer）算完prompt的KV，通过RDMA传给decode节点
+    #   （kv_role=kv_consumer），后者只负责逐token生成。两边可以各自选最合适的并行方式和batch大小。
+    #   例：'{"kv_role":"kv_producer","kv_connector":"mooncake","handshake_port":6301}'
+    #   实现和用法见 atom/kv_transfer/disaggregation/（README.md）
     kv_transfer_config: str = "{}"
     # 独立的草稿模型路径：eagle3必填；mtp不支持（MTP层就在目标模型的checkpoint里）
     draft_model: str | None = None
@@ -296,10 +388,16 @@ class EngineArgs:
     # 在计算图中插入graph_marker节点，方便profile时定位
     mark_trace: bool = False
     # 【分支】RapidServe：单卡内的prefill/decode分离（用不同的stream，可选按CU划分），见第5批
+    #   与上面跨机的PD分离不同：同一张卡上prefill和decode并发跑在两条stream上，不传KV；
+    #   CU（Compute Unit，AMD GPU的计算单元，类似NVIDIA的SM）屏蔽：让两条stream各自只用一部分CU，互不抢占
     enable_rapidserve: bool = False
     disagg_prefill_max_num_seqs: int | None = None
     disagg_constrained: bool = False
     # 在线量化配置（JSON）：加载时把权重量化成ptpc_fp8或mxfp4，可按层覆盖，见第6批
+    # 【科普】离线量化是事先发布一个已量化的checkpoint；在线量化则读入bf16的checkpoint，在加载时逐层量化。
+    #   ptpc_fp8：per-token（激活）+ per-channel（权重）的FP8，权重显存减半；mxfp4：每32个元素共享一个scale的4bit，
+    #   约为bf16的1/4。代价：一定精度损失、加载变慢。常见做法是只把占大头的MoE专家量化成mxfp4。
+    #   消费方：model_loader/loader.py；文档 docs/online_quantization_guide.md
     online_quant_config: dict | None = None
     # 加载HF config后覆盖其中的字段（JSON）
     hf_overrides: dict | None = None
@@ -307,6 +405,9 @@ class EngineArgs:
     dspark_config: dict | None = None
 
     # 【分支】EPLB（专家负载均衡）：运行时监控各专家负载，并迁移/复制热点专家，见第7批
+    #   为什么需要：EP下每层要等最慢的那张卡；若某个专家特别热，它所在的卡收到的token远多于别人，其他卡空等。
+    #   例：num_redundant_experts=8，就多出8个槽位放热点专家的副本，把它们的token分摊到多张卡上。
+    #   实现在 model_ops/eplb.py
     eplb_enable: bool = False
     eplb_config: dict | None = None
     # 【分支】DCP的详细配置（JSON），解析成DCPConfig，见第9批
@@ -328,6 +429,7 @@ class EngineArgs:
         )
         # 【译·help】覆盖API返回的模型名；不指定时默认为--model的值。
         #   （注：EngineArgs没有这个字段，from_cli_args不会读取它，它由API server使用）
+        #   具体：api_server.py里 model_name = args.served_model_name if args.served_model_name else args.model
         parser.add_argument(
             "--served-model-name",
             type=str,
@@ -441,6 +543,10 @@ class EngineArgs:
         )
         # 【译·help】开启前缀缓存（默认开启）。用--no-enable_prefix_caching关闭。
         #   （BooleanOptionalAction：自动生成 --xxx 和 --no-xxx 两个开关）
+        #   配合FlexibleArgumentParser，实际注册了4个写法：--enable_prefix_caching、--enable-prefix-caching、
+        #   --no-enable_prefix_caching、--no-enable-prefix-caching（已实测）
+        #   关闭的代价：重复前缀（系统提示词、多轮历史）每次都要重新prefill，TTFT变大；好处是省掉hash计算，
+        #   且做A/B性能对比时结果不受缓存命中影响
         parser.add_argument(
             "--enable_prefix_caching",
             action=argparse.BooleanOptionalAction,
@@ -515,6 +621,8 @@ class EngineArgs:
         #   '=zero'：所有权重为0。'=xavier'：bf16权重用xavier_uniform_初始化，fp4/fp8打包权重用固定的
         #   目标幅值（有限值、大致接近真实尺度；fp4是验证过的路径）。
         #   （nargs="?" + const：只写--load_dummy不带值时取const，即"empty"）
+        #   用途：没有真实checkpoint或不想等加载时测性能、测显存；输出的文字没有意义。
+        #   empty是torch.empty未初始化的显存，内容随机（可能有NaN/Inf）；xavier给出有限、尺度接近真实的值
         parser.add_argument(
             "--load_dummy",
             nargs="?",
@@ -550,6 +658,8 @@ class EngineArgs:
             help="Directory to save torch profiler traces",
         )
         # 【译·help】开启DP attention。
+        #   取舍：MLA这类KV只有1个头的模型，纯TP时每张卡都存一整份KV；DP attention让每张卡只处理自己的请求、
+        #   只存自己请求的KV，同样显存能容纳更多请求；代价是MoE前后需要在DP rank之间收发token（见--all2all-backend）
         parser.add_argument(
             "--enable-dp-attention",
             action="store_true",
