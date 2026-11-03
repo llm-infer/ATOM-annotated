@@ -1309,10 +1309,71 @@ class QuantizationConfig:
                 )
 
 
-# 【分支】GLM-5.3-Flash（glm5_next）的KV block大小，见第8批
-# 作用：GLM-5.3的稀疏索引器不是每个token存一个索引key，而是每 index_kpool 个token池化成一个key（k-pool），
-#   索引key和主KV共用同一套分页（同一个block_table）。索引打分kernel deepgemm_fp8_paged_mqa_logits
-#   要求每个block的索引行数是16（MQA_LOGITS_PRESHUFFLE_ROWS）的倍数，所以block里的token数必须放大
+# =====================================================================================
+# 【科普】什么是 k-pool？—— 从你熟悉的 MHA / GQA 出发，四步讲清楚
+#   （GLM-5.3-Flash 的稀疏注意力索引器；模型实现见第8批 models/glm5_next.py，
+#    kernel 见 model_ops/glm5_next/kpool.py、indexer.py，数字取自 recipes/GLM-5.3-Flash.md）
+# =====================================================================================
+#
+# ① 出发点：MHA / GQA 的注意力要看"全部"历史 token
+#   decode 时，新 token 的 q 要和 KV cache 里每一个历史 token 的 k 做点积，再对 v 加权求和：
+#
+#       q_新 ──点积──> k_0  k_1  k_2  ...  k_{L-1}      （L 个，全都要算）
+#                       │    │    │          │
+#                    softmax 后加权求和 v_0 ... v_{L-1}
+#
+#   GQA 只是让多个 q 头共用一组 K/V 头，省的是 KV cache 的显存，"每个 q 要看 L 个 token"这件事没变。
+#   上下文 L = 100万 时，每生成一个 token、每层都要读 100万 个 k/v —— 这是长上下文的主要开销。
+#
+# ② 稀疏注意力（DSA）：先"粗筛"，只对最相关的 2048 个 token 做真正的注意力
+#   想法：大多数历史 token 对当前 token 几乎没贡献。如果能便宜地挑出最相关的 top-k 个（这里 k = index_topk = 2048），
+#   主注意力就只在这 2048 个 token 上算，代价从"随 L 增长"变成固定的 2048。
+#   挑选靠一个额外的小模块：索引器（indexer）。它本身就是一个"迷你注意力"：
+#     - 32 个索引 q 头，每头 128 维；但 k 只有 1 个头、128 维 —— 正是 GQA 的极端情况 MQA（所有 q 头共用一份 k）。
+#       所以索引器也要缓存一份"索引 key"：每个 token 只存 128 维（FP8），比主 KV 小得多
+#     - 打分：新 token 的 32 个索引 q 头分别和每个历史 token 的索引 key 点积，按每头权重加起来，得到一个分数
+#     - 取分数最高的 2048 个 token 的下标，交给主注意力（MLA）只算这些位置
+#
+#       新token ──> 索引器：给 L 个历史 token 各打一个分（便宜：1个k头、128维、FP8）
+#                     │
+#                     └─> top-2048 的下标 ──> 主注意力（MLA）只读这 2048 个 token 的 KV（贵的部分被限住了）
+#
+#   剩下的问题：索引器自己仍然要给"全部 L 个"token 打分、缓存"全部 L 个"索引 key —— 虽然便宜，仍随 L 线性增长。
+#
+# ③ k-pool：把"每个 token 一个索引 key"压成"每 index_kpool 个 token 一个"
+#   GLM-5.3 的 index_kpool = 4：把连续 4 个 token 的索引 key 合并（pool，池化）成 1 个，索引器只给这些"池"打分。
+#
+#       token:      0   1   2   3 | 4   5   6   7 | 8   9  10  11 | 12  13
+#       索引key:    k0  k1  k2  k3| k4  k5  k6  k7| k8  k9  k10 k11| k12 k13
+#                   └────┬────┘   └────┬────┘   └────┬─────┘   └─┬─┘
+#       池化后:         P0            P1             P2         尾巴（还没凑满4个，不池化）
+#
+#   合并方式不是简单平均，而是"按维度的加权平均"：对 128 维里的每一维，4 个 token 各有一个打分
+#     （由一个可学习的门 gate 投影 + 每个槽位一个可学习偏置 ape 算出），在这 4 个 token 之间做 softmax 得到权重，
+#     再加权求和。于是每一维都能自己决定"更听这 4 个 token 里哪一个的"。
+#   打分与选择也在"池"的粒度上进行：
+#     - 要选 2048 个 token，就选 2048 / 4 = 512 个池，再把每个池展开回它覆盖的 4 个 token
+#     - 尾巴（最新的、还没凑满 4 个的 0~3 个 token）总是被选上（always_select_tail），所以最新的 token 永远不会被漏掉；
+#       尾巴的原始 key 暂存在每个请求自己的小缓存里（tail cache），凑满 4 个时才池化写入索引缓存
+#   效果：索引缓存缩小到 1/4，索引器的打分量也缩小到 1/4。
+#   一个重要性质：序列不超过 2048 个 token 时，512 个池足以覆盖全部历史 → 每个 token 都被选中 →
+#     结果和不做稀疏的普通（dense）注意力完全一样。只有超过 2048 时，池化选择才真正决定"看哪些 token"。
+#   （池化后的 key 还会做一次 Hadamard-128 旋转再量化成 FP8，只是为了让 FP8 量化更准，不改变点积结果。）
+#
+# ④ 这和 KV block 大小有什么关系？—— 就是下面这个函数要解决的
+#   索引 key 和主 KV 共用同一张 block_table（见文件开头【科普】分页 KV）：一个 KV block 装 B 个 token 的主 KV，
+#   同时也装这 B 个 token 对应的索引 key。池化后，这 B 个 token 只占 B / 4 行索引。
+#   索引打分 kernel（deepgemm_fp8_paged_mqa_logits）按"每 16 行一组"的预重排（preshuffled）布局读每个 block，
+#   所以每个 block 的索引行数必须是 16 的倍数（MQA_LOGITS_PRESHUFFLE_ROWS = 16）：
+#
+#       B = 16（默认）:  主KV 16个token │ 索引 16/4 = 4 行   ✗ 不够16行 → 只能退回"每个token一行"，k-pool省的全浪费了
+#       B = 64        :  主KV 64个token │ 索引 64/4 = 16 行  ✓ 正好一组
+#       B = 128       :  主KV 128个token│ 索引 32 行         ✓ 也行，但 block 越大：最后一个 block 平均浪费越多、
+#                                                             前缀缓存复用的粒度越粗
+#
+#   所以取满足条件的最小值 B = index_kpool × 16 = 64。
+# =====================================================================================
+#
 # 调用方：只有 Config.__post_init__：检测到Glm5Next架构且index_kpool>1时，用返回值覆盖 kv_cache_block_size
 #   （用户的 --block-size 被改写），之后 BlockManager、slot_mapping、注意力builder 都按这个block大小工作
 # 例：index_kpool=4，MQA_LOGITS_PRESHUFFLE_ROWS=16 -> block_size=64，每个block正好16行索引
@@ -1338,6 +1399,8 @@ def glm5_kpool_block_size(index_kpool: int) -> int:
 # 作用：列出当前配置里开启了、但GLM-5.3还没适配的并行方式。这三种方式都会把一条序列的token/KV
 #   或一个batch切到不同rank / micro-batch上处理，而上面说的k-pool池化索引状态还没有按这种切分维护，
 #   硬跑会得到错误的索引结果而不是报错
+#   例：PCP把一条prompt的token切给两张卡，第4~7个token可能被拆到两边，"凑满4个才池化"和"尾巴缓存"
+#   这两件事都要求同一个池的4个token在同一处处理
 # 调用方：只有 Config.__post_init__：返回非空就抛 ValueError，在启动时拒绝，而不是跑出错误答案
 def _glm5_next_unsupported_features(config: "Config") -> list[str]:
     """Return parallel modes that do not yet preserve GLM-5.3 k-pool state."""
@@ -4215,6 +4278,7 @@ class Config:
         #   理由和机制都与上面V4的覆盖相同：BlockManager和slot_mapping假定全局只有一个block大小，所以在这里设置，
         #   注意力builder据此确定索引缓存的大小。
         # 解释：上面"B=16得4行、B=64得16行"对应index_kpool=4
+        # 什么是kpool、为什么要改block大小：见 glm5_kpool_block_size 上方的【科普】（四步图解）
         is_glm5_next = any("Glm5Next" in str(a) for a in arches)
         if is_glm5_next:
             unsupported_features = _glm5_next_unsupported_features(self)
@@ -4244,6 +4308,13 @@ class Config:
                 #   限定了 max_seqlen_k，所以这里一次检查就能替代45层热路径上的一个分支；而且它会干净地让启动失败，
                 #   而不是在模型内部抛异常、在batch中途把引擎一起拖垮——envs.py和docs/environment_variables.md
                 #   把后者描述为"拒绝该请求"。
+                # 用【科普】里的概念说：两个调试开关各关掉一部分，用来排查池化/稀疏路径的bug
+                #   - ATOM_GLM5_KPOOL=0：不池化，索引器按"每个token"打分、选top-2048个token（不再按4个一池选512个池）
+                #   - ATOM_GLM5_FORCE_DENSE_MLA=1：不跑索引器，主注意力直接看全部token（dense）
+                #   序列 <= 2048 时，三种做法都会选中全部token，结果完全一样，所以可以拿来做精确的A/B对比：
+                #     有差异就说明是池化/稀疏路径的bug；
+                #   序列 > 2048 时，三者选中的token本来就不同，有差异是正常的，比较没有意义。
+                #   所以开了这两个开关之一时，要求 max_model_len <= index_topk，否则启动就报错
                 index_topk = int(getattr(self.hf_config, "index_topk", 0) or 0)
                 sparsity_off = []
                 if not envs.ATOM_GLM5_KPOOL:
