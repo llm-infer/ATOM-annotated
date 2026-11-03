@@ -57,6 +57,19 @@ logger = logging.getLogger("atom")
 #   ATOM的LLMEngine只做tokenize/detokenize和进程间收发：调度器在EngineCore进程里自己循环，
 #   GPU计算在每张卡单独的ModelRunner进程里，step()不驱动任何计算，只是"等下一批结束的请求"
 #   这样做的好处：tokenize、HTTP处理、调度、GPU计算分在不同进程，互不抢GIL；DP>1时可以有多个EngineCore
+#
+# 为什么tokenize / detokenize放在前端进程，而不放进GPU循环所在的EngineCore：
+#   GPU循环的理想状态是"上一步forward一结束，下一步的输入已经备好"。一步decode往往只有几到几十毫秒，
+#   而给一个几千token的prompt做tokenize、套chat模板、解析HTTP/JSON都是纯CPU的Python工作。
+#   若它们和调度器在同一个进程，就要争同一把GIL（Python全局解释器锁：同一时刻只有一个线程在执行Python字节码），
+#   这些CPU时间会直接变成GPU在两步之间的空闲气泡。放到前端后，EngineCore收到的已经是token id，回传的也只是token id
+#   用多进程而不是多线程，才能真正绕开GIL；进程用spawn启动，避免fork继承父进程已初始化的CUDA/HIP上下文导致崩溃
+#
+# "step"在ATOM里有两层意思，容易混淆：
+#   EngineCore里的一步 = busy_loop的一次迭代：schedule()选出一批 → 一次forward → postprocess。
+#     与nano-vllm相同，一批要么全是prefill、要么全是decode（不混合；有可调度的prefill时通常先做prefill）；
+#     decode批里每条序列这一步只长1个token（开投机解码时可以一次接受多个）
+#   本文件的step() = 从outputs_queue取一项"已结束的序列列表"，与GPU的步调无关：EngineCore可能已经跑了几百步才回来一项
 
 
 # 加载HF tokenizer；若"编码后再解码"不能还原探测字符串，就退回PreTrainedTokenizerFast
@@ -415,12 +428,26 @@ class LLMEngine:
             )
             reqs.extend(fanout)
         # 一次性把整批序列交给CoreManager：pickle后经ZMQ发给EngineCore（DP>1时按负载均衡分到各DP rank）
+        #   seq id在本进程里由Sequence.counter分配（Sequence.__init__），所以跨所有DP rank唯一，EngineCore直接沿用
+        #   DP>1时每条序列单独选rank（_dispatch_to_dp_ranks），n>1的兄弟序列也可能落到不同rank
+        # 背压（back-pressure）：这里没有显式的背压，add_request从不因为"引擎太忙"而阻塞或拒绝——
+        #   make_zmq_socket把这些socket的SNDHWM/RCVHWM设为0（不设上限），outputs_queue也是无界的queue.Queue。
+        #   超出GPU容量的请求会在EngineCore的scheduler.waiting里排队（受max_num_seqs、max_num_batched_tokens和空闲KV block限制），
+        #   表现为TTFT变长；需要限流的话得在更上层（网关或客户端并发数）做
         self.core_mgr.add_request(reqs)
 
     # 取回下一批"已结束"的序列（阻塞直到有结果）
     # 对比nano-vllm：nano-vllm的step()执行一次"调度 + forward + 后处理"，返回本步结束的序列和吞吐数据；
     #   ATOM的EngineCore进程一直在自己的busy_loop里跑，这里的step()只是从CoreManager的outputs_queue里
     #   阻塞取一项。若取到的是异常对象（例如进程关闭时放入的），get_output会把它抛出
+    # 从前端看continuous batching（示意：A、B一起提交，C稍后才到达；横轴是EngineCore的step编号）：
+    #   step:  1        2 ........ 40 ....... 120 ...... 300
+    #   A      prefill  decode ... 结束
+    #   B      prefill  decode ...................... 结束(300)
+    #   C               (第3步prefill加入) ... 结束(120)
+    #   step()依次返回：[A] → [C] → [B]（同一步结束的会在同一个列表里）
+    #   请求随时加入、随时离开，batch的成员每一步都可能变化；返回顺序取决于"谁先结束"，与提交顺序无关，
+    #   所以generate最后要按seq id重新排序
     def step(self) -> list[Sequence]:
         seqs = self.core_mgr.get_output()
         return seqs
@@ -1141,6 +1168,14 @@ class InputOutputProcessor:
         # 调度器判停只比较token，所以要把stop字符串预先分词成token序列，判停时检查token_ids的末尾是否等于其中之一
         #   例：stop_strings=["\n\nUser:"] → 得到类似[[271, 1474, 25]]的token序列（具体id取决于tokenizer）
         # 注意这是token级匹配：同一段文本在生成时若被切成不同的token（例如与前一个字符合并），就匹配不上
+        #   例：stop="\n\n"单独分词可能是一个token X；但模型生成时若吐出的是".\n\n"合并成的另一个token，
+        #   token序列里就不会出现X，这次停不下来（直到eos或max_tokens）
+        # 为什么不在EngineCore里按文本匹配：EngineCore没有tokenizer，按文本匹配就得在调度热循环里每步detokenize每条序列，
+        #   正是上面"放到前端"想避免的CPU开销；token级匹配只需比较token_ids末尾的几个整数
+        # 三种"停止"的区别（判停都在EngineCore的Scheduler.postprocess里）：
+        #   eos_token_id        tokenizer的结束符，finish_reason="eos"；ignore_eos=True时这一项和下一项都不检查
+        #   stop_token_ids      generation_config里的其他结束token（例如某些对话模型的轮次结束符），finish_reason="stop_<id>"
+        #   stop_token_sequences 用户的stop字符串分词后的结果，finish_reason="stop_sequence"；匹配到的这段token保留在输出里
         stop_token_sequences = []
         if sampling_params.stop_strings:
             # 允许传单个字符串，统一成列表
@@ -1162,6 +1197,12 @@ class InputOutputProcessor:
             )
 
         # ---------- 5. 创建n个兄弟Sequence ----------
+        # n>1（parallel sampling，并行采样：同一个prompt采样出n个不同回答）时，兄弟之间共享的与不共享的：
+        #   共享：tokenize结果、stop token序列、多模态数据与M-RoPE位置、前端算好的prompt hash链（见第6步）
+        #   不共享：seq id、KV block（每个兄弟各自分配；prompt部分的KV能否复用只取决于前缀缓存是否开启并命中，
+        #     引擎不做"fork一份block表"式的专门共享）、DP rank（见add_request处）
+        #   从这里起每个兄弟就是一个普通请求，调度、判停、结束都各管各的
+        # 对比nano-vllm：nano-vllm的SamplingParams没有n，要多个回答只能把同一个prompt提交多次
         seqs: list[Sequence] = []
         for i in range(n):
             # 每个兄弟用自己的回调（若给了stream_callbacks），否则共用stream_callback
@@ -1182,6 +1223,10 @@ class InputOutputProcessor:
                 mrope_positions=mrope_positions,
                 mrope_position_delta=mrope_position_delta,
                 # n>1时需要独立噪声，否则兄弟序列采样结果完全相同（见上面docstring的翻译）
+                #   原理：采样器用Gumbel-max的等价形式 token = argmax_i(p_i / E_i)，E_i ~ Exp(1)，这与按概率p采样等价。
+                #   默认为了省时只缓存一行(1, vocab)的噪声并广播给整批；兄弟序列prompt相同，第一步logits完全相同，
+                #   共用同一行噪声就会选出同一个token，之后输入也一样，于是n个回答一字不差。
+                #   needs_independent_noise=True时采样器为每行重新生成(num_tokens, vocab)的噪声（见model_ops/sampler.py）
                 needs_independent_noise=(n > 1),
                 parent_request_id=parent_request_id,
                 sibling_index=i,
@@ -1192,6 +1237,9 @@ class InputOutputProcessor:
                 dp_parent_session_id=dp_parent_session_id,
             )
             # 到达时间（墙钟）。first_token_time由EngineCore进程里的调度器记录，两者跨进程比较，所以都用time.time()
+            #   注意测量边界：arrive_time在tokenize之后才记，所以这里的TTFT不含tokenize和HTTP处理；
+            #   first_token_time在EngineCore的postprocess里记，不含结果传回前端的时间。
+            #   若EngineCore在另一台机器上（多机DP），两台机器的时钟偏差会直接计入TTFT
             seq.arrive_time = time.time()
             # 登记为"在途请求"，postprocess时删除
             self.requests[seq.id] = seq
@@ -1246,6 +1294,13 @@ class InputOutputProcessor:
             if external_request_id is not None:
                 self._external_to_internal.pop(external_request_id, None)
             # detokenize：只解码生成的部分（completion_token_ids = token_ids[num_prompt_tokens:]）
+            #   离线路径在结束时对整段一次性decode，所以没有增量反分词的麻烦。流式（在线）路径要边生成边吐文本，
+            #   难点在于token与字符不是一一对应：byte-level BPE里一个汉字是3个UTF-8字节，一个emoji是4个，
+            #   常被拆进多个token，单独decode其中一个只会得到"\ufffd"（替换字符）；合并规则也会让"前文+新token"的解码结果
+            #   不等于两者分别解码再拼接。所以流式解码要保留一个滑动窗口，用"窗口整体解码 - 窗口前半解码"得出新增文本，
+            #   末尾是"\ufffd"就先扣住不发——见entrypoints/openai/streaming_dispatch.py的IncrementalStreamDetokenizer
+            #   另外这里没有传skip_special_tokens，默认会把eos等特殊token的文本（如"<|im_end|>"）也解码进text；
+            #   流式路径则用skip_special_tokens=True
             output_str = self.tokenizer.decode(req.completion_token_ids)
             # 离开时间：在本进程记录，所以latency包含了结果从EngineCore传回来的时间
             req.leave_time = time.time()

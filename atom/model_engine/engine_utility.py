@@ -47,6 +47,9 @@ logger = logging.getLogger("atom")
 #   收到任何 update_weights*：置fenced → busy_loop不再调度（EngineCore._is_idle_rl_weights_offloaded）
 #   一次同步可以分成多个bucket（同一个sync_id，最后一个is_last=True）；任一步失败就记下原因，之后的bucket和FINISH都被拒绝
 #   CoreManager确认所有DP engine都成功后发 finish_weight_sync → 解除围栏、恢复服务；失败时发 discard 清理各rank的暂存
+# 为什么要围栏而不是"边服务边更新"：一次forward要读遍所有层的权重，若更新只写了一半，这一步就是"前几层新、后几层旧"的
+#   混合模型，logits没有意义；而且RL需要知道每条rollout是哪个版本的策略生成的。DP>1时还要求所有engine一起切换，
+#   否则同一时刻不同rank上跑的是不同版本——所以本地成功也只能先停着，等CoreManager确认全体成功后统一放行
 # 对比nano-vllm：nano-vllm没有这一层（没有统计接口、profile、权重热更新）
 
 
@@ -801,6 +804,13 @@ class EngineUtilityHandler:
         """Cancel queued work promptly; running forwards finish via postprocess."""
         # 【译】及时取消排队中的工作；正在运行的forward会经由postprocess结束。
         # 调用方：CoreManager.abort_request（客户端断开连接时，广播到每个DP rank，只有持有该请求的那个起作用）；不回复
+        # 为什么必须中止：不中止的话，一个已经没人接收的请求会一直占着batch里的一个位置和它的KV block，直到生成满max_tokens。
+        #   例：max_tokens=4096、每步20ms → 白白占用约80秒，期间这些KV block也不能分给排队中的请求
+        # Scheduler.abort_request对两种状态的处理不同：
+        #   waiting中（还没开始算）：立刻移出队列，标成"aborted"放进被拒绝列表（_rejected），下一轮busy_loop经take_rejected作为已结束序列发回前端
+        #   running中：只把status改成ABORTED；下一次postprocess看到这个状态才把它以"aborted"结束并释放block
+        # running不立刻释放的原因：它的block可能正被一次已经下发、尚未完成的forward读写（GPU是异步执行的），
+        #   若马上把block分给别的请求，在途forward的写入就会覆盖新主人的KV；postprocess是forward结果已回收的安全点
         req_id = args.get("req_id") if isinstance(args, dict) else None
         if req_id is None or self.scheduler is None:
             return

@@ -32,6 +32,23 @@ import enum
 #                                SHUTDOWN           EngineCore已退出
 #   ABORT、START_DP_WAVE、EXECUTOR_FAILED 在仓库里没有使用（中止请求走的是UTILITY命令"abort_request"）
 #
+# 一个请求在这条通道上的消息时间线（DP=1，时间只是示意；→ 为CoreManager发往EngineCore，← 反之）：
+#   ← READY                      EngineCore加载完模型、分好KV池、抓完CUDA Graph后只发一次
+#   → ADD [A]           t=0      请求A到达；前端已经tokenize好，发过去的是token id而不是文本
+#   ← STREAM [(A,..)]   t=80ms   A的prefill那一步结束，带回第1个token（这就是TTFT的来源）
+#   → ADD [B]           t=95ms   B到达：不必等A结束，B在随后的step里就会被调度（continuous batching）
+#   ← STREAM [(A,..),(B,..)]     此后每个step一条STREAM，装着"本步有新token的所有序列"
+#   ← ADD [A]                    A结束（eos / stop / max_tokens）：EngineCore保证先发它最后一步的STREAM，再发这条
+#   → UTILITY abort_request(B)   客户端断开：B在EngineCore的下一个postprocess里以"aborted"结束
+# 要点：一条STREAM对应EngineCore busy_loop的一次迭代（一次schedule + forward + postprocess），而不是一个请求；
+#   从前端看，EngineCore是一条持续运转的流水线：任何时刻都能塞进新请求，输出按step一批批流回来
+#
+# 为什么"pickle整个Python对象 + ZMQ"就够了，而不用共享内存：
+#   这条通道上只走控制面数据——token id、采样参数和少量元数据。例：4096个token的prompt ≈ 4096 × 4B = 16KB；
+#   decode阶段每条序列每步只多一两个token。真正的大块数据（权重、KV cache，GB级）始终留在GPU上，从不经过这里。
+#   这个量级的序列化开销远小于一步forward（毫秒级），换来的是实现简单、进程之间互不共享内存（一方崩溃不会破坏另一方）。
+#   代价：pickle.loads会执行任意对象的反序列化逻辑，所以这些socket只能在同一信任域内的进程之间使用
+#
 # enum.Enum：枚举类，每个成员是单例，可以用 == 或 is 比较；反序列化后仍是同一个成员
 class EngineCoreRequestType(enum.Enum):
     """
@@ -43,6 +60,7 @@ class EngineCoreRequestType(enum.Enum):
     # 解释：ATOM实际上把(类型, 数据)整体pickle后发送，并没有直接把这些字节串写进socket
 
     # 两个方向都用：发请求（新序列）和回结果（已结束的序列）
+    #   同一个类型码在两个方向上含义不同，不会混淆：每个方向是各自独立的socket，收方只会收到一个方向的消息
     ADD = b"\x00"
     # 以下两个未使用
     ABORT = b"\x01"

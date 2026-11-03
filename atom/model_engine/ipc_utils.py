@@ -37,6 +37,16 @@ Phase 2 (weight sharing):
 #   export_kv_cache_ipc_handle / import_kv_cache_ipc_handle（model_runner.py，每个TP rank各自导出/导入自己那张卡的）；
 #   它们再由PrefillEngineCore / DecodeEngineCore经call_func驱动（engine_core.py），句柄经临时文件和ZMQ传给对端
 # 解释：所以准确地说，这些函数运行在prefill/decode两边的ModelRunner进程里，而不是EngineCore进程里
+#
+# 为什么同机PD分离要共享显存，而不是各自加载一份：
+#   权重：例如一个70B模型的bf16权重约140GB，TP=8时每张卡约17.5GB；prefill、decode两个进程各放一份就是35GB/卡，
+#     多出来的17.5GB全部要从KV cache预算里扣掉，直接减少能同时服务的请求数
+#   KV cache：两边看到同一个分页KV池，prefill算完把KV写进某些block，decode拿着同样的block id直接读——
+#     KV"传输"退化成传几个block编号。跨机器的PD分离则必须把这些KV经网络（RDMA等）真正搬过去
+#   代价：两个进程跑在同一组GPU上，prefill和decode的kernel会互相争抢算力和显存带宽
+#
+# 生命周期约束：IPC句柄只是"另一个进程那块显存的一个引用"，必须由分配它的进程（prefill）一直持有原张量；
+#   原张量一旦被释放（显存被缓存分配器回收或改作他用），decode端的视图就会读到别人的数据
 
 import logging
 
@@ -60,6 +70,8 @@ def _export_tensor(t: torch.Tensor) -> dict:
     # 注意：若t本来不连续，contiguous()会生成一份新拷贝，导出的就是这份拷贝而不是原张量
     t = t.contiguous()
     # IPC句柄针对的是整个底层storage（一次显存分配），视图信息另外记录在下面几项里
+    #   更细一点：PyTorch的缓存分配器常把多个storage放在同一次hipMalloc得到的大段里，
+    #   _share_cuda_返回的元组里既有这一整段的句柄，也有本storage在段内的字节偏移，导入端据此定位
     share_cuda_args = t.untyped_storage()._share_cuda_()
     return {
         "share_cuda_args": share_cuda_args,
