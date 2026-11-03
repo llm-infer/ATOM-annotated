@@ -28,6 +28,66 @@
 #   仓库里没有地方直接实例化本类；这里的类主要说明有哪些字段、默认值是什么
 # 对比nano-vllm：nano-vllm的Qwen3只有全注意力和dense FFN；这里的linear_*、MoE字段都是它没有的
 # 【分支】GDN线性注意力和Qwen3-Next模型实现见第8批；MoE见第7批
+#
+# =====================================================================================
+# 【科普】读懂这个配置需要的几个概念（假设你只熟悉标准Transformer + MHA）
+# =====================================================================================
+#
+# ① GQA / MQA：MHA的"省KV"变体（字段 num_attention_heads、num_key_value_heads）
+#   MHA里每个query头都有自己的一份K、V头。推理时K、V要缓存起来（KV cache），头越多缓存越大。
+#   GQA让多个query头"共用"一份K/V头：例如16个q头、2个kv头，就是每8个q头共享一组K/V，
+#   KV cache缩小到MHA的1/8，效果损失很小。kv头数=1时叫MQA（极端情况），=q头数时就退化回MHA。
+#   本模型默认 16 q头 / 2 kv头。
+#
+# ② 线性注意力与 Gated DeltaNet（GDN）（字段 linear_*）
+#   标准（softmax）注意力：o_t = Σ_i softmax(q_t·k_i) v_i，要和"所有"历史token的k、v算，
+#     所以必须保存全部历史K、V（KV cache随长度线性增长），每生成一个token的计算量也随长度增长。
+#   线性注意力的想法：去掉softmax，o_t = Σ_i (q_t·k_i) v_i = (Σ_i v_i k_iᵀ) q_t。
+#     括号里的 Σ v_i k_iᵀ 是一个固定大小的矩阵，记作状态 S（形状 [v_dim, k_dim]），
+#     每来一个token只需 S += v_t k_tᵀ，再算 o_t = S q_t。于是：
+#       - 不需要KV cache，每层每条序列只存一个固定大小的S（不管上下文多长）
+#       - decode每步的计算量是常数，像RNN一样"循环"更新
+#   代价：S的容量有限，信息会被"压缩"，精确回忆远处细节的能力不如softmax注意力。
+#   GDN是线性注意力的改进版，更新规则（gated delta rule）大致是：
+#       S_t = α_t · S_{t-1} · (I − β_t k_t k_tᵀ) + β_t · v_t k_tᵀ
+#     - α_t（门控/衰减，0~1）：每步把旧记忆按比例"遗忘"一点，由模型根据输入决定
+#       （权重里的 A_log、dt_bias 和投影出的 a 一起算出来）
+#     - β_t（写入强度，0~1，由投影出的 b 过sigmoid得到）配合 (I − β k kᵀ)：先把S里和k_t相关的旧值擦掉一部分
+#       再写入新值，这就是"delta rule"——像覆盖写，而不是一味累加，所以记忆更不容易"糊"
+#     - 输出还会乘一个门 z（o = norm(o) · silu(z)），让模型控制每个通道输出多少
+#   推理实现：prefill时一次处理很多token，用"chunk"算法（分块并行）；decode时一个token，用"recurrent"算法
+#     （直接按上面的公式更新S）。见第8批 fla_ops/ 和 attention_gdn.py。
+#   短卷积（linear_conv_kernel_dim=4）：q/k/v进GDN之前先过一个长度4的因果1D卷积，让每个token先混入前3个token的信息，
+#     弥补线性注意力"局部细节"弱的问题。所以除了S，还要缓存最近3个token的卷积输入（conv state）。
+#   ATOM里一层GDN每条序列的状态（gdn_attn.py）：
+#     temporal_state [num_v_heads, v_dim, k_dim] = 32 x 128 x 128 ≈ 52万个数
+#     conv_state     [kernel-1, conv_dim]        = 3 x (128*16*2 + 128*32) = 3 x 8192
+#   对比：一层全注意力每个token的KV = 2(k,v) x 2头 x 256维 = 1024个数，约512个token就和GDN状态一样大；
+#     上下文越长，GDN越划算。
+#
+# ③ 混合架构（字段 layer_types）
+#   纯线性注意力回忆能力弱，纯全注意力长上下文太贵，于是交替排布：每4层里3层GDN + 1层全注意力。
+#   全注意力层照常有KV cache（走第4批的block manager），GDN层只有固定大小的状态（走第4批的状态缓存）。
+#   因此同一个模型里有两种"缓存"，这正是ATOM调度、KV管理比nano-vllm复杂的原因之一。
+#
+# ④ 带输出门的全注意力（attn_output_gate，config.json里的字段，本类没有显式声明，默认True）
+#   全注意力层的q_proj多投影出一份"门"g，注意力输出 o 变成 o · sigmoid(g) 再进o_proj。
+#   作用：让模型能把某些头的输出"关掉"，训练更稳定。ATOM因此用QKVGParallelLinear一次投影出q、k、v、g（第6批）。
+#
+# ⑤ MoE（混合专家，字段 num_experts、num_experts_per_tok、moe_intermediate_size 等）
+#   标准Transformer每层一个FFN；MoE层换成很多个小FFN（"专家"），再加一个路由器（router/gate，一个线性层）：
+#     router给每个token对每个专家打分 -> 取分数最高的k个（top-k，这里k=10）-> 只算这k个专家 ->
+#     按分数加权求和。总参数很大（512个专家），但每个token只用到一小部分，所以"参数多、算得少"。
+#     "80B-A3B"就是总参数80B、每个token激活约3B。
+#   共享专家（shared expert）：一个所有token都必经的FFN，学通用知识，路由专家学专门知识，两者输出相加。
+#     Qwen3-Next的共享专家输出还会乘一个sigmoid门（shared_expert_gate）。
+#   norm_topk_prob=True：选出的k个专家的权重重新归一化，使它们加起来等于1。
+#   ATOM里MoE的执行（把token分发给专家、多卡专家并行）见第7批 moe.py。
+#
+# ⑥ 部分RoPE（partial_rotary_factor=0.25）
+#   标准RoPE对q/k的全部维度做旋转；这里只旋转head_dim的前25%（256维里的64维），其余维度不带位置信息。
+#   经验上对长上下文外推更友好。
+# =====================================================================================
 from transformers.configuration_utils import PretrainedConfig, layer_type_validation
 from transformers.utils import logging
 
@@ -244,6 +304,17 @@ class Qwen3NextConfig(PretrainedConfig):
     #     configuration = model.config             # 读取模型的配置
     #
     # 补充：上文"Transformer编码器"是HF文档模板的原话，Qwen3-Next实际是decoder-only模型
+    # 字段速查（按上面的科普①~⑥分组）：
+    #   ① GQA：num_attention_heads=16个q头，num_key_value_heads=2个kv头，head_dim=256（全注意力层）
+    #   ② GDN：linear_num_key_heads=16、linear_num_value_heads=32、linear_key_head_dim=linear_value_head_dim=128、
+    #     linear_conv_kernel_dim=4（这些只作用于线性注意力层，和①的字段互不相干）
+    #   ③ 层类型：layer_types
+    #   ⑤ MoE：num_experts=512、num_experts_per_tok=10、moe_intermediate_size=512（每个专家FFN的中间维度，
+    #     比dense FFN的intermediate_size=5632小很多，因为每个token会过10个专家）、shared_expert_intermediate_size、
+    #     norm_topk_prob、decoder_sparse_step、mlp_only_layers
+    #   ⑥ RoPE：rope_parameters、partial_rotary_factor
+    #   训练专用、推理不用：initializer_range、attention_dropout、output_router_logits、router_aux_loss_coef
+    #     （router_aux_loss是训练时防止所有token都挤到少数几个专家上的"负载均衡"损失）
     # ATOM怎么用这些MoE字段（models/qwen3_next.py）：第i层不在mlp_only_layers里、num_experts>0、
     #   且(i+1) % decoder_sparse_step == 0时用Qwen3NextSparseMoeBlock，否则用dense的Qwen3NextMLP
     model_type = "qwen3_next"
@@ -344,6 +415,9 @@ class Qwen3NextConfig(PretrainedConfig):
         self.head_dim = head_dim
 
         # layer_types没给时：第i层满足(i+1)%4==0时是全注意力，其余是线性注意力（48层时第3、7、...、47层是全注意力）
+        # 即48层里36层GDN、12层全注意力：KV cache只有12层要存，比纯全注意力模型少3/4
+        # ATOM读取方：models/qwen3_next.py 逐层决定建GDN层还是全注意力层；ModelRunner据此分别分配
+        #   KV cache（全注意力层）和GDN状态（线性注意力层）
         # 这里调用layer_type_validation没传num_hidden_layers；Qwen3.5版本传了，会额外检查列表长度
         self.layer_types = layer_types
         if self.layer_types is None:
@@ -357,6 +431,10 @@ class Qwen3NextConfig(PretrainedConfig):
         # 【译】线性注意力部分
         # 线性注意力（GDN）层的形状：q/k/v先过长度为linear_conv_kernel_dim的短因果卷积；
         #   默认16个k头、32个v头，即每个q/k头被2个v头共享
+        # 科普：这和①的GQA方向正好相反——GQA是"多个q共享一个kv"，这里是"一个q/k配多个v"。
+        #   GDN的状态S按v头存（每个v头一个 [v_dim, k_dim] 矩阵），v头多 = 记忆容量大，而q/k少一些省计算
+        # ATOM读取方：models/qwen3_next.py 的GDN层按这些字段建 in_proj_qkvz / in_proj_ba / conv1d 投影，
+        #   gdn_attn.py 按它们算每层状态的形状（见文件头科普②里的数字）
         self.linear_conv_kernel_dim = linear_conv_kernel_dim
         self.linear_key_head_dim = linear_key_head_dim
         self.linear_value_head_dim = linear_value_head_dim
@@ -365,6 +443,11 @@ class Qwen3NextConfig(PretrainedConfig):
 
         # MoE arguments
         # 【译】MoE参数
+        # ATOM读取方：models/qwen3_next.py 建 FusedMoE（num_experts个专家、每token取num_experts_per_tok个，
+        #   renormalize=norm_topk_prob）和共享专家；config.py 的 _normalize_moe_config_fields 还会把
+        #   num_experts 抄一份成 n_routed_experts，供权重加载代码统一读取
+        # 例（默认值）：一个token进MoE层 -> router对512个专家打分 -> 取前10个 -> 10个专家各算一个
+        #   hidden 2048 -> 512 -> 2048 的小FFN -> 按分数加权相加 -> 再加上共享专家的输出
         self.decoder_sparse_step = decoder_sparse_step
         self.moe_intermediate_size = moe_intermediate_size
         self.shared_expert_intermediate_size = shared_expert_intermediate_size

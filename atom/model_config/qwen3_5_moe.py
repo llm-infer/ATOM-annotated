@@ -24,6 +24,13 @@
 # 调用方：models/qwen3_5.py用Qwen3_5MoeTextConfig做类型标注并再导出Qwen3_5MoeConfig；
 #   与dense版一样，仓库里没有地方直接实例化这些类，运行时的hf_config来自config.get_hf_config
 # 【分支】MoE层（FusedMoE、专家并行）见第7批；Qwen3.5模型实现见第8批
+#
+# 【科普】MoE（混合专家）一句话：把每层的一个大FFN换成很多小FFN（专家），每个token由路由器挑top-k个来算，
+#   参数总量大但每个token的计算量小。详细说明见 qwen3_next.py 文件头科普⑤；
+#   多模态、M-RoPE见 qwen3_5.py 文件头；GDN线性注意力见 qwen3_next.py 文件头科普②。
+# 和dense版的对比（默认值）：
+#   dense：hidden 4096、32层，每层一个 4096 -> 12288 -> 4096 的FFN
+#   MoE：  hidden 2048、40层，每层256个 2048 -> 512 -> 2048 的小专家（每个token用8个）+ 1个共享专家
 from transformers.configuration_utils import PretrainedConfig, layer_type_validation
 
 
@@ -32,6 +39,8 @@ class Qwen3_5MoeTextConfig(PretrainedConfig):
     model_type = "qwen3_5_moe_text"
     keys_to_ignore_at_inference = ["past_key_values"]
 
+    # 科普：gate_up_proj是什么——现代FFN是SwiGLU：FFN(x) = down( silu(gate(x)) * up(x) )，
+    #   gate和up是两个同形状的投影，常把它们拼成一个矩阵gate_up_proj一次算完（ATOM也这样融合，第6批）
     # HF的张量并行方案（ATOM运行时不读）：experts.gate_up_proj是"packed_colwise"，
     #   说明HF把所有专家的gate/up权重打包成一个张量；ATOM加载时用detect_fused_expert_format区分
     #   这种打包格式（Qwen3.5 BF16）和逐专家存储的格式（Qwen3.5 FP8），见models/qwen3_5.py
@@ -134,6 +143,10 @@ class Qwen3_5MoeTextConfig(PretrainedConfig):
         #   shared_expert_intermediate_size：共享专家（每个token都会经过）的中间维度
         #   num_experts_per_tok：每个token激活的专家数（top-k，默认8）；num_experts：路由专家总数（默认256）
         #   output_router_logits / router_aux_loss_coef：训练时的路由辅助损失，推理用不到
+        # 注意：没有intermediate_size（dense FFN的维度）和decoder_sparse_step——Qwen3.5-MoE每一层都是MoE
+        # ATOM读取方：models/qwen3_5.py 按这些字段建FusedMoE和共享专家；config.py的_normalize_moe_config_fields
+        #   把num_experts抄成n_routed_experts，权重加载代码统一读后者
+        # 例：一个token -> router对256个专家打分 -> 取前8个 -> 8个专家输出按分数加权 + 共享专家输出
         self.moe_intermediate_size = moe_intermediate_size
         self.shared_expert_intermediate_size = shared_expert_intermediate_size
         self.num_experts_per_tok = num_experts_per_tok

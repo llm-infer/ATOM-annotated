@@ -30,6 +30,35 @@
 #   所以这里的类主要充当类型标注和"有哪些字段"的说明
 # 对比nano-vllm：nano-vllm只支持Qwen3，直接用AutoConfig；ATOM要支持transformers未必内置的新模型，才有model_config/这个目录
 # 【分支】Qwen3.5模型实现与GDN线性注意力见第8批
+#
+# =====================================================================================
+# 【科普】读这个文件需要的概念（GQA、GDN线性注意力、混合层、MoE、部分RoPE已在 qwen3_next.py 文件头讲过，先读那里）
+# =====================================================================================
+#
+# ① 多模态模型 = 视觉编码器 + 投影 + 语言模型
+#   语言模型只认token序列，图片要先变成"一串向量"才能塞进去：
+#     图片 -> 切成小方块（patch，这里16x16像素）-> 每个patch展平成向量 -> 过一个ViT（视觉Transformer，
+#     本质就是你熟悉的Transformer编码器，双向注意力）-> 相邻2x2个patch合并成1个（spatial_merge_size=2，
+#     减少4倍token数）-> 投影到语言模型的hidden维度 -> 替换掉prompt里的图片占位token。
+#   例：一张448x448的图 -> 28x28=784个patch -> 合并后196个"视觉token"，在prompt里占196个位置。
+#   视频再多一个时间维：每2帧一组（temporal_patch_size=2）切成3D的patch。
+#   本文件里：Qwen3_5VisionConfig描述视觉编码器，Qwen3_5TextConfig描述语言模型，Qwen3_5Config把两者包起来，
+#     再加上占位token的id（image_token_id等）。
+#   ATOM原生模式目前只跑文本部分（get_hf_config只取text_config），视觉部分由vLLM插件模式处理（第10批）。
+#
+# ② M-RoPE（多模态RoPE，rope_parameters里的 mrope_section / mrope_interleaved）
+#   普通RoPE里每个token只有一个位置编号（第几个token）。图片是二维的，视频是三维的，
+#     只用一个序号会丢掉"上下左右"的空间关系。
+#   M-RoPE把每个token的位置拆成三个编号 (t, h, w)：时间、行、列。文本token三个编号相同（退化成普通RoPE），
+#     图片token的h、w取它在图上的行列。RoPE的旋转维度也按 mrope_section 分成三段，
+#     分别用t、h、w的位置去旋转；mrope_interleaved表示三段在维度上是交错排布还是连续排布。
+#   ATOM读取方：ModelRunner看rope_parameters里有没有mrope_section决定是否按M-RoPE准备位置（每个token 3个位置号），
+#     triton_mrope.py、triton_fused_qkv_norm_rope_cache.py 按 mrope_section 分段旋转（第6批）。
+#
+# ③ dense 与 MoE
+#   本文件是dense版：每层的FFN是一个普通MLP（intermediate_size）。qwen3_5_moe.py 是MoE版，
+#     把FFN换成路由专家 + 共享专家，其余（注意力、GDN、视觉部分）完全一样。
+# =====================================================================================
 from transformers.configuration_utils import PretrainedConfig, layer_type_validation
 
 
@@ -60,6 +89,12 @@ class Qwen3_5TextConfig(PretrainedConfig):
     }
     base_config_key = "text_config"
 
+    # 字段速查：
+    #   全注意力层：num_attention_heads、num_key_value_heads（GQA）、head_dim、attention_bias、rope_parameters
+    #   GDN线性注意力层：linear_*（含义见qwen3_next.py科普②）
+    #   dense FFN：intermediate_size、hidden_act（SwiGLU里的激活函数silu）
+    #   层排布：layer_types（或config.json里的full_attention_interval）
+    #   训练专用：initializer_range、attention_dropout
     def __init__(
         self,
         vocab_size=248320,
@@ -90,7 +125,8 @@ class Qwen3_5TextConfig(PretrainedConfig):
         **kwargs,
     ):
         # 告诉transformers的RoPE参数校验：rope_parameters里的mrope_section / mrope_interleaved是允许的额外键
-        #   M-RoPE（多模态RoPE）把旋转维度分给时间、高、宽三种位置，图文混排的输入要用它
+        #   M-RoPE（多模态RoPE）把旋转维度分给时间、高、宽三种位置，图文混排的输入要用它（见文件头科普②）
+        #   不加这句，transformers会把这两个"不认识"的键当成错误配置报警
         kwargs["ignore_keys_at_rope_validation"] = {
             "mrope_section",
             "mrope_interleaved",
@@ -111,6 +147,7 @@ class Qwen3_5TextConfig(PretrainedConfig):
         self.head_dim = head_dim
         self.rope_parameters = rope_parameters
         # partial_rotary_factor=0.25：只对head_dim的前1/4做RoPE；用setdefault写进kwargs，在super().__init__(**kwargs)里成为配置属性
+        #   例：head_dim=256 -> 只有64维带位置信息；用了M-RoPE时，mrope_section切分的也是这64维
         kwargs.setdefault("partial_rotary_factor", 0.25)
 
         # layer_types：每层是"linear_attention"还是"full_attention"；config.json没给时按full_attention_interval（默认4）生成
@@ -127,6 +164,7 @@ class Qwen3_5TextConfig(PretrainedConfig):
                 for i in range(self.num_hidden_layers)
             ]
         # layer_type_validation（transformers提供）：检查每项取值合法，并检查列表长度等于num_hidden_layers
+        # ATOM读取方：models/qwen3_5.py 按 layer_types[i] 决定第i层建GDN层还是全注意力层
         layer_type_validation(self.layer_types, self.num_hidden_layers)
 
         # linear attention part
@@ -152,6 +190,9 @@ class Qwen3_5TextConfig(PretrainedConfig):
 
 
 # 视觉编码器（ViT）配置；model_type与顶层相同（"qwen3_5"），靠base_config_key="vision_config"表明自己是子配置
+#   depth=27层、hidden_size=1152、num_heads=16：ViT本身的大小（一个标准的Transformer编码器，双向注意力、无KV cache）
+#   in_channels=3：RGB三通道；num_position_embeddings=2304：ViT的可学习位置编码表大小（48x48个patch位置），
+#     图片更大/更小时会对它插值
 #   patch_size=16：图片切成16x16的patch；spatial_merge_size=2：相邻2x2个patch合并成1个视觉token
 #   temporal_patch_size=2：视频按2帧一组切patch；out_hidden_size：视觉特征输出维度，需与文本hidden_size对齐
 class Qwen3_5VisionConfig(PretrainedConfig):
@@ -224,6 +265,9 @@ class Qwen3_5Config(PretrainedConfig):
             self.text_config = self.sub_configs["text_config"]()
 
         # image_token_id / video_token_id：prompt里图片、视频占位token；vision_start / vision_end：视觉段的起止标记token
+        # 例：一张图片在prompt里展开成 <vision_start> <image> <image> ... <image> <vision_end>，
+        #   中间<image>的个数等于这张图的视觉token数（见文件头科普①）；推理时这些位置的embedding
+        #   会被替换成视觉编码器的输出
         self.image_token_id = image_token_id
         self.video_token_id = video_token_id
         self.vision_start_token_id = vision_start_token_id

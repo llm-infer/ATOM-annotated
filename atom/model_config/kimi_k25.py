@@ -20,6 +20,46 @@ A video-chunk is the smallest independently processable unit of video.
 # 原生ATOM路径不用这个类：config.get_hf_config对model_type="kimi_k25"只抽出text_config，
 #   按text_config的model_type经_CONFIG_REGISTRY映射（如kimi_k2 -> deepseek_v3）后解析，见本批config.py
 # 【分支】vLLM插件见第10批；DeepSeek-V3结构（MLA、MoE）见第7批
+#
+# =====================================================================================
+# 【科普】文本部分：DeepSeek-V3结构（text_config是DeepseekV3Config）
+# =====================================================================================
+# 和你熟悉的"MHA + dense FFN"Transformer相比，DeepSeek-V3改了两处：注意力换成MLA，FFN换成MoE。
+#
+# ① MLA（Multi-head Latent Attention，多头潜在注意力）——目的：把KV cache压到极小
+#   MHA每层每个token要缓存 num_heads 份K和V。DeepSeek-V3有128个头，K每头192维、V每头128维，
+#     一个token一层就是 128 x (192 + 128) = 40960 个数，长上下文时KV cache会非常大。
+#   MLA的做法：不直接存K、V，而是先把hidden压缩成一个很短的"潜在向量"c（kv_lora_rank=512维），只缓存它；
+#     用的时候再用两个上投影矩阵从c还原出每个头的K和V（"低秩分解"，lora_rank即低秩维度）。
+#   RoPE的麻烦：RoPE要对K按位置旋转，旋转后就没法再和上投影矩阵"合并"了。所以MLA把K拆成两部分：
+#     - 不带位置的部分（qk_nope_head_dim=128）：从c还原
+#     - 带位置的部分（qk_rope_head_dim=64）：所有头共享一份，单独算、单独缓存
+#   于是每个token每层只缓存 512 + 64 = 576 个数，约为MHA的1/71。
+#   decode时还有个技巧（"权重吸收"）：把K的上投影矩阵合并进Q、把V的上投影合并进输出投影，
+#     注意力直接在512维的c上算，不必真的把每个头的K、V还原出来。ATOM的实现见第7批 attention_mla.py。
+#   Q也做了类似的压缩（q_lora_rank），主要为了省参数和计算，与KV cache无关。
+#
+# ② MoE（混合专家）——目的：参数多、算得少
+#   每层的FFN换成很多个小FFN（专家）+ 一个路由器：路由器给每个token对所有专家打分，只挑分数最高的
+#     几个（DeepSeek-V3是256个专家里挑8个）来算，结果按分数加权求和；另外还有1个所有token都要过的共享专家。
+#     开头几层仍是普通的dense FFN（first_k_dense_replace）。Kimi-K2沿用这个结构，只是专家更多（384个）。
+#   ATOM的实现见第7批 moe.py、topK.py。
+#
+# 顺带一提（本文件用不到，但DeepSeek家族常见）：
+#   DSA（DeepSeek Sparse Attention，V3.2 / GLM-5 用）在MLA之上再加一个轻量的"索引器"（indexer）：
+#     每个query先用很便宜的打分从全部历史token里挑出top-k个（例如2048个），真正的注意力只和这k个token算。
+#     这样超长上下文时注意力的计算量不再随长度增长。Kimi-K2 / K2.5没有DSA。见第7批 model_ops/indexer。
+#
+# =====================================================================================
+# 【科普】视觉部分：MoonViT + 投影器（vision_config）
+# =====================================================================================
+#   和其他多模态模型一样（可参考 qwen3_5.py 文件头科普①）：图片切成14x14像素的patch -> 过ViT（视觉Transformer）
+#     -> 相邻2x2个patch合并（merge_kernel_size）-> 投影器（mm_projector）映射到文本hidden维度 ->
+#     替换prompt里的占位token（media_placeholder_token_id）。
+#   视频按"video-chunk"处理：几帧连续画面作为一个单元，ViT里同时做空间和时间维的注意力（video_attn_type），
+#     合并时除了2x2空间合并，还把同一位置不同帧的特征取平均（merge_type="sd2_tpool"，tpool = temporal pooling，
+#     时间维池化），所以一段视频不会因为帧多而产生成倍的视觉token。
+# =====================================================================================
 from transformers import DeepseekV3Config
 from transformers.configuration_utils import PretrainedConfig
 
@@ -33,6 +73,15 @@ def _first_non_none(*values):
 
 
 # 视觉部分的配置：视觉塔（MoonViT，支持图片和视频）+ 多模态投影器（mm_projector，把视觉特征映射到文本hidden维度）
+# 字段速查：
+#   patch_size=14：每个patch 14x14像素
+#   init_pos_emb_height / width / time、pos_emb_type="divided_fixed"：ViT的位置编码表按"高、宽、时间"
+#     分开存（64 x 64 x 4），图片尺寸不同时按实际网格大小取用/插值
+#   num_attention_heads / num_hidden_layers / hidden_size / intermediate_size：ViT本身的大小
+#   merge_kernel_size=(2,2)、merge_type="sd2_tpool"：2x2空间合并 + 时间维平均（见文件头科普）
+#   video_attn_type="spatial_temporal"：视频帧之间也做注意力
+#   mm_projector_type="patchmerger"：投影器是一个把合并后的patch特征映射到文本维度的小MLP
+#   mm_hidden_size / text_hidden_size：投影器输出维度，必须等于文本模型的hidden_size
 # 输入：config.json里vision_config的各字段（两种命名都接受）；调用方：KimiK25Config.__init__经from_remote_config构造
 class KimiK25VisionConfig(PretrainedConfig):
     model_type = "kimi_k25_vision"
@@ -180,6 +229,9 @@ class KimiK25Config(PretrainedConfig):
         # Text config
         # 【译】文本配置
         # text_config可以是None（用默认DeepseekV3Config）、dict（config.json里的原始字典）或已构造好的对象（原样使用）
+        # 文本模型的关键字段（都在DeepseekV3Config里，含义见文件头科普）：
+        #   MLA：kv_lora_rank、q_lora_rank、qk_nope_head_dim、qk_rope_head_dim、v_head_dim
+        #   MoE：n_routed_experts、num_experts_per_tok、n_shared_experts、moe_intermediate_size、first_k_dense_replace
         if text_config is None:
             text_config = DeepseekV3Config()
         elif isinstance(text_config, dict):
@@ -197,6 +249,9 @@ class KimiK25Config(PretrainedConfig):
         # Other config
         # 【译】其他配置
         self.ignore_index = ignore_index
+        # media_placeholder_token_id：prompt里图片/视频占位token的id，推理时这些位置换成视觉特征
+        # use_unified_vision_chunk / video_placeholder：是否把图片也当成"只有1帧的video-chunk"统一处理，
+        #   以及视频在文本里的占位字符串（由预处理展开成若干占位token）
         self.media_placeholder_token_id = media_placeholder_token_id
         self.use_unified_vision_chunk = use_unified_vision_chunk
         self.video_placeholder = video_placeholder
@@ -204,6 +259,7 @@ class KimiK25Config(PretrainedConfig):
         # Propagate quantization config from text model
         # 【译】从文本模型传递量化配置
         # 量化配置写在text_config里；复制到顶层后，按顶层quantization_config读取量化方式的代码也能看到它
+        #   （ATOM的QuantizationConfig读的是 hf_config.quantization_config，见config.py）
         if getattr(self.text_config, "quantization_config", None) is not None:
             self.quantization_config = self.text_config.quantization_config
 
