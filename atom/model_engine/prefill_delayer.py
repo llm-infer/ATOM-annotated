@@ -158,6 +158,9 @@ DP-state barrier drives shutdown.
 #     _shutting_down 置 True，所有 rank 按"要关闭"处理
 #   - "浪费了约 97%"指 500/16384≈3% 的预算被用上；真正白花的是那份与 token 数无关的固定开销，见下面【科普】①(b)
 #   - 不只是 DP-attention：任何 DP>1 的部署默认都会创建跨 DP 的 delayer（见下面④）
+#   - "TP/DCP"：DCP（decode context parallel）在 TP 组内把每条请求的 KV 按 token 分到各卡上存（-tp 8 -dcp 8 时每卡存 1/8），
+#     不增加卡数，和纯 TP 一样仍是一个 EngineCore、一个调度器驱动所有卡，所以同样走本地模式
+#     （arg_utils.py decode_context_parallel_size 上方的【科普】）
 #
 # ============================== 以下是解释（不是翻译） ==============================
 # 【导读】PrefillDelayer：调度器每个 tick 问一次"这一步能不能放 prefill 进来"的闸门
@@ -167,7 +170,13 @@ DP-state barrier drives shutdown.
 #   与主干的关系：挂在调度器上的可选闸门。返回 False（HOLD）时 _schedule 跳过 Phase 1（续算 chunked prefill）和
 #     Phase 2（准入新请求），这一步只做 decode。它只决定"这一步做不做 prefill"，从不把 prefill 和 decode 拼进同一个 batch
 #   术语：tick = 一次 Scheduler._schedule() 调用 ≈ 一个 step（一次 forward）；FIRE = 本 tick 允许 prefill；
-#     HOLD = 本 tick 不放 prefill；扣住期（episode）= 上一次 FIRE 之后连续 HOLD 的一段，_hold_ticks 数的就是它的长度
+#     HOLD = 本 tick 不放 prefill；扣住期（episode）= 上一次 FIRE 之后连续 HOLD 的一段，_hold_ticks 数的就是它的长度；
+#     TTFT = 请求到达 → 第一个输出 token（排队 + prefill；sequence.py 里的 first_token_time − arrive_time）；
+#     ITL = 同一请求相邻两个输出 token 的间隔（这两个词也在 engine_core.py 文件开头的术语表里）
+# 前置概念（每个都在第一次用到的地方先给要点和数字，再指向完整讲解）：
+#   prefill 算力受限 / decode 带宽受限 → ①(a)；CUDA Graph 与 eager → ①(b)；chunked prefill 与 partial → ①(c)；
+#   DP-attention、MoE 的跨 rank 交换、集合通信（all_reduce / all-to-all）与 DP 锁步、gloo → ①(d)；
+#   DP prefill 代价估算 → ②末尾；KV 使用率与分页 KV → ④ 的两个 KV 水位
 # 阅读路线：
 #   ① 【科普】为什么要扣住 prefill（从"一步只做一种"出发）
 #   ② 两种模式的时间线（本地 TP、跨 DP），带数字；为什么用 SUM
@@ -184,9 +193,18 @@ DP-state barrier drives shutdown.
 #       decode B=64 一步 ≈ 13ms（读一遍 70GB 权重）
 #       prefill 500 token   ≈ 2×70e9×500   / 2600e12 ≈ 27ms（已超过约245 token的分界，算力受限）
 #       prefill 16384 token ≈ 2×70e9×16384 / 2600e12 ≈ 0.88s（一个满预算，max_num_batched_tokens 默认 16384）
+#     "分界"的由来：一步的耗时约等于"把权重读一遍"和"算完全部 FLOP"中较慢的那个。读 70GB 权重固定 ≈13ms，与 token 数
+#       无关；计算 = 2×70e9×N / 2600e12，N≈245 时也是 ≈13ms。少于约 245 个 token 由读权重决定（带宽受限，decode 属于这类），
+#       多于它由计算决定、耗时与 token 数成正比（算力受限，prefill 属于这类）。推导见 engine_core.py 文件开头【2】
 #   (b) 很多次小 prefill vs 一次大 prefill：每次 prefill forward 除了与 token 数成正比的计算，还有一份与 token 数无关的
 #     固定开销（prefill 走 eager、不回放 CUDA Graph，要逐个发射每一层的 kernel；DP attention 下每个 MoE 层都有一次
-#     跨 rank 的 all-to-all；还有一次 CPU 调度 + postprocess）。
+#     跨 rank 的 all-to-all（是什么见下面(d)的前置）；还有一次 CPU 调度 + postprocess）。
+#     前置：CUDA Graph 与 eager（完整讲解见 config.py CUDAGraphMode 上方的【科普】①②）——GPU 上每个算子都要由 CPU 发射一次
+#       kernel，一次 forward 有几百到几千个，每次发射要几微秒（示意：1000 个 × 5µs ≈ 5ms，和 decode 一步 13ms 同一量级）。
+#       CUDA Graph 把一次 forward 的全部 kernel 录下来，之后一条命令整体回放，这份发射开销几乎消失；但录下的形状是固定的，
+#       ATOM 只为 decode 的若干 batch 档位（capture sizes）录图。prefill 每步的 token 数都不同，从不回放
+#       （utils/forward_context.py ForwardMode.decide：replayable 要求 not is_prefill），kernel 只能逐个发射——ATOM 把
+#       不回放图的执行叫 eager。所以每次 prefill forward 都要付一整份发射开销，带 500 个 token 和带 16384 个一样多
 #     例：每隔约 5 个 step 来一条 500 token 的短 prompt，一共 30 条（15000 token，历时约 145 个 step）；设每次 prefill 的固定开销
 #       为 c（示意）。按默认上界：pending 每 5 个 step 增长一次（stall 到不了 10），扣住期约 145 个 tick（< ttft_max_ticks 200）
 #       来一条放一条：30 次 prefill forward → 30c 固定开销；正在 decode 的请求被打断 30 次（每次 ≈27ms+c）
@@ -195,11 +213,33 @@ DP-state barrier drives shutdown.
 #     代价：先到的请求要等后面的请求凑齐（第 1 条多等约 145 个 step ≈ 1.9s，TTFT 变长），而那一次打断很长（ITL 出现一个大尖峰）。
 #     所以"等多久"必须有上界（stall / ttft / kv / 排队时长）——这就是下面决策流程里那一串 FIRE 条件。
 #     这和 TCP 的 Nagle 算法是一个思路：小包先攒在缓冲区里，攒够一个包（或等到上一个包的 ACK）再发，用一点延迟换更少的包
-#   (c) 本地 TP 的另一件事：保护 decode（decode 间隔）。chunked prefill 做到一半的请求下一步优先续算（scheduler.py
-#     Scheduler._schedule 的 Phase 1），于是一条长 prompt 的所有 chunk 会背靠背占满连续几个 step，decode 在这期间完全停住。
+#   (c) 本地 TP 的另一件事：保护 decode（decode 间隔）。
+#     前置：chunked prefill（nano-vllm 也有；完整讲解见 arg_utils.py enable_chunked_prefill 上方的【科普】）——一步最多算
+#       max_num_batched_tokens（默认 16384）个 prompt token，更长的 prompt 切成几块分几步算：40000 = 16384 + 16384 + 7232，
+#       后面的块 attend 前面块已写进 cache 的 KV。准入时就按整条 prompt 一次分好全部 KV block（同 nano-vllm；默认 16 token
+#       一个 block → 2500 个），所以做到一半的请求（partial，seq.is_partial_prefill）一直占着这些 block。
+#       与 nano-vllm 不同：ATOM 的 partial 第一次被调度就已是 RUNNING、留在 running 里，下一步由 Scheduler._schedule 的
+#       Phase 1 先于新请求续算（为什么先续算见 scheduler.py Phase 1 上方的说明）。
+#     再加上"一步只做一种"，一条长 prompt 的所有 chunk 会背靠背占满连续几个 step，decode 在这期间完全停住。
 #     ATOM_PREFILL_DECODE_INTERVAL=N 让每次真正执行过的 prefill 之后至少跟 N 个只做 decode 的 tick，decode 就能插进 chunk 之间
-#   (d) 跨 DP 的问题：DP rank 之间锁步（原理图见 engine_core.py DPEngineCoreProc 上方）：每一步所有 rank 一起 forward，
-#     MoE 层每层都要跨 rank 交换 token，一步的时长由最慢的 rank 决定。只要有一个 rank 在 prefill，这一步就是"混合步"：
+#   (d) 跨 DP 的问题。先交代要用到的前置知识（要点 + 数字；完整讲解见各条的指针）：
+#     · DP-attention：`-tp 8 --enable-dp-attention` 会被改写成 DP=8、TP=1（engine_core_mgr.py）。8 张卡各有一份完整的
+#       注意力权重，各自调度、各自只存自己请求的 KV；MoE 层（FFN 换成很多个"专家"FFN，每个 token 由 router 选 top-k 个）
+#       则由 8 张卡协同计算：常见配法再开 --enable-expert-parallel（EP），如 256 个专家每卡放 32 个，每层先把 token 按 router
+#       结果发到专家所在的卡、算完再收回，这就是每个 MoE 层的 all-to-all（不开 EP 时换成 all_gather 等集合通信）。
+#       MoE / EP 见 arg_utils.py enable_expert_parallel 上方的【科普】
+#     · 集合通信是会合点：all-reduce / all-to-all / all_gather 要求组里每个 rank 都调用、次数和顺序都一致，先到的 rank
+#       一直等到最后一个到齐才返回；有一个 rank 少调一次，其余 rank 就永远卡住（engine_core.py 文件开头【4】）。
+#       all_reduce(SUM) = 每个 rank 交一个等长向量，返回时每个 rank 都拿到同一份逐元素之和。本文件就用它交换调度信号：
+#       例 DP=4，各 rank 的 prefillable 标志为 1、1、0、1 → 每个 rank 都读回 3。它走 DP 的 gloo 组（gloo = PyTorch 在 CPU
+#       张量上做集合通信的后端；调度信号本来就在 CPU，不必拷到 GPU），同样是会合点——所以 should_allow_prefill 必须每个
+#       tick 在每个 rank 上各调用一次
+#     · DP 锁步：示意 80 层、每层都是 MoE 的模型，一次 forward 就有 80 次跨 rank 会合，所以只要有一个 rank 有活，所有 rank
+#       都得一起走这一步：没有请求的 rank 跑一个 1 token 的 dummy batch 陪完这 80 次交换，结果丢弃；一步的时长由最慢的
+#       rank 决定（原理图、时序图见 engine_core.py DPEngineCoreProc 上方）
+#     · CUDA Graph（见(b)）回放时，图里录好的集合通信也跟着回放，形状固定在录制时的 batch 档位；所以整个 DP 组要么一起
+#       回放、要么一起 eager——有一个 rank 在 prefill（不回放），其他 rank 这一步也只能 eager，否则集合通信的形状对不上
+#     有了这些：只要有一个 rank 在 prefill，这一步就是"混合步"：
 #       正在 decode 的 rank：每层 MoE 都在等做 prefill 的 rank；而且整个 DP 组这一步都不能回放 CUDA Graph，decode 改走 eager
 #         （utils/forward_context.py ForwardMode.decide：unified = not any_rank_has_prefill，只有 unified 时才可能回放）
 #       没有任何请求的 rank：跑一个 dummy batch 陪跑（DPEngineCoreProc._execute_dummy_batch），同样要等满这一步
@@ -250,6 +290,11 @@ DP-state barrier drives shutdown.
 #     MAX 式（最忙的 rank 满了就放行）：这一步 rank0 要算 16384 个 token（≈0.88s），rank1~3 反正要陪它等满这一步，
 #       却只用了自己预算的 6%，剩下的 prompt 以后还得再占 prefill 步
 #     SUM 式：fill=(16384+3×1000)/(4×16384)≈0.30 < 0.9 → HOLD，rank1~3 继续积累，放行时各自带更大的 batch
+#     前置：同样多的 token，chunk 的代价为什么会不同——chunk 里每个新 token 除了线性层 / MoE 这份与上下文无关的计算，还要
+#       attend 前面全部已缓存的 token（因果 mask 下块内平均再看一半）。scheduler.py Scheduler._chunk_cost 的估算：
+#       代价 = chunk × (W + start + chunk/2)；W = ATOM_DP_PREFILL_BALANCE_TOKEN_WEIGHT（默认 360000，把每 token 的固定计算
+#       折算成"相当于 attend 多少个上下文 token"），start = 这个 chunk 之前已缓存的 token 数。
+#       例：chunk=16384、start=0 → ≈6.03e9；同样 16384 个 token、start=200000（长 prompt 的后段）→ ≈9.31e9，贵约 54%
 #     反方向的问题（某个 rank 的 chunk 特别贵，拖长整步）由 DP prefill 代价均衡处理：各 rank 的代价搭同一次 all_reduce 交换，
 #       贵的 rank 少拿 token（见 envs.py ATOM_DP_PREFILL_BALANCE_TOKEN_WEIGHT 上方、scheduler.py Scheduler._balance_prefill_step）
 #
@@ -320,7 +365,12 @@ DP-state barrier drives shutdown.
 #       等待"在途前缀 checkpoint"的期限
 #     ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS=100  框 C⑤：有 rank 在 chunked prefill 中途时更紧的上界——中途的请求已经占着
 #       KV block，扣着它等于让这些 KV 空占；只有小于 TTFT_MAX_TICKS 才有意义
+#     （下面两个水位的前置：KV 使用率 = 已用 KV block / 总 block 数（scheduler.py Scheduler._kv_usage）。和 nano-vllm 一样是
+#       分页 KV：KV 显存预先切成固定数量的 block（默认每 block 16 个 token），新请求准入时按整条 prompt 一次分好 block
+#       （4000 token → 250 个），decode 每写满一个 block 再要一个；分不到时新请求准入不了，running 里的请求还可能被抢占
+#       （scheduler.py Scheduler._preempt_one_running）。分页 KV 的完整讲解见 config.py 文件开头的【科普】KV cache 与分页 KV）
 #     ATOM_PREFILL_DELAYER_KV_HIGH_WATERMARK=0.9  框 C②：可 prefill 的 rank KV 使用率 ≥ 它就放行——KV 快满了，再等也攒不出更大的 batch
+#       （剩下的 block 还要供 running 里的请求逐 token 增长，新到的 prompt 分不到 block，等下去也准入不了更多）
 #     ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK=（空，关闭）  框 C②：KV 使用率 < 它就放行——KV 用得少说明在跑的请求少、
 #       GPU 吃不饱，先把 prefill 喂进去（对应 SGLang 的 token_usage_low_watermark）
 #     ATOM_PREFILL_DELAYER_MAX_QUEUE_MS=（空，关闭）  框 C③：最老的可准入等待请求从到达起排队满这么多 ms 就放行（墙钟时间，
@@ -344,6 +394,8 @@ DP-state barrier drives shutdown.
 #       False：Phase 1（续算 partial）和 Phase 2（准入新请求）都跳过，这一步走 decode；被跳过的 partial 挪到 running 队尾
 #       True 且 cost_balance：_balance_prefill_step(prefill_cost) 用 rank_prefill_costs 定本步的代价上限
 #   Scheduler._wait_for_inflight_prefix（只在本地模式）：等待在途前缀 checkpoint 的期限 = 当前 tick + ttft_max_ticks
+#     （【分支】带每请求状态的混合模型：一条请求先不准入，等另一条正在 prefill、共享同一段长前缀的请求在前缀末尾存下状态
+#     checkpoint 后再复用；为什么要等、判定条件见 scheduler.py 该函数上方的说明）
 #   EngineCore._process_engine_step_inner：batch.total_seqs_num_prefill > 0 的 forward 返回后 → notify_prefill_executed()
 #
 # ⑥ 对比
@@ -800,7 +852,8 @@ class PrefillDelayer:
         # 【译】上一个 tick 里真正跑过的 prefill，会在每个 rank 上装填同一个倒计时。delayer 的 FIRE 只是"允许尝试"：
         #   分配、远端 KV 的处理或队列变化仍可能让这一步变成 decode 批或空批，那种情况不能开启 decode 保护窗口。
         # 解释：所以装填看的是槽 7（engine_core.py 在含 prefill 的 forward 返回后调 notify_prefill_executed），而不是上一次的 FIRE；
-        #   每次又有 prefill 跑过都会重新装满（不会叠加）
+        #   每次又有 prefill 跑过都会重新装满（不会叠加）。"远端 KV"是【分支】PD 分离 / KV offload：请求的 KV 由别的节点或
+        #   CPU 内存传来、不在本地算（arg_utils.py kv_transfer_config 上方的【科普】PD 分离，第 9 批）
         if prefill_ran_n > 0:
             self._decode_interval_remaining = self.prefill_decode_interval
 
