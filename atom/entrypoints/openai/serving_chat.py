@@ -19,6 +19,19 @@
 #   {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}  ┐
 #   {"choices": [], "usage": {...}}                                    ├ 最后三帧合并成一次发送
 #   [DONE]                                                             ┘
+# 原理：工具调用（function calling）在模型看来只是"按约定格式写一段文本"
+#   1. 请求带tools（JSON Schema描述的函数）→ chat template把它们渲染进prompt（通常在system段），告诉模型有哪些工具、怎么调用
+#   2. 模型决定调用时，输出模板约定格式的文本，例如Hermes / Qwen风格：
+#        <tool_call>{"name": "get_weather", "arguments": {"city": "北京"}}</tool_call>
+#      格式由模型训练时的模板决定，服务端必须用对应的解析器（启动时从模板推断，见tool_parser/registry.py）
+#   3. 服务端把这段文本解析成结构化的tool_calls，不再作为content返回，finish_reason为tool_calls
+#   4. 客户端执行工具，把结果作为role="tool"的消息（带tool_call_id）发回，下一轮由模板再渲染进prompt
+#   服务端从不执行工具，它只负责"文本 ↔ 结构"的双向翻译（回传的历史调用见protocol._normalize_tool_call_arguments）
+# 流式工具调用的帧（tool_parser/stream.py的事件）：先发一帧带id、type和function.name（arguments为""），
+#   该调用解析完整后再发一帧带function.arguments（ATOM整段发出，不逐字符流式）；客户端按tool_calls[i].index把同一调用的片段拼起来
+#   {"delta": {"tool_calls": [{"index": 0, "id": "call_...", "type": "function", "function": {"name": "get_weather", "arguments": ""}}]}}
+#   {"delta": {"tool_calls": [{"index": 0, "function": {"arguments": "{\"city\": \"北京\"}"}}]}}
+#   {"delta": {}, "finish_reason": "tool_calls"}
 # 对比nano-vllm：nano-vllm没有这一层
 import logging
 import time
@@ -282,6 +295,7 @@ def create_chat_chunk(
                 "index": index,
                 "delta": delta if delta else {},
                 "finish_reason": finish_reason,
+                # 恒为None：HTTP接口不支持logprobs（请求模型里没有这个字段，_build_sampling_params也不传，见api_server.py）
                 "logprobs": None,
             }
         ],
@@ -358,6 +372,9 @@ async def stream_chat_response(
     # 【分支】PD分离：prefill节点的KV位置，放进最后的usage帧带回给路由器（第9批）
     kv_transfer_params_value = None
 
+    # 客户端断开如何到达这里：StreamingResponse监听到http.disconnect后取消正在迭代本生成器的任务；
+    #   若此刻停在await collector.get()上，这里收到CancelledError，若停在某个yield上，之后生成器被关闭时收到GeneratorExit——
+    #   两种情况finally都会执行，用下面的aborted标志区分"引擎已经结束"和"需要abort"
     # Assume abort until the engine's finished chunk arrives. A client
     # disconnect closes the generator before then, leaving this True so the
     # finally aborts the still-running seq; normal completion flips it to False.
@@ -455,6 +472,10 @@ async def stream_chat_response(
         finish_reason = openai_stop_reason_with_calls(
             engine_finish_reason, has_tool_calls
         )
+        # usage总是作为倒数第二帧发出（choices为空列表），不看OpenAI的stream_options.include_usage（服务端没有读取它的代码，atom/里只有benchmarks客户端会发送它）；
+        #   只读choices[0]而不判空的客户端在这一帧上会出错。cached_tokens：prompt中命中前缀缓存、跳过了prefill计算的token数，
+        #   例：多轮对话第二轮，前一轮的1500个token仍在缓存里，新prompt共1600个token → prompt_tokens=1600，cached_tokens≈1500
+        #   （前缀缓存按整块命中，所以通常是block大小的整数倍）
         usage = {
             "prompt_tokens": num_tokens_input,
             "completion_tokens": num_tokens_output,

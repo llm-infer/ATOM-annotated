@@ -38,6 +38,10 @@ instance) has to be sanitised before it gets here.
 # 调用方：serving_chat / serving_completion / atomesh的atom_standalone_service（data_frame）、
 #   serving_anthropic / serving_responses（event_frame）、api_server._client_stream（iter_sse_data，用于日志和TTFT）
 
+# 原理：为什么用SSE而不是WebSocket。生成是单向的（服务端 → 客户端），SSE就是一个普通的HTTP响应、只是不一次性写完，
+#   能穿过一般的HTTP代理和负载均衡，客户端用任何HTTP库逐行读即可。代价是协议本身没有"正常结束"的标志——
+#   连接断开既可能是生成完了，也可能是中途出错，所以OpenAI约定以 "data: [DONE]" 作为结尾哨兵，没收到它就说明响应不完整
+#   中间的代理若缓冲响应（例如nginx默认开启proxy_buffering），客户端会看到所有帧在最后一下子到达，流式就失去意义
 import re
 from collections.abc import Iterator
 from typing import Any

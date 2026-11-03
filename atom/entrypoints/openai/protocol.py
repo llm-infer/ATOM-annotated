@@ -37,6 +37,8 @@ from pydantic import (
 DEFAULT_TEMPERATURE = 1.0
 DEFAULT_TOP_K = -1
 DEFAULT_TOP_P = 1.0
+# max_tokens的作用：给输出长度一个上限，同时也是API层长度校验的依据（prompt + max_tokens ≤ max_model_len，见api_server._validate_context_length）；
+#   默认值8192意味着：没传max_tokens时，prompt超过 max_model_len - 8192 个token的请求会被直接拒绝（400）
 DEFAULT_MAX_TOKENS = 8192
 CHAT_COMPLETION_OBJECT = "chat.completion"
 CHAT_COMPLETION_CHUNK_OBJECT = "chat.completion.chunk"
@@ -133,6 +135,7 @@ def openai_stop_reason(finish_reason: str | None) -> str | None:
         return None
     if finish_reason in ("stop", "length", "tool_calls"):
         return finish_reason
+    # 其余一律报"stop"，包括aborted和unschedulable: ...——客户端从finish_reason上区分不出"自然结束"和"被引擎放弃"
     if finish_reason in ("max_tokens", "max_new_tokens"):
         return "length"
     return "stop"
@@ -321,6 +324,10 @@ class ChatCompletionRequest(BaseModel):
     # max_completion_tokens是OpenAI较新的字段名，优先于max_tokens（见get_max_tokens）
     max_completion_tokens: int | None = None
     # stop：停止字符串列表 → SamplingParams.stop_strings；ignore_eos：遇到EOS也不停（压测常用）
+    # stop的语义与OpenAI有两点不同：①引擎做的是token级匹配（stop字符串先被tokenize成token序列，见llm_engine.py的preprocess），
+    #   生成时同一段文字若被切成别的token就匹配不上；②按调度器的截断逻辑，命中的stop序列本身保留在输出里（OpenAI的返回文本不含它）。
+    #   命中后leave_reason为"stop_sequence"，对外报告为finish_reason="stop"
+    # ignore_eos：压测时用，让每个请求都正好生成max_tokens个token，输出长度固定，吞吐数字才可复现、可比较
     stop: list[str] | None = None
     ignore_eos: bool | None = False
     stream: bool | None = False

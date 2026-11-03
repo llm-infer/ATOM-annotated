@@ -53,6 +53,25 @@ Usage:
 #   而是一帧一帧地写，每帧形如 "data: {json}\n\n"；OpenAI的流式协议以 "data: [DONE]\n\n" 结尾。
 #   FastAPI的StreamingResponse包装一个异步生成器：生成器每yield一个字符串，就往socket写一次
 #
+# ---- 原理：一个"OpenAI兼容服务器"到底要做什么 ----
+# 引擎只认token id和SamplingParams，客户端说的是OpenAI的JSON协议；服务层就是两者之间的翻译，主要五件事：
+#   1. 输入：messages → chat template → prompt字符串 → token id（chat_encoders.py；tokenize在preprocess里做）
+#   2. 采样：temperature / top_p / top_k / max_tokens / stop / n → SamplingParams（_build_sampling_params）
+#   3. 输出：token id → 文本（非流式一次decode，流式增量反分词），再拆出reasoning_content / tool_calls（serving_chat.py）
+#   4. 结束：引擎的leave_reason → finish_reason（stop / length / tool_calls，见protocol.openai_stop_reason*）
+#   5. 计量：usage = prompt_tokens（渲染模板后的prompt长度，含模板加的特殊token）/ completion_tokens /
+#      prompt_tokens_details.cached_tokens（前缀缓存命中、不用重新prefill的prompt token数）
+# 为什么要流式：自回归生成的总时延 ≈ TTFT + (输出token数 - 1) × TPOT
+#   TTFT（首token时延）= 排队 + prefill；prefill是计算密集的，随prompt长度增长
+#   TPOT（每个输出token的时间）≈ 一个decode step的耗时；decode是访存密集的（每步都要读一遍权重和整段KV），随batch和上下文缓慢增长
+#   例：TTFT=0.3s、TPOT=20ms、输出500个token → 非流式要等 0.3 + 499×0.02 ≈ 10.3s 才看到第一个字；
+#     流式0.3s就开始显示，之后每20ms左右来一段。用户感知的快慢主要看TTFT和ITL（相邻两次输出的间隔，即逐段测得的TPOT；
+#     投机解码时一个step可能一次吐出多个token，ITL会"一阵一阵"的）
+# 为什么用一个事件循环而不是每请求一个线程：一个请求绝大部分时间在等GPU，HTTP这边只做"等待 + 转发"，
+#   一个线程挂几千个协程就够了；真正的批处理（continuous batching：每个step都有序列加入或离开batch）在EngineCore进程的Scheduler里
+# 为什么客户端断开要立刻abort：KV cache是推理服务最稀缺的资源，它决定了能同时跑多少条序列。
+#   例：一条序列已有4000个token的KV，max_tokens还剩6000；客户端走了却不abort，它会继续占着KV block和batch里的一个位置
+#   再decode 6000步——这期间等待中的请求因KV不够而进不来，TTFT被拉长。abort后调度器在下一个step结束它并释放block
 # ---- 图1：一个流式chat请求的完整路径 ----
 #   客户端  POST /v1/chat/completions  {"messages": [...], "stream": true}
 #     │  uvicorn解析HTTP → FastAPI用pydantic校验JSON → ChatCompletionRequest
@@ -841,6 +860,14 @@ async def _client_stream(
 #   stop_strings：停止字符串，preprocess里会把它们tokenize成stop_token_sequences
 #   SamplingParams.__post_init__会校验top_k / top_p，非法时抛ValueError → 接口返回400
 # 注意：请求里的seed、presence_penalty、frequency_penalty不会传进来（protocol.py里只是"为兼容而接受"）
+# 原理：采样参数的"默认值"有两种来源
+#   协议默认值：OpenAI规范里temperature=1、top_p=1，即直接按模型原始分布采样；protocol.py的DEFAULT_*就是这一组
+#   模型推荐值：模型作者写在generation_config.json里的值，例如Qwen3写的是temperature=0.6、top_p=0.95、top_k=20——
+#     这是作者在该模型上调出的最好设置（推理模型在temperature=1时更容易发散、重复）
+#   chat / completions接口在请求没传时用协议默认值（pydantic字段的默认值就是DEFAULT_*，到这里已分不清"没传"和"传了1.0"）；
+#   /v1/messages和/v1/responses则优先取模型推荐值。所以评测或压测chat接口时，最好显式传采样参数
+# logprobs：SamplingParams本身有logprobs字段（离线的LLMEngine.generate会返回每个token的logprob），但HTTP请求模型没有声明它
+#   （extra="ignore"直接丢弃），这里也不传，所以serving_chat / serving_completion的帧里"logprobs"恒为None
 def _build_sampling_params(
     temperature: float,
     max_tokens: int,
@@ -1136,6 +1163,8 @@ def _send_stream_chunk_tagged(
 # generate_async：非流式、n=1 的主路径（chat / completions / messages / responses 都会用到）
 # =====================================================================================
 # 形式上是异步生成器，但只在最后yield一次（完整结果dict）；调用方用_run_nonstream_with_disconnect驱动它
+# 原理：非流式请求在整个生成期间，客户端收不到任何字节（响应头也要等到最后），所以长生成容易撞上
+#   代理或SDK的读超时；而服务端这边也无从得知客户端是否还在——这就是下面_race_disconnect要单独监听断开事件的原因
 # 步骤：
 #   1. 建一个asyncio.Queue作为本请求的收件箱，定义在输出线程上运行的回调completion_callback
 #   2. 线程池里preprocess：tokenize + 构造Sequence（回调挂在Sequence上）
@@ -1658,6 +1687,11 @@ def _with_kv_transfer_params(response: dict, final_output: dict) -> dict:
 #   4. 长度校验；失败则撤销所有登记、把异常抛给handler（变成400）
 #   5. add_request交给引擎，返回(seq_id, collector, prompt长度)
 # 对比非流式的generate_async：那里每个回调直接call_soon_threadsafe一次，这里回调只缓冲、每step批量投递一次
+# 原理：为什么要"先把请求交给引擎、再返回StreamingResponse"
+#   StreamingResponse一开始迭代就会先发出 "200 + Content-Type: text/event-stream" 的响应头，之后状态码再也改不了。
+#   所以一切可能失败、应当返回4xx的检查（模板渲染、tokenize、长度校验）都必须在这之前完成——本函数被handler直接await，
+#   失败的异常才能在handler里变成400。流开始之后的错误只能放进流里告诉客户端（Anthropic路径的stream_failure_frames），
+#   或者直接断流：chat / completions的流式生成器只有try/finally没有except，异常会让响应在没有[DONE]的情况下被截断
 async def setup_streaming_request(
     prompt_or_tokens: str | list[int],
     sampling_params: SamplingParams,
@@ -2326,6 +2360,14 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         else:
             # 普通情况：在事件循环上直接渲染chat template，得到prompt字符串（Jinja路径固定tokenize=False、add_generation_prompt=True）；
             #   tokenize留到preprocess在线程池里做
+            # 原理：chat template为什么必须是模型自己的那一份。模型在SFT/RLHF阶段见过的每条对话都是用这个模板拼出来的：
+            #   角色标记（如<|im_start|>user）、system prompt放在哪、工具描述怎么写、回合结束符（如<|im_end|>）都是它"学会"的格式。
+            #   模板不匹配的典型后果：①模型认不出角色边界，把自己当user接着写；②模型输出的回合结束符不在stop_token_ids里，停不下来，
+            #   一直写到max_tokens；③system prompt或工具描述放错位置，指令遵循和工具调用质量明显下降
+            #   add_generation_prompt=True在末尾补上assistant回合的开头（如"<|im_start|>assistant\n"），告诉模型"轮到你说了"；
+            #   有的模板还会顺手预填思考段的开头（如"<think>\n"），所以下面要检查prompt是否已处在思考段内
+            # 注意：渲染结果里的特殊token是以文本形式出现的，preprocess里tokenizer.encode会把它们识别回特殊token id；
+            #   encode默认add_special_tokens=True，若模板文本本身已以BOS开头、tokenizer又自动加BOS，就会出现两个BOS
             prompt_or_tokens = apply_chat_template(
                 tokenizer,
                 custom_message_encoder,
@@ -2334,6 +2376,12 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 **merged_kwargs,
             )
 
+        # 原理：推理（thinking）模型的输出形如 "<think>\n先算……\n</think>\n\n答案是42"，服务端把它拆成两个字段：
+        #   reasoning_content="先算……"，content="答案是42"。为什么要拆：①UI通常折叠或不展示思考过程；
+        #   ②多轮对话里，不少模板渲染历史assistant消息时会丢掉旧回合的思考，客户端回传时需要能区分两者；
+        #   ③工具调用解析只应看content，否则模型在思考里"设想"的调用会被当成真调用（见anthropic_template_kwargs的docstring）
+        #   难点是"从哪开始"：模板若已在prompt末尾写了"<think>\n"，模型的第一个token就在思考段内，输出里不会再出现<think>，
+        #   只会在某处出现</think>——所以要先判断prompt是否已打开思考段（ReasoningChannel的starts_open）
         # The K3 template may open the reasoning channel in text or token IDs.
         # 【译】K3模板可能以文本或token ID的形式打开推理通道。
         # prompt是字符串时检查文本末尾；是token id时只解码末尾几个token再检查（reasoning.py）
@@ -2806,6 +2854,8 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
             max_ctx = 30720
         logger.warning(f"[anthropic] resolved max_ctx={max_ctx}")
         # 过长时截断：保留开头的max_input个token（截掉的是末尾），再解码回字符串
+        # 注意截掉的是末尾：也就是最新的消息和模板补上的assistant回合开头，模型看到的是一段没说完的对话；
+        #   另外截断点可能落在一条消息中间，解码后再在preprocess里重新tokenize，token数也不一定恰好等于max_input
         headroom = _prompt_headroom(request.max_tokens, max_ctx, kv_transfer_params)
         max_input = max_ctx - headroom
         if input_tokens > max_input:
@@ -3062,6 +3112,8 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         if drop_reasoning:
             events = [e for e in events if e[0] != "reasoning"]
         _, tool_calls = flatten_tool_events(events)
+        # 注意：这里的output_tokens是把解码后的文本重新tokenize得到的，不等于引擎实际生成的token数
+        #   （final_output["num_tokens_output"]）：skip_special_tokens去掉的EOS等特殊token不再计入，重新分词的切法也可能不同
         output_tokens = len(tokenizer.encode(raw_text))
         cache_read_input_tokens = final_output.get("num_cached_tokens", 0)
         response = build_anthropic_response(
@@ -3398,6 +3450,7 @@ async def responses_create(raw_request: Request):
             openai_tools,
             suppress_calls=forbids_tool_calls(request.tool_choice),
         )
+        # 与/v1/messages相同：重新tokenize得到的计数，不等于引擎实际生成的token数
         output_tokens = len(tokenizer.encode(raw_text))
         cache_read_input_tokens = final_output.get("num_cached_tokens", 0)
         response = build_responses_response(
