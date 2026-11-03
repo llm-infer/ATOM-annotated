@@ -65,6 +65,31 @@ logger = logging.getLogger("atom")
 # 对比nano-vllm：nano-vllm的config.py只有一个11个字段的Config，__post_init__只有5行；
 #   ATOM的Config有上百个字段和一组子配置，因为它要支持多进程DP、PP/DCP/PCP、投机解码、量化、
 #   PD分离、插件模式，以及几十种模型各自不统一的HF config
+#
+# 一个命令行参数的完整旅程（以 --kv_cache_dtype fp8 为例，每一跳都在代码里核实过）：
+#   命令行  --kv_cache_dtype fp8
+#      │  argparse（EngineArgs.add_cli_args注册，choices=["bf16", "fp8"]）
+#      ▼
+#   args.kv_cache_dtype = "fp8" ──EngineArgs.from_cli_args（按字段名挑）──> EngineArgs.kv_cache_dtype
+#      │  _get_engine_kwargs：同名透传（它不在改名/打包的名单里）
+#      ▼
+#   LLMEngine.__init__：只留Config里有的字段 ──Config(model, **config_kwargs)──> Config.kv_cache_dtype = "fp8"
+#      │  __post_init__第13步：index_cache_dtype为None且不是V4/V4.1 -> 跟随成"fp8"
+#      ▼
+#   CoreManager：launch_engine_core 写好本rank的 parallel_config.data_parallel_rank / control_address，
+#      │  再把 config 作为 multiprocessing.Process 的kwargs（spawn启动，config被pickle进子进程）
+#      ▼
+#   EngineCore（子进程，持有一份副本）──AsyncIOProcManager再spawn──> ModelRunner × TP（各自又是一份副本）
+#      │  ModelRunner.__init__：set_current_atom_config(config)
+#      ▼
+#   建模型：各模型把 atom_config.kv_cache_dtype 作为 cache_config 交给注意力层（如gpt_oss.py、glm4_moe.py）
+#   分配KV：注意力builder按 dtypes.d_dtypes[config.kv_cache_dtype] 建KV池，fp8时还把k_scale/v_scale
+#     绑到层上（aiter_attention.py；MLA的池在aiter_mla.py）
+#
+# 由此得到两条推论：
+#   (1) Config跨进程是"值传递"：子进程改自己的副本，前端进程看不到，反之亦然。
+#       所以num_kvcache_blocks这种运行期才算出来的值，要靠RPC显式回传给EngineCore（engine_core.py）
+#   (2) 能放进Config的东西必须可pickle：lambda、锁、打开的socket都不行
 
 
 # 【科普】KV cache 与分页（paged）KV —— 读本文件和第4、5批的前置知识
@@ -213,6 +238,34 @@ class KVCacheConfig:
 #   据代码，原生路径里没有对NONE的单独判断（第5批）
 # 命令行开放NONE、PIECEWISE、FULL、FULL_AND_PIECEWISE、AF_PIECEWISE五种，FULL_DECODE_ONLY来自vLLM，命令行不能选
 # 对比nano-vllm：nano-vllm没有模式选择，只有enforce_eager开关，开启时只捕获decode整图（相当于FULL）
+#
+# 适用场景（原生模式；命令行默认FULL；"实际行为"按ModelRunner._piecewise_cg_active/capture_cudagraph核实）：
+#   模式                实际行为（原生）                          什么时候选                             好处 / 代价
+#   NONE                与FULL相同：走手动整图捕获                几乎不用；想真正关图请用--enforce-eager    —（原生路径不认NONE；vLLM插件和
+#                       （ModelRunner不单独判断NONE）                                                     backends.py的copy_inputs分支才看它）
+#   FULL                decode按capture_sizes录整张forward图      默认；多数模型的标准选择；                 好处：CPU launch开销最低，一次回放
+#                       prefill/混合batch走eager                  DeepSeek-V4.1必须用它（Engram stream       代价：attention kernel必须可录制；
+#                                                                 fork/join要求整图），recipe里多数是FULL     超过最大capture size的batch退回eager
+#   PIECEWISE           按level 3切出的稠密片段各录各的图，        attention元数据形状多变、不宜整图录的场景， 好处：attention可以是任意eager实现
+#                       attention在片段之间eager运行；            如DSpark的ragged verify（recipes/DSpark.md  代价：每层attention仍有launch开销；
+#                       手动整图捕获关闭                          用它）；必须--level 3                     片段间张量要放进静态buffer
+#   FULL_AND_PIECEWISE  原生下等同PIECEWISE（只要含PIECEWISE就    与vLLM行为对齐时；原生下没有额外收益        同PIECEWISE
+#                       走逐片段路径，decode也不录整图）
+#   AF_PIECEWISE        PIECEWISE + 再单独录attention核心的图     DeepSeek-V4 + DSpark（.github/benchmark/    好处：attention也省掉launch开销
+#                       （_capture_attn_ffn_graphs）              models.json的V4-Pro-DSpark配置）           代价：多一组图的录制时间和显存
+#   不支持PIECEWISE类的模型会直接拒绝：例如qwen4_exp.py（Qwen3.8-Flash-Next）在非eager且requires_piecewise_compilation()时报错
+#
+# 选择流程：
+#   要调试/排查graph问题？ ── 是 ──> --enforce-eager（不录任何图，--level照常生效）
+#          │ 否
+#          ▼
+#   模型是DeepSeek-V4.1？ ── 是 ──> FULL（Config在cudagraph_mode为None时也会替它选FULL）
+#          │ 否
+#          ▼
+#   用DSpark（ragged verify）？ ── 是 ──> PIECEWISE；V4系列想再压launch开销 -> AF_PIECEWISE（都要--level 3）
+#          │ 否
+#          ▼
+#   FULL（默认）
 class CUDAGraphMode(enum.Enum):
     """Constants for the cudagraph mode in CompilationConfig.
     Meanwhile, the subset enum `NONE`, `PIECEWISE` and `FULL` are also
@@ -293,6 +346,16 @@ class CUDAGraphMode(enum.Enum):
 #                     Config.__post_init__只在这一级调用set_splitting_ops_for_v1和init_with_cudagraph_sizes
 # 注意：编译级别和CUDA Graph模式基本正交：FULL整图在任何--level下都能录制，
 #   但PIECEWISE类模式依赖--level 3的分段编译（见下面cudagraph_mode的docstring）
+#
+# 适用场景：
+#   --level  什么时候选                                   好处                                代价
+#   0        排查"是不是编译导致的"数值/崩溃问题；           启动最快，没有Dynamo追踪的限制          没有算子融合；PIECEWISE类cudagraph用不了
+#            小模型做功能验证（如recipes/Qwen3-8B-FP8.md）
+#   1        只想确认模型能被Dynamo完整抓图                 能暴露graph break                      backend="eager"不生成新kernel，几乎没有加速
+#   2        需要编译、但不需要分段（例如只用FULL整图）       Dynamo只追踪一次，之后不走guard检查      不切图，所以同样不能配PIECEWISE类模式
+#   3        生产默认                                       分段编译 + 允许任意cudagraph_mode        首次启动编译慢（之后读/root/.cache/atom/）；
+#                                                                                                    改代码后必须清缓存（CLAUDE.md）
+# 例：--level 0 --cudagraph-mode FULL 是合法组合：不编译，但decode仍录整图（FULL录图不依赖编译）
 class CompilationLevel:
     # constants for the levels of the compilation process
     # 【译】编译过程各级别的常量
@@ -626,6 +689,31 @@ class CompilationConfig:
 # 例：DeepSeek-R1 FP8 checkpoint + --online_quant_config '{"global_quant_config": "mxfp4", ...}'
 #   第3步按checkpoint表把专家建成FP8 blockscale参数，加载FP8权重；第4步按在线表把它们转成MXFP4，
 #   之后推理走MXFP4 MoE kernel
+#
+# 适用场景：常见量化格式一览（QuantType取值见quant_spec.py；"在线名"是--online_quant_config里能写的字符串，
+#   来自quant_spec.py的FORMAT_MAP；硬件结论来自docs/online_quantization_best_practices.md）
+#   格式             QuantType   在线名                          scale粒度                             权重显存(相对bf16)
+#   BF16（不量化）    No          —（写进exclude_layer的层）       无                                     1
+#   FP8 per-tensor   per_Tensor  —（只能来自checkpoint）          整个权重1个scale，激活也是整张量1个      约1/2
+#   FP8 per-token    per_Token   ptpc_fp8                        权重每输出通道1个，激活每token1个（动态） 约1/2
+#   FP8 blockscale   per_1x128   per_block_fp8/per_block128_fp8  权重每128x128块1个，激活每1x128块1个      约1/2（另加少量scale）
+#   MXFP8            per_1x32    mxfp8                           每32个元素共享1个E8M0 scale              约1/2
+#   MXFP4            per_1x32    mxfp4                           每32个元素共享1个E8M0 scale，两个值打包   约1/4（4bit + 每32个元素8bit scale）
+#                                                                成1字节（权重形状[N, K/2]）
+#
+#   格式             适用场景                                         好处                          代价
+#   BF16             lm_head、router gate、注意力等精度敏感层；基线    无精度损失                     显存/带宽最大
+#   FP8 per-tensor   checkpoint本来就是这种格式                       scale开销最小，GEMM最简单       一个离群值会拉大整张量的scale，FP8里精度最差
+#   FP8 per-token    在线量化的保守通用默认（ptpc_fp8）；MI300上       逐行scale抗离群值               激活scale每步动态计算，有少量开销
+#                    想省显存时的首选
+#   FP8 blockscale   DeepSeek-V3/R1这类官方FP8 checkpoint             粒度介于上两者之间，             scale存储与反量化更复杂；
+#                                                                    与DeepSeek发布格式一致           scale格式还分fp32/e8m0（blockscale_e8m0_scale）
+#   MXFP4            占参数大头的MoE路由专家                          显存、带宽最省，decode最快       精度风险最大；只有MI350/MI355（CDNA4）有原生
+#                                                                                                   MXFP4加速，MI300（CDNA3）上应改用ptpc_fp8
+#   NVFP4（checkpoint）NVIDIA的FP4 checkpoint                        —                              AITER不能直接算，必须在线转成MXFP4
+#                                                                                                   （见下面_validate_nvfp4_online_quant）
+#   FP8格式本身也随架构变化：MI300是e4m3fnuz，MI350是e4m3fn
+#   常见组合：MoE专家mxfp4 + 其余ptpc_fp8 + 排除lm_head/gate/共享专家（best_practices文档的逐步策略）
 class QuantizationConfig:
     """Model-wide quantization configuration.
 
@@ -1673,6 +1761,33 @@ def _normalize_minimax_m3_text_config(hf_config: PretrainedConfig) -> None:
 #     EngineCore / pp_engine_core.py 在子进程里按地址连接
 #   端口（master_ip / master_port / base_port）：master_port给DP之间的gloo组，
 #     base_port给ModelRunner的torch.distributed集合点（TCPStore）
+#
+# 适用场景：ATOM的几种并行方式对比（参数在arg_utils.py；限制条件均在代码里核实过）
+#   方式          参数                         总GPU数        切的是什么
+#   TP            -tp N（1..8）                N              每层权重（按列/按行/按注意力头）
+#   DP            -dp M                        M x tp         请求：M个EngineCore，各有调度器和一份完整模型
+#   DP-attention  --enable-dp-attention        dp x tp        注意力按请求切（CoreManager把dp改成dp x tp、tp改成1），
+#                                                             MoE仍在全部卡上协同
+#   EP            --enable-expert-parallel     不变           MoE专家整个分到各卡（跨dp x tp张卡）
+#   PP            -pp S                        S x tp         按层切成S段，每段一个EngineCore
+#   DCP           -dcp K（K整除tp）            不变（复用TP卡）一个请求的KV按token切到TP组内
+#   PCP           -pcp P                       tp x P         prefill时一条长序列按token切
+#
+#   方式          什么时候用                                          代价 / 限制
+#   TP            模型一张卡放不下；想降低单请求延迟                    每层1~2次all-reduce；Config断言tp<=8（单机内）
+#   DP            模型放得进tp张卡，追求总吞吐                          每份副本都要一整份权重显存；PP>1时不能再DP>1（CoreManager断言）
+#   DP-attention  MLA/KV头很少的MoE大模型高并发（DeepSeek、Kimi类）；    各DP rank每层MoE要锁步，路由不均时轻载rank空等；
+#                 TP下每卡重复存同一份latent KV，改DP后KV容量约x卡数      不能与PP>1、PCP>1同用（LLMEngine/CoreManager报错）
+#   EP            专家很多的MoE；通常与DP-attention一起开                每层dispatch+combine两次all-to-all；热点专家靠EPLB均衡
+#   PP            跨机部署，或TP的all-reduce太贵                         流水线气泡（可用动态分块缓解，见第9批）；不能与DP>1、DP-attention同用
+#   DCP           长上下文decode、KV显存紧张的MLA模型                    每层多一次通信（LSE合并）；投机解码+DCP只支持gfx950
+#   PCP           超长prompt想缩短TTFT                                  要多出P倍的卡；不支持DP-attention
+#
+# 例：8张卡跑DeepSeek类MoE，两种常见起法
+#   -tp 8                                          1个EngineCore、8个ModelRunner：权重最省，但8卡各存一份相同的latent KV
+#   -tp 8 --enable-dp-attention --enable-expert-parallel
+#                                                  CoreManager改写为dp=8、tp=1：8个EngineCore各管1张卡、各自调度请求；
+#                                                  按engine_core_mgr.py里的估算，整机KV容量约是前者的8倍
 @dataclass
 class ParallelConfig:
     # DP的总rank数（全集群），对应-dp
@@ -3234,6 +3349,15 @@ class Config:
     #   在子进程里，写不到EngineCore那份Config，所以要通过RPC把数字传回来
     num_kvcache_blocks: int = -1
     # KV cache的数据类型（bf16/fp8）
+    # 适用场景（命令行choices只有bf16、fp8；每token的KV字节数算法见arg_utils.py同名字段的【科普】）：
+    #   取值   每token KV（32层、8个kv头、head_dim 128）  什么时候选                         代价/限制
+    #   bf16   128KB                                    默认；精度最敏感的评测；              KV容量只有fp8的一半
+    #                                                   DeepSeek-V4.1 DSpark与Qwen QSA强制要求
+    #                                                   （deepseek_v41/config.py、qwen4_exp_attn.py会报错）
+    #   fp8    64KB                                     长上下文、高并发、显存紧张；CLAUDE.md   写入时量化、读出时乘scale，有轻微精度损失；
+    #                                                   和多数recipe的启动示例都用它            fp8格式随架构不同：MI300(gfx942)是e4m3fnuz、
+    #                                                                                         MI350(gfx950)是e4m3fn（mooncake_store/keys.py）
+    # 选fp8之后，index_cache_dtype不指定时也会跟着变成fp8（V4/V4.1另有默认值，见__post_init__第13步）
     kv_cache_dtype: str = "bf16"
     # 【分支】DSA索引器缓存的数据类型；None时__post_init__按模型决定默认值，见第7、8批
     index_cache_dtype: str | None = None
@@ -3494,6 +3618,44 @@ class Config:
         return list(sizes)
 
     def __post_init__(self):
+        # 流程图（编号与下面各段"第N步"标题一致；✗ = raise/assert，启动即终止；"降级"= 只打warning并关掉功能）：
+        #   ┌──────────────── 早期规范化与校验（还不需要HF config）────────────────┐
+        #   │ 1  moe_all2all_backend / moe_backend 小写化、查取值      ──非法──> ✗    │
+        #   │    rccl + TBO -> 降级关TBO；mega 但没开EP / mega + rccl  ─────────> ✗    │
+        #   │ 2  compilation_config / eplb_config / dcp_config：dict -> 对象          │
+        #   │ 3  强制接受率 + DSpark置信度调度 ─────────────────────────────> ✗      │
+        #   │    RapidServe：runner_qualname换成RapidServeModelRunner                │
+        #   │ 4  1 <= tp <= 8；dcp>1时 tp % dcp == 0、投机解码+DCP必须gfx950 ─否─> ✗  │
+        #   └──────────────────────────────────────────────────────────────────────────┘
+        #                                     ▼
+        #   ┌──────────────── 读模型自己的配置 ──────────────────────────────────────┐
+        #   │ 5  hf_config = get_hf_config(model) -> hf_overrides -> 各模型字段归一化   │
+        #   │ 6  generation_config -> stop_token_ids；quant_config = QuantizationConfig │
+        #   │ 7  max_model_len = min(用户值, max_position_embeddings)，None时取后者      │
+        #   │    long_prefill_token_threshold 不在 [block_size, max_model_len] ──> ✗    │
+        #   └──────────────────────────────────────────────────────────────────────────┘
+        #                                     ▼
+        #   8  (原生 或 vLLM插件) 且 level == 3 ?
+        #        是 -> splitting_ops = 4个注意力算子；cudagraph_mode为None时：V4.1 -> FULL，其他 -> PIECEWISE
+        #        否 -> 跳过（cudagraph_mode保持传进来的值）
+        #                                     ▼
+        #   9  torch_dtype = hf_config.dtype 或 bf16；kv_transfer_config字符串 -> dict；有KV传输时给cache几何拍快照
+        #                                     ▼
+        #   10 _resolve_dynamic_chunking()：条件不满足时校验报错或降级（见第9批）
+        #   11 有投机解码？ num_speculative_tokens > 上限 ──> ✗
+        #   12 V4 -> block_size = 256；GLM-5.3 -> 不支持的特性 ✗，index_kpool > 1时block_size由它算出
+        #   13 indexer_dcp_only门控（不满足 -> 降级）；index_cache_dtype默认值；
+        #      V4.1 -> block_size = 128 + validate_runtime_config；V4 -> state_replay_tokens
+        #
+        # 走一遍（数字是假设的）：Qwen3-8B，命令 -tp 2 --kv_cache_dtype fp8 --max-model-len 65536，
+        #   且config.json里max_position_embeddings = 40960
+        #   1~3 全部默认值，通过；4 tp=2 ∈ [1, 8]，dcp=1，跳过DCP检查
+        #   5 读到hf_config（model_type=qwen3）；6 没有quantization_config -> 量化表只有一条"不量化、bf16"
+        #   7 max_model_len = min(65536, 40960) = 40960（静默截断，不报错）
+        #   8 原生 + level 3 -> 设好splitting_ops；cudagraph_mode已是命令行给的FULL，不改
+        #   9 torch_dtype取hf_config.dtype（通常bf16）；kv_transfer_config是"{}"，解析成空dict，不拍快照
+        #   10~12 没开PP动态分块、没开投机解码、不是V4/GLM-5.3，全部跳过
+        #   13 index_cache_dtype为None且不是V4/V4.1 -> 等于kv_cache_dtype = "fp8"
         # ---------------- 第1步【分支】MoE后端字段的规范化与校验，见第7批 ----------------
         # 统一成小写、去空格；None/空字符串当作"auto"
         self.moe_all2all_backend = (

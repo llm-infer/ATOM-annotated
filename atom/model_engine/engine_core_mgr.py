@@ -75,6 +75,8 @@ from atom.utils import (
 #                                                                 │ 回复：每个worker一条ZMQ PUSH(connect) ─► PULL(bind)
 #                                                                 ├─ ModelRunner进程 TP0（GPU 2r）
 #                                                                 └─ ModelRunner进程 TP1（GPU 2r+1）
+#   更准确地说（见async_proc.py）：forward的主输出只有TP0发回（manager的process_output_sockets只收rank 0）；
+#     "每个worker各一条PUSH"的是KV聚合输出和集合RPC回复通道，用来区分"所有rank都完成"和"rank 0完成"
 #
 #   为什么请求和控制分两个socket：input_sockets只有add_request一个线程写，可以不加锁；控制消息会从多个线程发出，
 #     放在另一个socket上加锁串行化（详见_send_request的docstring）
@@ -111,6 +113,24 @@ from atom.utils import (
 #     例：每个rank每秒能完成约10个prefill，1秒内涌进100个请求、DP=2 -> 最后到的请求大约要排5秒才出第一个token。
 #   前端唯一的硬拒绝是api_server的_validate_pool_capacity：prompt比max_pool_tokens（所有rank中最小的KV池容量）还长，
 #     路由到哪都永远放不下，直接报错而不进队列。并发数限流、排队超时之类需要在API server之外（网关/客户端）做。
+#
+# ── 适用场景：单engine vs 普通DP vs DP-attention（CoreManager看到的engine数由此决定） ──
+#   ┌────────────────┬───────────────────────────┬──────────────────────────────────┬──────────────────────────────┐
+#   │ 形态           │ engine / 调度器            │ 适用场景                          │ 代价                          │
+#   ├────────────────┼───────────────────────────┼──────────────────────────────────┼──────────────────────────────┤
+#   │ 单engine       │ 1个EngineCore，管N张卡     │ 模型一组卡放得下、并发不高、       │ 一个调度器的CPU开销就是上限；  │
+#   │ -tp N          │ add_request不走路由        │ 延迟优先；dense模型的常规部署      │ 加卡只是让单请求更快           │
+#   ├────────────────┼───────────────────────────┼──────────────────────────────────┼──────────────────────────────┤
+#   │ 普通DP         │ M个EngineCore，各管N张卡   │ dense / GQA模型扩吞吐：M份完整     │ 权重占M份显存；各rank锁步      │
+#   │ -dp M -tp N    │ 各自独立的KV池和前缀缓存   │ 副本并行接请求                     │ （DPEngineCoreProc）；前缀缓存 │
+#   │                │                           │                                  │ 不跨rank，要靠路由/会话亲和     │
+#   ├────────────────┼───────────────────────────┼──────────────────────────────────┼──────────────────────────────┤
+#   │ DP-attention   │ M×N个EngineCore，各管1张卡 │ MLA + MoE大模型（DeepSeek-V3/R1、 │ 每层MoE all-to-all，锁步最紧， │
+#   │ -dp M -tp N    │ 注意力按DP，MoE按EP铺满    │ Kimi-K2）的高并发decode：latent KV │ 路由不均直接变空转；不能与PP、  │
+#   │ --enable-dp-   │ 全部M×N张卡                │ 不再在TP rank间重复（见__init__）  │ PCP同时开（见llm_engine.py）    │
+#   │ attention      │                           │                                  │                              │
+#   └────────────────┴───────────────────────────┴──────────────────────────────────┴──────────────────────────────┘
+#   路由器只在engine数>1时工作；三种负载均衡策略的选择见_select_dp_rank_locked上方的速查表
 logger = logging.getLogger("atom")
 # 权重同步最后那条FINISH命令的等待上限（秒），见_broadcast_and_wait末尾；【分支】RL权重热更新，见第10批
 _WEIGHT_SYNC_FINISH_TIMEOUT_S = 30.0
@@ -1174,6 +1194,9 @@ class CoreManager:
                                     f"{self.label}: flush_stream_batch failed: {e}",
                                     exc_info=True,
                                 )
+                        # 观察：在线服务（api_server）不调用get_output，按grep atom/entrypoints里也没有别处读outputs_queue；
+                        #   于是在线模式下每一批已结束的Sequence都会留在这个无界队列里、直到进程退出。上面STREAM分支的英文注释
+                        #   描述过同类问题（stream_outputs_queue没人读、对象一直可达、拖慢GC），这里是否需要同样处理有待确认
                         # 交给get_output()（离线generate的主循环在那里阻塞等待）；put_nowait：不阻塞地放入（Queue没有上限，不会满）
                         self.outputs_queue.put_nowait(seqs)
             finally:
@@ -1385,6 +1408,36 @@ class CoreManager:
                 [self.control_identities[dp_rank], payload], copy=copy
             )
 
+    # DP路由决策流程图（add_request → 每个seq落到哪个engine；方框内全程持_lb_lock）：
+    #   core_mgr.add_request(seqs)
+    #     │ 摘回调：seq.stream_callback → _seq_id_to_callback[seq.id]
+    #     ▼
+    #   pp_size > 1？ ──── 是 ──► 整批发engine 0（PP head），不记负载
+    #     │ 否
+    #   可路由engine数 == 1？ ── 是 ──► 整批发rank 0，不记负载
+    #     │ 否
+    #     ▼ _dispatch_to_dp_ranks
+    #   ① _resolve_and_validate_hints：先校验整批的data_parallel_rank提示（越界 → ValueError，此时什么都没记账）
+    #     ▼
+    #   ┌─ ② 逐个seq：_select_dp_rank_for_seq_locked ───────────────────────────────────────────────┐
+    #   │ 有显式提示？ ── 是 ──► 用提示的rank（亲和开且带session_id时，顺便改写会话拥有者） [explicit]  │
+    #   │   │ 否                                                                                      │
+    #   │ 亲和关，或没有session_id？ ── 是 ──► _select_dp_rank_locked（按--dp-load-balance） [load_balanced]│
+    #   │   │ 否                                   ├ round_robin：   cursor % n                       │
+    #   │   │                                      ├ least_requests：min (reqs, tokens)，字典序         │
+    #   │   │                                      └ least_tokens：  min tokens + req_equiv × reqs      │
+    #   │ 会话已有拥有者？ ── 是 ──► 拥有者rank，不看负载                                [affinity_owner_hit]│
+    #   │   │ 否（新会话）                                                                            │
+    #   │   └──► _select_new_session_rank_locked：min tokens + req_equiv × reqs，                     │
+    #   │        平局取blake2b(session_id + rank)最大者；记为拥有者                       [affinity_new]  │
+    #   │ track_load（策略不是RR，或开了亲和）？ → _charge_seq_load_locked：reqs+1，tokens+prompt（增量）│
+    #   └─────────────────────────────────────────────────────────────────────────────────────────────┘
+    #     ▼ 解锁
+    #   ③ 按rank分组，每个非空rank一个ADD帧（_add_frame）→ _send_request
+    #   ④ 中途发送失败 → 回滚"还没发出"那些rank的负载，再抛出
+    #   之后（输出线程）：首个STREAM输出 → _mark_seq_prefill_complete（tokens部分清零）
+    #                     结束 / abort → _release_seq_load（全部扣回，幂等）
+    #   方括号里是_dp_route_counters的键（去掉_total后缀），由get_dp_router_statistics导出到/metrics
     # 接收一批Sequence并发往EngineCore（离线：LLMEngine.add_request；在线：api_server直接调用）
     #   1. 把流式回调从Sequence上摘下来存进_seq_id_to_callback（回调是闭包，无法pickle，也只有主进程用得上）
     #   2. 选目标engine：PP -> 只发给stage 0（PP head）；只有1个可路由的engine -> 发给它；否则 -> DP负载均衡
@@ -1612,6 +1665,22 @@ class CoreManager:
         #     rank1有20个已进入decode的短请求（prefill债已释放）。least_requests选rank0（1<20），新请求排到32k prefill后面；
         #     least_tokens：rank0 = 32768+512 = 33280，rank1 = 0+20×512 = 10240 -> 选rank1。代价是各rank的decode batch可能不均。
         #   这与DeepSeek-V3推理系统的经验一致：prefill按输入token数均衡，decode按请求数均衡（见docs/distributed_guide.md）
+        # 策略速查（--dp-load-balance；会话亲和是另一个正交开关ATOM_DP_SESSION_AFFINITY=1，叠加在所选策略之上）：
+        #   ┌────────────────┬────────────────────────┬────────────────────────────────────┬─────────────────────────────┐
+        #   │ 策略            │ 比较什么                │ 适用场景                            │ 代价                         │
+        #   ├────────────────┼────────────────────────┼────────────────────────────────────┼─────────────────────────────┤
+        #   │ round_robin    │ 不看负载，cursor % n    │ 短而均匀的chat（prompt几百token、     │ 长短混合时长prompt可能扎堆    │
+        #   │                │                        │ 输出长度相近）；要求分配可复现的基准   │ 在同一rank                   │
+        #   │ least_requests │ (在途请求数,            │ 长短混合的通用在线流量（默认）：先让   │ 少量超长prompt排队时，请求数  │
+        #   │ （默认）        │  排队prefill token)     │ 各rank decode batch等大，token只打平局 │ 少的rank反而最忙              │
+        #   │ least_tokens   │ tokens + 512 × reqs     │ RAG / 长文档总结：prompt 8k~32k、     │ 各rank decode batch可能不等； │
+        #   │                │ （512=ATOM_DP_LB_REQ_   │ 输出短，prefill才是主要负载            │ 512折合多少要按典型输出长度调 │
+        #   │                │  EQUIV默认值）          │                                    │                             │
+        #   │ + 会话亲和      │ 新会话按负载放置，      │ 多轮对话 / agent：每轮在上一轮prompt   │ 热门长会话会让某个rank持续偏重；│
+        #   │                │ 之后严格粘住            │ 后追加，留在原rank命中累积的前缀        │ 需要客户端带会话header         │
+        #   └────────────────┴────────────────────────┴────────────────────────────────────┴─────────────────────────────┘
+        #   会话header：x-dynamo-session-id（没有则用x-correlation-id），由api_server读取后写进seq.dp_session_id；
+        #     不带header的请求照常按所选策略均衡
         n = self._routable_engine_count
         if self._dp_lb_strategy == "round_robin":
             dp_rank = self._rank_rotation_cursor % n
@@ -1991,6 +2060,27 @@ class CoreManager:
                 dp_rank, pickle.dumps((EngineCoreRequestType.UTILITY, {"cmd": cmd}))
             )
 
+    # abort 完整链路（DP=2，seq 7在rank 1上，客户端在它decode到一半时断开）：
+    #   api_server（事件循环）        CoreManager（本进程）                    EngineCore rank 0 / rank 1
+    #   检测到断开 → abort_request(7)
+    #                                 _release_seq_load(7)：立即扣回负载
+    #                                 broadcast_utility_command：只pickle一次
+    #                                   ── control ROUTER（加锁）×2 ──────────► 两边输入线程：utility_queue.put
+    #                                                                           busy_loop下一轮开头process_queue
+    #                                                                           → _handle_abort_request
+    #                                                                           → scheduler.abort_request(7)
+    #                                                                           rank 0：waiting/running里都没有 → False
+    #                                                                           rank 1：
+    #                                                                            ├ 在waiting：立即移出，leave_reason="aborted"
+    #                                                                            │   → _rejected → 下一步take_rejected → ADD帧
+    #                                                                            └ 在running：只标ABORTED；下一次postprocess
+    #                                                                                _mark_finished("aborted") → 释放block → ADD帧
+    #                                                                                （这条路径不产生STREAM chunk）
+    #                                 输出线程收到ADD[seq 7]：
+    #                                   _deliver_terminal_output：回调若还在 → 合成finished RequestOutput("aborted")
+    #                                   _release_seq_load(7)：已经扣过，空操作
+    #   abort_request属于FIRE_AND_FORGET_UTILITY_CMDS：EngineCore不回复，调用方也不等
+    #   时间上：running中的请求通常在处理完abort之后的那次postprocess里释放block（已下发的forward会照常跑完，不会被打断）
     # 客户端断开时取消一个请求：先释放本地的DP负载记账，再向所有DP rank广播"abort_request"工具命令
     #   调用方：api_server（检测到客户端断开时）、atomesh服务
     #   EngineCore侧：输入线程放进utility_queue -> busy_loop里utility_handler调用scheduler.abort_request（第3批）

@@ -70,6 +70,47 @@ logger = logging.getLogger("atom")
 #     与nano-vllm相同，一批要么全是prefill、要么全是decode（不混合；有可调度的prefill时通常先做prefill）；
 #     decode批里每条序列这一步只长1个token（开投机解码时可以一次接受多个）
 #   本文件的step() = 从outputs_queue取一项"已结束的序列列表"，与GPU的步调无关：EngineCore可能已经跑了几百步才回来一项
+#
+# ── 进程 / 线程 / socket 归属（单机 -dp 1 -tp 2；排查"卡住了"时先对照它看是哪一段在等） ──
+#   上面的生命周期图按"一条请求怎么走"画，这里按"谁持有什么、谁阻塞在哪"画；
+#   bind/connect方向的细节见engine_core_mgr.py文件开头的拓扑图（CoreManager一侧全部bind，EngineCore一侧全部connect）
+#
+#   ┌─ 用户进程（本文件 + CoreManager）─────────────────────────────────────────────────┐
+#   │ 主线程：generate() → add_request → CoreManager._send_request ─► ROUTER(input)      │
+#   │         step() → core_mgr.get_output() = outputs_queue.get()   ◄ 阻塞在这里        │
+#   │   （在线时没有generate：preprocess在线程池里跑，add_request在api_server事件循环线程） │
+#   │ 输出线程 EngineCoreOutputThread-DP0：poll PULL(output)                             │
+#   │   STREAM → 流式回调（离线没有回调）；ADD → outputs_queue.put                        │
+#   │ 控制：ROUTER(control)，abort / 工具RPC / SHUTDOWN 从这里发（_control_send_lock串行） │
+#   └──────────────────────────────────────────────────────────────────────────────────┘
+#                   ║ ADD帧 / 控制帧（DEALER收）          ▲ STREAM / ADD / READY / METRICS（PUSH发）
+#   ┌─ EngineCore进程 EngineCore-DP0 ────────────────────────────────────────────────────┐
+#   │ 输入线程：poll两个DEALER(input/control) → input_queue / utility_queue              │
+#   │ 主线程busy_loop：utility → 取input_queue → schedule → forward → postprocess          │
+#   │   → output_queue：先("STREAM", …)，再已结束的list[Sequence]（顺序有意义，见engine_core.py）│
+#   │   没有请求时不阻塞，一直空转轮询（名副其实的busy loop）                               │
+#   │ 输出线程：output_queue.get → PUSH(output)                                          │
+#   │ AsyncIOProcManager：写共享内存广播队列MessageQueue；PULL收TP0的主输出               │
+#   └──────────────────────────────────────────────────────────────────────────────────┘
+#                   ║ 共享内存MessageQueue（下发，所有worker读同一份）   ▲ ZMQ PUSH（主输出只有TP0发）
+#   ┌─ ModelRunner进程 TP0 ──────────┐       ┌─ ModelRunner进程 TP1 ──────────┐
+#   │ 读MessageQueue → forward → 采样 │ ◄═══► │ 读MessageQueue → forward        │  RCCL all-reduce
+#   └────────────────────────────────┘       └────────────────────────────────┘
+#   （KV聚合输出和集合RPC回复另有"每个worker一条"的PUSH通道，见async_proc.py）
+#
+# ── 适用场景 ──
+#   离线 generate(prompts, sp)：批量评测、数据合成、离线打分
+#     好处：一次交出全部prompt，调度器从第一步就看到完整的waiting队列，batch最满、吞吐最高；结果按提交顺序返回
+#     代价：要等最慢的那条结束才整体返回；没有流式；不能单独取消某一条（本类没有abort接口）
+#   在线 openai_server：请求陆续到达，需要流式、断开即取消、多客户端并发
+#     api_server不走generate/step/postprocess：每个请求单独preprocess(_fanout) + core_mgr.add_request，
+#     token经流式回调逐step推回；客户端断开调core_mgr.abort_request
+#   n>1（parallel sampling）：best-of-n、self-consistency投票、RL rollout里同一prompt采多条
+#     好处：只tokenize一次、stop序列和prompt hash链共享，比"同一prompt提交n次"省前端CPU
+#     代价：n条序列各自占KV和batch槽位（prompt部分能否复用取决于前缀缓存）；DP>1时兄弟可能分到不同rank
+#   stop strings：对话模板里的"\n\nUser:"、代码补全里的"\n```"之类
+#     好处：预先分词，EngineCore判停只比较token_ids末尾的几个整数，热循环里零detokenize
+#     代价：token级匹配可能漏停（见preprocess_fanout第4步）；要求严格文本截断时，前端还得对text再截一次
 
 
 # 加载HF tokenizer；若"编码后再解码"不能还原探测字符串，就退回PreTrainedTokenizerFast
@@ -315,6 +356,29 @@ class LLMEngine:
         if hasattr(self, "core_mgr"):
             self.core_mgr.close()
 
+    # add_request 流程图（离线；括号里是出错时的行为）：
+    #   prompts, sampling_params, stream_callback, multimodal_data_list, request_ids
+    #     │ 每个参数：单个/None → itertools.repeat 广播；列表 → 长度必须等于len(prompts)（否则ValueError，此时还没建任何seq）
+    #     ▼
+    #   for 每个prompt：io_processor.preprocess_fanout(...)
+    #     ├─ hf_config.validate_request？（只有定义了它的模型才校验）
+    #     ├─ 是str？ ── 是 → tokenizer.encode ；否 → 直接当token id列表
+    #     ├─ 带多模态数据？ ── 是 → 预算M-RoPE位置
+    #     ├─ stop_strings → 逐个encode(add_special_tokens=False) → stop_token_sequences
+    #     ├─ for i in range(n)：Sequence(...)（n>1时needs_independent_noise=True），记arrive_time，登记io_processor.requests
+    #     └─ 开了前缀缓存？ ── 是 → 只为第0个兄弟算prompt hash链，其余兄弟共享同一条
+    #     │ reqs.extend(这n个seq)
+    #     ▼
+    #   core_mgr.add_request(reqs)：整批一次调用
+    #     ├─ 摘下每个seq的stream_callback（闭包不能pickle）
+    #     ├─ PP>1 → 整批发给stage 0；只有1个engine → 整批发给rank 0
+    #     └─ 否则 _dispatch_to_dp_ranks：逐seq选rank、按rank分组，每个rank一个ADD帧（路由流程图见engine_core_mgr.py）
+    # 例：prompts=["你好", [1, 2, 3]]，SamplingParams(n=2, stop_strings=["\n\n"])
+    #   → 第1个prompt被encode，第2个原样使用；各扇出2个兄弟 → reqs=[seq0, seq1, seq2, seq3]（seq0、seq1来自"你好"的同一份tokenize结果）
+    #   → DP=1：一个ADD帧 (ADD, [seq0..seq3]) 发给rank 0
+    # 观察：如果第k个prompt在preprocess_fanout里抛异常（例如validate_request拒绝），前k个prompt的seq已经登记进
+    #   io_processor.requests，却还没交给CoreManager（core_mgr.add_request在循环之后才调用）；
+    #   异常照常抛给调用方，但这些登记不会被清掉，同一个引擎上之后的generate会因has_pending_requests()一直为True而等不到结束
     # 提交一批prompt（离线路径；在线路径直接调用io_processor + core_mgr.add_request，不经过这里）
     # 输入：
     #   prompt_or_tokens_list  文本或token id列表组成的列表
@@ -456,6 +520,35 @@ class LLMEngine:
     def is_finished(self):
         return not self.io_processor.has_pending_requests()
 
+    # generate() 时序图：两个prompt走一遍（DP=1、TP=2、无投机解码；忽略延迟输出带来的"晚一步"，步数只是示意）
+    #   P0：12个token，max_tokens=4；P1：30个token，max_tokens=8；进程里的第一批请求，所以seq id为0、1
+    #
+    #   主线程（本进程）            CoreManager输出线程          EngineCore busy_loop（另一进程）
+    #   reset_dp_router()
+    #   add_request
+    #    ├ preprocess_fanout×2：seq0、seq1，记arrive_time
+    #    └ _send_request(0, ADD[seq0, seq1]) ══════════════════► 输入线程 → input_queue
+    #   step() 阻塞在outputs_queue.get()                         step 1  prefill 42个token（两条一起）
+    #    ┊                                                               各采样1个token，记first_token_time
+    #    ┊                         ◄══ STREAM[(0,..),(1,..)] ════        postprocess → STREAM
+    #    ┊                         离线无回调；DP=1不记负载，            step 2~4 decode，batch=2，每步各+1 token
+    #    ┊                         _mark_seq_prefill_complete直接返回     step 4：seq0满4个token → leave_reason="max_tokens"
+    #    ┊                         ◄══ STREAM(seq0 finished) ════        先STREAM ……
+    #    ┊                         ◄══ ADD[seq0] ════════════════        …… 再已结束列表
+    #    ┊                         outputs_queue.put([seq0])
+    #   step()返回[seq0]                                          step 5~8 decode，batch=1
+    #   postprocess：decode 4个token，算TTFT/TPOT；
+    #     requests里还剩seq1 → 继续循环                            step 8：seq1满8个token
+    #   step() 阻塞 …………………………          ◄══ ADD[seq1] ════════════════
+    #   step()返回[seq1] → postprocess → requests为空 → 退出while
+    #   按seq id排序 → [outputs[0], outputs[1]]，与prompts顺序一致
+    #
+    #   墙钟时间线（假设prefill一步约40ms、decode一步约10ms）：
+    #     t=0      add_request（tokenize在这之前，不计入TTFT）
+    #     t≈40ms   step 1结束：两条的first_token_time ≈ arrive_time + 40ms → TTFT ≈ 0.04s
+    #     t≈70ms   step 4结束：seq0结束 → TPOT ≈ (70 - 40) / (4 - 1) = 10ms
+    #     t≈110ms  step 8结束：seq1结束 → TPOT ≈ (110 - 40) / (8 - 1) = 10ms，generate返回
+    #   要点：step()的次数（这里2次）只取决于"结束事件"有几批，与GPU走了几步（这里8步）无关
     # 离线批量生成：提交全部prompt，循环取结果直到所有请求结束
     # 输入：prompts（文本或token id列表）、sampling_params（单个或等长列表）、request_ids（可选）
     # 输出：扁平列表，每项是postprocess产生的dict（text、token_ids、latency、ttft、tpot等）

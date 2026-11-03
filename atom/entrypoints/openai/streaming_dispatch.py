@@ -147,6 +147,22 @@ _DELTA_REUSE = _DeltaReuse()
 # 例：某个字被切成两个字节级token a、b
 #   update([a])：prefix_text=""，new_text="�" → 不完整，返回""，窗口不动
 #   update([b])：prefix_text=""，new_text="字" → 返回"字"；窗口前移：prefix_offset=0（旧read_offset），read_offset=2
+# 完整的状态演示：输出"你😀!"，😀（U+1F600）的UTF-8是4个字节 F0 9F 98 80，假设字节级BPE把它切成两个token：
+#   T0="你"（E4 BD A0，一个token）  T1=字节F0 9F  T2=字节98 80  T3="!"；每次update一个token（复用关闭时的两次decode）
+#   调用            tokens          prefix_text=decode(              new_text=decode(          返回     之后的(prefix, read)
+#                                   tokens[prefix:read])             tokens[prefix:])
+#   ─────────────   ─────────────   ──────────────────────────────   ───────────────────────   ──────   ───────────────────
+#   初始            []                                                                                   (0, 0)
+#   update([T0])    [T0]            decode([])        = ""           decode([T0])     = "你"   "你"     (0, 1)
+#   update([T1])    [T0,T1]         decode([T0])      = "你"         decode([T0,T1])  = "你�"  ""       (0, 1) 以�结尾，扣住
+#   update([T2])    [T0,T1,T2]      decode([T0])      = "你"         decode([T0..T2]) = "你😀" "😀"     (1, 3)
+#   update([T3],    [T0..T3]        decode([T1,T2])   = "😀"         decode([T1..T3]) = "😀!"  "!"      (3, 4)
+#     finished=True)
+#   要点：
+#   ① 窗口[prefix_offset:]最多只覆盖"上一段已输出 + 本次新增"，所以每步的decode开销与总输出长度无关
+#   ② delta按Python字符串长度切（码点数）：len("😀")=1，与它占几个字节、几个token无关
+#   ③ 第2行若消费者落后，T1、T2会在collector里先合并（merge_chunk），一次update([T1, T2])直接得到"😀"，中间那次扣住根本不会发生
+#   ④ 增量复用开启时，prefix_text直接取last_delta（第3、4行分别是"你"、"😀"，正好等于真实decode的结果），省掉第一次decode
 @dataclass
 class IncrementalStreamDetokenizer:
     """Decode token deltas without emitting incomplete UTF-8 characters."""
@@ -506,6 +522,18 @@ def merge_chunk(into: dict, new: dict) -> None:
 #   按消费者的节奏发生，而不是按引擎产出token的节奏。例：引擎每10ms一个step，事件循环忙了50ms才轮到这个流 →
 #   这期间5个step的chunk已合并成一个，get()只解码一次、只发一帧（含5个step的全部文本）。
 #   代价是该流这一帧的ITL变成50ms；好处是事件循环越忙，每token的平均开销越低，不会因为积压越来越多帧而雪崩
+# 时间线（引擎每10ms一个step；"put"是_deliver里的put_nowait，"get"是SSE生成器的await collector.get()）：
+#   引擎step      输出线程                     事件循环上的collector._pending          SSE生成器
+#   ──────────    ──────────────────────────   ─────────────────────────────────────   ──────────────────────────────
+#   t=10 step1    enqueue → flush → _deliver   put {ids:[a]}           → {None: [a]}   get取走[a] → decode → 1帧
+#   t=20 step2    同上                         put {ids:[b]}           → {None: [b]}   （事件循环在忙别的流，没轮到）
+#   t=30 step3    同上                         put {ids:[c]} 合并      → {None: [b,c]} （仍在忙）
+#   t=40 step4    同上                         put {ids:[d]} 合并      → {None: [b,c,d]}
+#   t=50/60 5,6   同上                         合并e、f                → {None: [b..f]}
+#   t=62                                                                               get取走[b..f] → 一次update → 1帧
+#   对比不合并的做法：t=62时队列里有5个chunk，要做5次反分词、5次JSON编码、5次socket写；
+#     而这5次工作本身又会推迟别的流，越积越多。合并后无论落后多少步，一个流每次被调度只付一次固定开销
+#   finished也会被合并进去（merge_chunk：finished取或，finish_reason等"后来者覆盖"），所以结束不会丢
 # asyncio.Event（第一次出现）：协程间的信号量，set()唤醒所有wait()的协程，clear()复位
 class StreamOutputCollector:
     """Per-request delivery point that merges chunks when the consumer lags.

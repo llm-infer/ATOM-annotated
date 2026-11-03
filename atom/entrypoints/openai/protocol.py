@@ -304,6 +304,35 @@ class ChatMessage(BaseModel):
         return d
 
 
+# ---- 请求参数速查：默认值 / 去向 / 适用场景（chat与completions共有的字段两者含义相同）----
+#   参数                    默认      去向                                  适用场景 / 注意
+#   ──────────────────────  ────────  ────────────────────────────────────  ──────────────────────────────────────────────
+#   temperature             1.0       SamplingParams.temperature            0 → 贪心（采样器把≤SAMPLER_EPS的行改成argmax）：
+#                                                                           评测、需要可复现的回归测试；0.6~0.8：对话；
+#                                                                           1.0：按原始分布，推理模型更易发散
+#   top_p                   1.0       SamplingParams.top_p                  核采样，取值(0, 1]，越界 → 400；0.9~0.95砍掉长尾怪词
+#   top_k                   -1        SamplingParams.top_k                  -1不限制，否则≥1；常与top_p同用（如Qwen3推荐20）
+#   max_tokens /            8192      SamplingParams.max_tokens             输出上限，<1 → 400；也参与长度校验
+#     max_completion_tokens （后者优先）                                    （prompt + max_tokens ≤ max_model_len），长prompt要调小
+#   stop                    None      SamplingParams.stop_strings           token级匹配、命中的stop留在输出里（见下面字段注释）；
+#                                                                           few-shot评测用它在"Question:"处截断
+#   ignore_eos              False     SamplingParams.ignore_eos             压测：每个请求都正好生成max_tokens个token
+#   n                       1         _coerce_n → 扇出n个兄弟Sequence        一次要多个候选（best-of / pass@k）；temperature≤0时
+#                                                                           折叠为1；共享prompt的前缀缓存，但KV和decode是n份
+#   stream                  False     流式 / 非流式两条路径                  见serving_chat.py文件头的"适用场景"
+#   seed、presence_penalty、 —        不使用（接受后丢弃）                   需要这些语义的客户端不会得到预期效果
+#     frequency_penalty
+#   tools / tool_choice     None      chat template参数 + 工具解析器         function calling；tool_choice="none"时解析出的调用不发出
+#   response_format         None      只作为chat template参数                不是约束解码：模型仍可能输出不合法的JSON
+#   reasoning_effort /      None      resolve_thinking → 模板开关            控制思考模型是否思考、思考多深
+#     thinking
+#   prompt_token_ids        None      跳过模板渲染与tokenize                 客户端/路由器已经tokenize过（PD分离、RL rollout）
+#   return_token_ids        None      非流式响应里回显prompt的token id       与stream=true同时给 → 400
+#   kv_transfer_params      None      PD分离元数据                          prefill/decode分离部署（第9批）
+#   data_parallel_rank      None      CoreManager路由                       atomesh指定由哪个DP rank处理（前缀缓存亲和）
+#   例：GSM8K评测（lm_eval local-completions，走/v1/completions）常见的组合是
+#     {"prompt": "<few-shot>Question: …\nAnswer:", "temperature": 0, "max_tokens": 256, "stop": ["Question:"]}
+#     → 贪心、输出可复现；命中stop后finish_reason="stop"，返回的text末尾会带着"Question:"（与OpenAI不同，评测侧会再截一次）
 # /v1/chat/completions的请求体。FastAPI据此解析校验JSON，api_server.chat_completions使用其中的字段
 class ChatCompletionRequest(BaseModel):
     """Request model for chat completions (OpenAI-compatible)."""

@@ -253,20 +253,53 @@ class Replay(NamedTuple):
 
 # 序列的生命周期状态
 # auto()：自动给枚举成员分配值（1、2、3...），只关心名字不关心值时使用
-# 状态流转图（主干是中间一行，其余为分支）：
+# 状态流转图（已逐条对照scheduler.py / engine_core.py里所有给seq.status赋值的地方核对）：
 #
-#                       add_request
-#                ┌───────────┴────────────┐
-#   PD分离decode端│                        │普通请求
-#                ▼                        ▼
-#   WAITING_FOR_REMOTE_KVS ──KV到达──> WAITING ──被调度做prefill──> RUNNING ──EOS/max_tokens/stop──> FINISHED
-#                                       ▲                            │
-#                                       └────── 被抢占(preempt) ─────┘
+#                           preprocess创建Sequence（任何请求都从WAITING出发）
+#                                         │
+#                                         ▼
+#   ┌──────────────────┐   ①    ┌───────────────┐   ③    ┌──────────────┐   ⑤    ┌──────────┐
+#   │ WAITING_FOR_     │<───────│    WAITING    │───────>│   RUNNING    │───────>│ FINISHED │
+#   │   REMOTE_KVS     │───────>│               │<───────│ ↺ mid chunk  │        └──────────┘
+#   └──────────────────┘   ②    └───────────────┘   ④    │ ↺ decode     │          ▲     ▲
+#      ▲          │                │         │          └──────────────┘          │     │
+#      │          │                │         └──────────────── ⑨ ────────┼────────┘     │
+#      │          ⑧                ⑦                         │      │    │              │
+#      │          │                ▼                         │      ⑦    │              │
+#      │          └──────────> ┌─────────┐ <─────────────────┼──────┘    │              │
+#      │                       │ ABORTED │ ──────────────────┼─────── ⑩ ─┼──────────────┘
+#      │                       └─────────┘                   │           │
+#      └──────────────────────── ⑥ ──────────────────────────┘           │
+#                                            （⑨从WAITING直达FINISHED） ──┘
+#
+#   编号  转移                         触发点（函数）与含义
+#   ①   WAITING -> WAITING_FOR_       准入时（can_allocate/allocate之后）connector报告要从外部加载：PD分离decode端
+#         REMOTE_KVS                  等prefill节点推KV，或KV offload从LMCache等取回KV/状态。Scheduler._park_for_remote_load，
+#                                     放进skipped队列，之后每步再检查一次。注意：新请求并不是一创建就处于这个状态
+#   ②   WAITING_FOR_REMOTE_KVS ->     加载完成（_resolve_waiting_remote_kv），或offload加载失败（_consume_failed_remote_kv，
+#         WAITING                     退回本地重算）。offload之后按普通prefill算剩余后缀；PD decode端则在同一次调度里
+#                                     由_schedule_first_decode_after_remote_kv直接改成RUNNING做首个decode（is_first_decode=True，
+#                                     本地不做prefill）
+#   ③   WAITING -> RUNNING            第一次被调度做prefill（Scheduler._schedule_prefill_seq，type=PREFILL），进running队列。
+#                                     之后一直是RUNNING：中间chunk（is_partial_prefill=True）和每个decode步都不改状态
+#   ④   RUNNING -> WAITING            Scheduler.preempt：KV block不够，删占位token、deallocate、放回waiting队首
+#   ⑤   RUNNING -> FINISHED           Scheduler._mark_finished（postprocess里命中eos/stop/max_tokens）；
+#                                     另外PD分离的prefill节点（engine_core.py）prefill算完后直接置FINISHED，不产出token
+#   ⑥   RUNNING -> WAITING_FOR_       仅KV offload：running里的半途prefill要等一段外部加载时被挂起
+#         REMOTE_KVS                  （Scheduler._park_ready_offload_partial_prefills，同时清掉is_partial_prefill）
+#   ⑦   WAITING/RUNNING -> ABORTED    客户端断开：EngineCore收到abort -> Scheduler.abort_request
+#   ⑧   WAITING_FOR_REMOTE_KVS ->     PD decode端接收KV失败（_abort_failed_remote_receive）：decode节点不会自己补做prefill
+#         ABORTED
+#   ⑨   WAITING -> FINISHED           准入时判定无法调度（如prompt超过max_model_len），leave_reason="unschedulable: ..."；
+#                                     从没运行过，CoreManager._deliver_terminal_output给客户端补发一个finished的RequestOutput
+#   ⑩   ABORTED -> FINISHED           在waiting里的：立即由_reject_aborted_waiting结束（abort_request内或下次调度开头）；
+#                                     在running里的：下一次postprocess用_mark_finished(seq, "aborted")，按正常路径释放block
+#   EXIT_ENGINE不是请求的状态，不在图里，见get_exit_sequence
 #
 # 对比nano-vllm：nano-vllm要等prefill全部算完才变成RUNNING；
 #   ATOM在第一次被调度做prefill时就变成RUNNING并进入running队列，
 #   chunked prefill没算完的序列留在running里（is_partial_prefill=True），下一步由调度器的Phase 1继续
-# 客户端断开：WAITING/RUNNING -> ABORTED，调度器在下一步按正常结束路径释放资源 -> FINISHED
+# 客户端断开：WAITING/RUNNING -> ABORTED，调度器在下一步按正常结束路径释放资源 -> FINISHED（见上表⑦⑩）
 #
 # 科普：抢占（preemption）
 #   KV block不够用时（例如很多序列同时decode、每条都要再领一个新block），调度器会把某条RUNNING序列
@@ -464,6 +497,33 @@ class OffloadJointRecord:
 #   链式保证"内容相同且前面所有内容也相同"才会命中（同样的4个token出现在不同上下文里hash不同）。
 #   BlockManager维护hash -> 物理block的索引，新请求准入时从头逐块查，命中多少块就跳过多少块的计算
 #   （实现：block_manager.py的compute_hash / hash_blocks / can_allocate，hash函数在prefix_hash.py）
+#
+# 字段演化总表：把上面几个例子合成一条请求的完整时间线（已按Scheduler.postprocess、BlockManager.hash_blocks /
+#   hash_decode_blocks / may_append / deallocate的代码逐行推算）
+#   设定：block_size=4，prompt 10个token（位置0~9），前缀缓存未命中，每步prefill最多6个token，不开延迟输出
+#   "真实token数" = num_tokens - num_placeholder_tokens（开MTP或延迟输出时token_ids末尾还挂着占位，这里不计）
+#
+#   步骤                    │ status   │partial│真实token数│cached│hashed│ block_table │本步新增token│ 说明
+#   ────────────────────────┼──────────┼───────┼──────────┼──────┼──────┼─────────────┼────────────┼─────────────────────────────
+#   0 创建（preprocess）     │ WAITING  │   F   │    10    │   0  │   0  │ []          │     -      │
+#   1 调度：prefill chunk 1  │ RUNNING  │   F   │    10    │   0  │   0  │ [5,9,2]     │     -      │准入按整个prompt分配3块；本步算位置0~5
+#   1 postprocess           │ RUNNING  │   T   │    10    │   6  │   4  │ [5,9,2]     │  0（丢弃） │只有填满的block 0登记hash
+#   2 调度：prefill chunk 2  │ RUNNING  │   T   │    10    │   6  │   4  │ [5,9,2]     │     -      │Phase 1优先续算半途prefill，位置6~9
+#   2 postprocess           │ RUNNING  │   F   │    11    │  10  │   8  │ [5,9,2]     │  1（t0）   │block 1登记；采样出第1个生成token
+#   3 decode（算位置10）     │ RUNNING  │   F   │    12    │  10  │   8  │ [5,9,2]     │     1      │decode不再累加cached
+#   4 decode（算位置11）     │ RUNNING  │   F   │    13    │  10  │  12  │ [5,9,2]     │     1      │block 2的KV写满 -> hash_decode_blocks登记
+#   5a decode（算位置12）    │ RUNNING  │   F   │    14    │  10  │  12  │ [5,9,2,7]   │     1      │调度时may_append补第4块
+#   5b 换成MTP k=3，接受2个  │ RUNNING  │   F   │    16    │  10  │  12  │ [5,9,2,7]*  │ 3（a,b,d） │验证位置12~15；num_bonus_tokens=2，num_rejected=1
+#   6 结束（eos/stop/max）   │ FINISHED │   F   │   不变   │   0  │   0  │ []          │     -      │_mark_finished -> deallocate
+#   6' 被抢占               │ WAITING  │   F   │   不变   │   0  │   0  │ []          │     -      │preempt：删占位、deallocate、回队首
+#
+#   读表要点：
+#   - cached（num_cached_tokens）只在prefill时增长，决定"下次prefill从哪算起"；decode位置由num_tokens推出
+#   - hashed（num_hashed_tokens）总是block_size的整数倍，只登记"KV已算好"的满block：第4步算完位置11才登记block 2，
+#     第5b步位置15的KV是被拒绝草稿c的，所以block 3不登记
+#   - 5b与5a是同一时刻的两种走法；*开MTP时token_ids还带k个占位，may_append按含占位的长度和draft_lookahead
+#     提前补块，补块的时机会比5a早
+#   - 6'之后重新准入：把10+已生成的token整体当prompt重算，前面登记过hash的block若还没被复用就能命中
 class Sequence:
     # 类变量，所有实例共享：全局自增器，为每条序列分配唯一id
     counter = count()
@@ -600,6 +660,8 @@ class Sequence:
         # 用途：调度器用num_tokens - num_cached_tokens算"还有多少token要prefill"，并据此切chunk
         # 归零的地方：BlockManager.deallocate（结束/抢占），以及若干放弃已认领前缀的路径
         # 注意它不是"前缀缓存命中数"：命中数单独记在prefix_cache_hit_tokens里（见下方）
+        # 补充（核对scheduler.py）：decode步不累加它，只有prefill chunk（postprocess / PP的_advance_prefill_on_schedule）
+        #   以及准入、加载路径会写它，所以prefill结束后它就停在prompt长度上，见类开头的字段演化总表
         self.num_cached_tokens = 0
         # The prefill forward scheduled last, where it backed off below the
         # point it resumed at (`BlockManager.replay_start`); None when it did
@@ -796,6 +858,10 @@ class Sequence:
         # 最多生成多少个token，达到后结束
         self.max_tokens = sampling_params.max_tokens
         # 是否忽略EOS继续生成
+        # 核对Scheduler.postprocess：它只跳过eos_token_id和stop_token_ids两种检查；
+        #   stop_strings（stop_token_sequences）照样生效，max_tokens也照样生效
+        # 适用场景：压测/profile（如examples/profile_offline.py），让每条请求恰好生成max_tokens个token，吞吐数字可比
+        # 代价：模型说完了还在硬生成，输出内容没有意义，不要用在正式服务上
         self.ignore_eos = sampling_params.ignore_eos
         self.stop_strings = sampling_params.stop_strings
         # Same type as `token_ids`, because the stop check compares a slice of
@@ -894,6 +960,10 @@ class Sequence:
         # sequences with identical logits would emit identical tokens.
         # 【译】SamplingParams.n > 1 时的扇出记录。为True时，采样器必须为这条序列生成新的、逐行独立的随机噪声，
         #   而不是复用缓存的共享指数分布张量，否则logits相同的兄弟序列会输出相同的token。
+        # 解释：LLMEngine.preprocess_fanout对n>1的每个兄弟都传needs_independent_noise=(n > 1)；
+        #   只有不做top-k/top-p过滤的采样路径会读它（Sampler._temperature_sample），过滤路径本来就逐行抽随机数
+        # n>1的适用场景：best-of-n / 多样本投票（如数学题多采几条取多数）、RL rollout一个prompt要多条回答
+        # 好处：prompt只分词一次，n条兄弟序列共享prompt；代价：显存和算力约为n倍，温度为0时n条结果完全相同，没有意义
         self.needs_independent_noise = needs_independent_noise
         # Parent request id (user-facing id from the API layer) and this
         # sequence's index within the fan-out group [0, n). Both default
@@ -1025,6 +1095,27 @@ class Sequence:
         self.output_tokens.append(token_id)
         self.num_tokens += 1
 
+    # 一条Sequence在前端进程与EngineCore进程之间的往返（核对engine_core_mgr.py / engine_core.py / llm_engine.py）：
+    #
+    #   前端进程（LLMEngine / api_server，CoreManager）              EngineCore进程（调度器所在）
+    #   ─────────────────────────────────────────────            ───────────────────────────────
+    #   preprocess创建seq，存进io_processor.requests
+    #   CoreManager.add_request：
+    #     seq.stream_callback ──摘下──> _seq_id_to_callback[id]
+    #     seq.stream_callback = None    （闭包不能pickle，也只有前端用得上）
+    #   _add_frame：pickle((ADD, [seq..], [chain..]))
+    #     · seq本体走__getstate__：__dict__全部字段，
+    #       但prompt_hash_chain置None
+    #     · chain由take_shipped_chains单独取出作第3个元素
+    #                                 ──────── ZMQ ────────>  输入线程反序列化出一份副本，attach_shipped_chains把链装回
+    #                                                         调度器/BlockManager只读写这份副本：status、block_table、
+    #                                                         各计数、first_token_time……前端原对象从此不再变化
+    #   输出线程：按seq_id查_seq_id_to_callback  <──── ZMQ ──  每步postprocess：(STREAM, [(seq_id, RequestOutput)..])
+    #     调用回调(RequestOutput)；finished=True时删掉回调     （只有增量token等少量字段，见request.py）
+    #                                          <──── ZMQ ──  结束后：(ADD, [已结束的seq..])，整条seq再pickle回来一次
+    #   _deliver_terminal_output：回调还在的（从没运行就被拒）补发终止RequestOutput
+    #   离线：LLMEngine.postprocess用这份回传的seq算TTFT/TPOT、decode completion_token_ids
+    #
     # 自定义pickle序列化：Sequence在LLMEngine -> CoreManager -> EngineCore之间通过ZMQ传递时会被pickle
     # 对比nano-vllm：nano-vllm只序列化前向需要的几个字段（发给其他TP rank）；
     #   ATOM的Sequence要交给另一个进程里的调度器完整管理，所以序列化全部字段（__dict__）

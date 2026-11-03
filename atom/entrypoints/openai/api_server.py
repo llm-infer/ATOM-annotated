@@ -34,6 +34,25 @@ Usage:
 #   GET  /v1/models、/health、/metrics、/server_info、/kv_transfer_info
 #   GET  /debug/mtp_stats、/debug/cache_stats、/debug/gc_census；POST /start_profile、/stop_profile
 #
+# 各接口的适用场景（背后是同一个引擎、同一套SamplingParams，区别在线上格式、服务端做多少翻译、采样参数的默认值）：
+#   接口                    典型调用方                    适用场景 / 注意
+#   ──────────────────────  ────────────────────────────  ──────────────────────────────────────────────────────────
+#   /v1/chat/completions    OpenAI SDK、聊天前端、Agent    对话/指令模型的默认选择：服务端套chat template，拆出reasoning_content、
+#                                                         tool_calls；未传的采样参数用协议默认值（temperature=1.0）
+#   /v1/completions         lm_eval的local-completions     裸prompt续写：base模型、客户端已自己拼好模板、或直接给token id
+#                           （GSM8K评测）、PD路由、压测    （prompt传数组或prompt_token_ids）；不做推理内容/工具调用拆分
+#   /v1/messages            Claude Code等Anthropic客户端    同一模型按Anthropic格式对外（content块、stop_reason、事件流）；
+#                                                         未传的采样参数优先取generation_config的推荐值
+#   /v1/responses           Codex CLI                      OpenAI Responses格式（含Codex专有工具）；未给max_output_tokens时
+#                                                         用serving_responses.DEFAULT_MAX_OUTPUT_TOKENS（4096）
+#   /v1/models              客户端探测                     只返回一个ModelCard（id=model_name）
+#   /health                 负载均衡、容器探针              只说明事件循环活着，不代表GPU上的模型正常（见/health前的注释）
+#   /metrics                Prometheus                     周期刷新的缓存指标文本，抓取本身不访问引擎
+#   /server_info            atomesh路由器                  DP宽度等元数据，用于按DP rank展开worker、做缓存感知路由
+#   /kv_transfer_info       PD分离部署                     PD角色与握手端口
+#   /debug/*、/start_profile、/stop_profile  开发者        投机解码/前缀缓存统计、GC普查、开关profiler
+#   注意：没有vLLM / SGLang那种原生的 /generate 接口；想直接喂token id，用 /v1/completions 的 prompt_token_ids
+#
 # 文件结构（自上而下）：
 #   全局状态（main()启动时填好）→ 推理内容 / Anthropic的辅助函数 → 请求日志、_client_stream
 #   → 引擎接口：SamplingParams构造、长度校验、流式chunk投递、generate_async*、setup_streaming_request*、
@@ -139,6 +158,64 @@ Usage:
 #     会争抢GIL；而且消费者落后时，多个未读chunk先合并再反分词，只解码一次
 #   非流式请求（generate_async）不经过dispatcher：每次回调直接
 #     loop.call_soon_threadsafe(token_queue.put_nowait, {...})，handler里 await token_queue.get() 一直收集到结束
+#
+# ---- 图3：一个流式chat请求的具体时间线（数字为示意，取一台空闲服务器上8B级模型的典型量级）----
+#   请求：POST /v1/chat/completions
+#     {"model": "Qwen/Qwen3-8B", "messages": [{"role": "user", "content": "用一句话介绍北京"}],
+#      "stream": true, "max_tokens": 64, "chat_template_kwargs": {"enable_thinking": false}}
+#   时间      在哪里                         发生了什么
+#   ───────   ─────────────────────────────  ──────────────────────────────────────────────────────────────────
+#   t=0ms     事件循环（chat_completions）   pydantic校验 → 合并模板参数 → SamplingParams(max_tokens=64) → 渲染prompt
+#   t≈1ms     线程池（do_preprocess）        tokenize：假设渲染后的prompt是18个token → Sequence(num_prompt_tokens=18)
+#             事件循环                       add_request经ZMQ发给EngineCore；返回StreamingResponse，先发出
+#                                            "HTTP/1.1 200" + "content-type: text/event-stream"（此时还没有任何帧）
+#   t≈2~30ms  EngineCore / ModelRunner       Scheduler在下一个step接纳它，prefill 18个token，采样出第1个token
+#   t≈30ms    输出线程 → 事件循环            STREAM消息 → 回调 → enqueue → flush → _deliver → collector.put_nowait
+#             stream_chat_response           get()反分词得到"北京" → 先yield role帧，再yield content帧：
+#               data: {"id":"chatcmpl-…","object":"chat.completion.chunk",…,"choices":[{"index":0,
+#                      "delta":{"role":"assistant","content":""},"finish_reason":null,"logprobs":null}]}
+#               data: {…"choices":[{"index":0,"delta":{"content":"北京"},"finish_reason":null,…}]}
+#             _client_stream                 第一帧带生成内容 → timing.first_output：TTFT ≈ 30ms（含排队 + prefill）
+#   t≈50ms    同上，下一个decode step        data: {…"delta":{"content":"是"}…}         ITL ≈ 20ms（≈一个decode step）
+#   …         每≈20ms一帧                    中国的首都，…（事件循环忙时几个step会合并成一帧，见streaming_dispatch.py）
+#   t≈470ms   最后一个step                   第23个token是EOS → chunk带finished=True、finish_reason="eos"
+#             stream_chat_response           一次发送里拼好三帧：
+#               data: {…"choices":[{"index":0,"delta":{},"finish_reason":"stop",…}]}      ← "eos"翻译成"stop"
+#               data: {…"choices":[],"usage":{"prompt_tokens":18,"completion_tokens":23,"total_tokens":41,
+#                      "prompt_tokens_details":{"cached_tokens":0}}}
+#               data: [DONE]
+#             finally                        cleanup_stream(seq_id, aborted=False)（不发abort）→ cleanup_request
+#   总时延 ≈ TTFT + (23 - 1) × ITL ≈ 30 + 22 × 20 ≈ 470ms；客户端从30ms起就开始逐段显示
+#   completion_tokens是各chunk的token_ids长度之和（engine计数，与"显示出来的字数"无关）；
+#   同一段对话第二轮再发，前缀缓存命中整块的部分会体现在cached_tokens里
+#
+# ---- 图4：客户端断开 → abort（流式与非流式两条路，最后汇合到同一个abort_request）----
+#                              客户端关闭连接（Ctrl+C、超时、浏览器关页）
+#                                        │ uvicorn向应用投递ASGI消息 {"type": "http.disconnect"}
+#                  ┌─────────────────────┴──────────────────────┐
+#          流式：StreamingResponse                      非流式：handler还在await结果
+#                  │                                            │
+#   Starlette监听到断开，取消迭代生成器的任务         _race_disconnect：disconnect_task先完成
+#                  │                                            │ handler_task.cancel()
+#   stream_chat_response停在哪里？                              ▼
+#     await collector.get() → CancelledError          generate_async里 await token_queue.get()
+#     某个yield上 → 之后被aclose → GeneratorExit        → CancelledError
+#                  │                                            │
+#   finally：aborted仍为True（finished chunk没到）     finally：_finished_ok为False
+#     → cleanup_stream(seq_id, aborted=True)             → core_mgr.abort_request(seq.id)
+#         ├ core_mgr.abort_request(seq_id)               → io_processor.requests.pop(seq.id)
+#         └ io_processor.requests.pop(seq_id)          _race_disconnect抛_ClientDisconnected
+#     → cleanup_request(request_id)                    → 接口返回499（客户端已经收不到）
+#                  └─────────────────────┬──────────────────────┘
+#                                        ▼
+#   CoreManager.abort_request：先_release_seq_load（DP负载记账），再broadcast_utility_command("abort_request")给每个DP rank
+#                                        ▼  ZMQ控制通道（发出即不管）
+#   各EngineCore → Scheduler.abort_request(seq_id)：
+#     在waiting里 → 移出队列、status=ABORTED、_reject_aborted_waiting
+#     在running里 → status=ABORTED，下一个step按正常停止路径结束它，释放KV block
+#     都找不到（已经结束、或不在本rank）→ 返回False，什么也不做
+#   好处：被放弃的请求最多再多跑一个step就让出KV和batch位置；代价：每次断开要向每个DP rank各发一条控制消息
+#     （所以正常结束时aborted=False，不发这条注定无效的广播）
 #
 # 对比nano-vllm：nano-vllm没有服务层，LLM.generate在同一个线程里循环step直到全部完成；
 #   ATOM的服务层要解决的是"引擎在别的进程/线程里异步产出token，而HTTP这边有几千个连接同时在等"——
@@ -3693,6 +3770,19 @@ async def stop_profile():
 #   8. 把flush_stream_batch挂到CoreManager的输出线程上
 #   9. 注册SIGINT处理；uvicorn.run(app, ...)启动事件循环（阻塞到服务关闭，lifespan在其中执行）
 # 对比nano-vllm：nano-vllm的入口只有 LLM(path) + llm.generate(...)，没有第5、7、8、9步
+# 启动与关闭的时序（uvicorn 0.54的行为：运行期间uvicorn用自己的处理器接管SIGINT/SIGTERM，结束后恢复原处理器并重新触发信号）：
+#   main()                                           uvicorn.run(app)
+#   ──────────────────────────────────────────────   ──────────────────────────────────────────────────────────
+#   解析参数、加载tokenizer、探测模板                  建事件循环（uvloop），绑定--host:--server-port
+#   create_engine（几十秒到几分钟：权重、KV、Graph）   lifespan前半：tune_gc → 刷新一次指标 → freeze_gc_heap
+#   StreamBatchDispatcher、enable_delta_reuse            → 起_periodic后台任务 → yield
+#   挂flush钩子、注册_sigint_handler      ───────────▶  开始接收请求（在此之前请求连不上端口）
+#                                                       … 服务中 …
+#                                                     Ctrl+C：uvicorn停止接收新连接、等在途请求结束
+#                                                     lifespan的finally：取消后台任务 → engine.close()
+#   uvicorn.run返回后，被捕获的SIGINT重新触发    ◀───  恢复原信号处理器，raise_signal(SIGINT)
+#   → _sigint_handler：再次engine.close()，最多等子进程2秒，仍活着的kill → SystemExit(0)
+#   好处：先排空在途请求再关引擎；代价：有长请求在跑时Ctrl+C要等一会儿（再按一次Ctrl+C，uvicorn会强制退出）
 def main():
     """Main entry point for the server."""
     # 【译】服务器的主入口。

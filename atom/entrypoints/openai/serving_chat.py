@@ -24,6 +24,9 @@
 #   2. 模型决定调用时，输出模板约定格式的文本，例如Hermes / Qwen风格：
 #        <tool_call>{"name": "get_weather", "arguments": {"city": "北京"}}</tool_call>
 #      格式由模型训练时的模板决定，服务端必须用对应的解析器（启动时从模板推断，见tool_parser/registry.py）
+#   解释：上面这行JSON写法是Hermes格式，ATOM并没有注册Hermes解析器——tool_parser/下只有qwen3（XML：<function=NAME>
+#     <parameter=P>…）、kimi、kimi_k3、glm、deepseekv4 / deepseekv41（DSML）、minimax这几种；模板是Hermes JSON格式时，
+#     --tool-call-parser auto识别不出格式，工具调用会作为普通文本交付（见下面"例"里的真实XML格式）
 #   3. 服务端把这段文本解析成结构化的tool_calls，不再作为content返回，finish_reason为tool_calls
 #   4. 客户端执行工具，把结果作为role="tool"的消息（带tool_call_id）发回，下一轮由模板再渲染进prompt
 #   服务端从不执行工具，它只负责"文本 ↔ 结构"的双向翻译（回传的历史调用见protocol._normalize_tool_call_arguments）
@@ -33,6 +36,59 @@
 #   {"delta": {"tool_calls": [{"index": 0, "function": {"arguments": "{\"city\": \"北京\"}"}}]}}
 #   {"delta": {}, "finish_reason": "tool_calls"}
 # 对比nano-vllm：nano-vllm没有这一层
+#
+# ---- 一个chat请求从messages到帧的完整流程（api_server.chat_completions负责前半，本文件负责后半）----
+#   messages + tools + tool_choice + response_format + thinking / reasoning_effort
+#     │ normalize_chat_tools（Anthropic形状的工具 → OpenAI形状）→ validate_chat_request（形状不对 → 400）
+#     │ resolve_thinking → (enabled, effort)，与--default-chat-template-kwargs、chat_template_kwargs合并
+#     ▼
+#   apply_chat_template（chat_encoders.py）→ prompt字符串（请求自带prompt_token_ids时跳过这一步）
+#     │ reasoning_channel(...)：这条回复是否"从思考段里面开始"（模板已经替模型写好了<think>）
+#     ▼
+#   preprocess（线程池）：tokenize → token ids → Sequence → add_request → EngineCore逐step生成
+#     ▼
+#   ┌──────────── stream=true ────────────┐        ┌──────────── stream=false ───────────┐
+#   │ stream_chat_response：每个chunk       │        │ generate_async收齐全部token           │
+#   │  collector.get() → 增量文本           │        │  → delivered_text：一次decode全文      │
+#   │  → reasoning_filter.process(片段)     │        │  → _build_chat_choice：                │
+#   │  → tool_parser.process(content片段)   │        │     reasoning.split(全文)              │
+#   │  → 逐帧yield；finished时flush两者     │        │     → parse_tool_calls(content部分)    │
+#   │  → 结束帧 + usage帧 + [DONE]          │        │  → ChatCompletionResponse（一个JSON）  │
+#   └──────────────────────────────────────┘        └───────────────────────────────────────┘
+#   两边用的是同一套方言（ReasoningChannel）和同一个工具格式解析器，只是一个逐块喂、一个整段喂
+#
+# ---- 例：一次完整的工具调用往返（Qwen3-Coder类模型，XML格式，解析器见tool_parser/qwen3_tool_parser.py；非流式；数字为示意）----
+#   第1轮请求：
+#     {"messages": [{"role": "user", "content": "北京今天天气怎么样？"}],
+#      "tools": [{"type": "function", "function": {"name": "get_weather",
+#                 "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}]}
+#   → 模板把tools的JSON Schema写进system段，prompt约300个token
+#   → 模型的原始输出（约20个token）：
+#       <tool_call>\n<function=get_weather>\n<parameter=city>北京</parameter>\n</function>\n</tool_call>
+#     XML不带类型，参数值按请求tools里的schema转换（city是string → "北京"），再json.dumps成arguments字符串
+#   → 引擎以EOS结束（finish_reason="eos"）；_build_chat_choice：reasoning.split → 无思考段；
+#     parse_tool_calls → 去掉工具区域后content=""，tool_calls=[1个]；openai_stop_reason_with_calls("eos", True) → "tool_calls"
+#   第1轮响应：
+#     {"choices": [{"index": 0, "finish_reason": "tool_calls",
+#                   "message": {"role": "assistant", "content": "",
+#                               "tool_calls": [{"id": "call_3f2a…", "type": "function",
+#                                               "function": {"name": "get_weather", "arguments": "{\"city\": \"北京\"}"}}]}}],
+#      "usage": {"prompt_tokens": 300, "completion_tokens": 20, …}}
+#   客户端自己执行get_weather，第2轮把历史和结果一起发回：
+#     messages = [user"北京今天天气怎么样？",
+#                 {"role": "assistant", "content": "", "tool_calls": [上面那个调用]},   ← arguments是JSON字符串
+#                 {"role": "tool", "tool_call_id": "call_3f2a…", "content": "{\"temp\": 18, \"sky\": \"晴\"}"}]
+#   → ChatMessage.to_template_dict把arguments反序列化回dict（protocol._normalize_tool_call_arguments），模板才能渲染
+#   → 模型这次输出普通文本"北京今天晴，18℃。"，finish_reason="stop"
+#   要点：服务端全程不执行工具；被max_tokens截断在工具区域中间时报"length"而不是"tool_calls"（protocol.openai_stop_reason_with_calls）
+#
+# ---- 适用场景：stream与非stream ----
+#   stream=true：聊天界面、Agent逐步显示；用户感知的是TTFT而不是总时延。代价：每帧一次JSON编码 + 一次socket写，
+#     高并发时事件循环是瓶颈（所以有逐step攒批投递和消费者端合并，见streaming_dispatch.py）；不支持return_token_ids
+#   stream=false：评测、批处理、只关心最终结果的后端调用。好处：一次decode、一次JSON；usage里额外有ttft_s / tpot_s / latency_s；
+#     可以要求return_token_ids回显prompt的token id。代价：客户端要等到最后一个token才拿到任何东西
+#   include_usage：OpenAI用stream_options.include_usage控制流式是否带usage帧；ATOM不读这个字段（请求模型里没有声明，被丢弃），
+#     流式总是发usage帧（choices为空），只取choices[0]而不判空的客户端要注意
 import logging
 import time
 from collections.abc import AsyncGenerator
