@@ -216,7 +216,7 @@ if TYPE_CHECKING:
 #     集合通信要求每个rank以同样次数调用，所以只要有一个rank有活，所有rank每步都要一起forward：没活的rank跑一个1个token的
 #     dummy batch陪跑；一步的耗时由最慢的rank决定（某个rank做8k token的prefill时，别的rank在集合通信处等它几百ms）
 #   【前置⑧】PD分离与KV offload（完整讲解：arg_utils.py kv_transfer_config字段上方的【科普】PD分离、arg_utils.py文件开头的
-#     【科普】KV offload；sequence.py SequenceStatus类内的科普）
+#     【科普】KV offload；sequence.py SequenceStatus类上方、状态图之前的"科普：PD分离 / 科普：KV offload"）
 #     PD分离：prefill节点（producer）算完prompt的KV和第1个token T0，经RDMA传到decode节点（consumer）事先分配好的block里，
 #     decode节点不做prefill、从T0开始decode。KV offload：还是同一组GPU，给前缀缓存加一层更大更慢的存储（CPU内存 / LMCache /
 #     Mooncake Store）：算好的KV另存一份，HBM里已被淘汰的前缀以后可以加载回来、免去重算。两者都由KV connector在后台异步搬运，
@@ -2578,7 +2578,7 @@ class Scheduler:
         self.waiting.extend(seqs)
 
     # ==================== 【分支】connector的延迟释放（deferred free），第9批 kv_transfer/ ====================
-    # PD分离、KV offload是什么：见文件开头【前置⑧】（完整讲解：sequence.py SequenceStatus类内的"科普：PD分离 / KV offload"，
+    # PD分离、KV offload是什么：见文件开头【前置⑧】（完整讲解：sequence.py SequenceStatus类上方、状态图之前的"科普：PD分离 / 科普：KV offload"，
     #   以及arg_utils.py开头的"【科普】KV offload"和kv_transfer_config字段上方的"【科普】PD分离"）
     # 为什么请求结束了，它的block却不能马上释放：
     #   没有connector：postprocess发现请求结束 → BlockManager.deallocate → block回到空闲队列，下一个请求马上能拿去写自己的KV
@@ -4567,7 +4567,7 @@ class Scheduler:
         #     - False：继续走普通的prefill准入。
         # ======== 【分支】PD分离 / KV offload：等外部把KV（或状态）搬进请求已分配好的block，见第9批 kv_transfer/ ========
         # 从这里到_schedule_first_decode_after_remote_kv，是Phase 2里"挂起-唤醒"一族的辅助函数
-        #   （状态转移见sequence.py SequenceStatus上方状态图的①②⑧；PD分离、KV offload的概念见SequenceStatus类里的两段科普）
+        #   （状态转移见sequence.py SequenceStatus上方状态图的①②⑧；PD分离、KV offload的概念见SequenceStatus类上方、状态图之前的两段科普）
         # 调用方：_schedule Phase 2，从waiting队头取出seq、过了ABORTED / unschedulable / max_num_seqs检查之后（每个waiting序列都经过这里）
         # 外部传输的结果由上一步的_update_from_kv_xfer_finished整理进两个列表：
         #   finished_recving_kv_req_ids：PD接收完成（finished_recving）或offload加载完成（finished_loading）

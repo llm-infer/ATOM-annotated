@@ -20,7 +20,7 @@ from atom.sampling_params import SamplingParams
 # 另一个区别：nano-vllm的rank 0会把Sequence传给其他TP rank；ATOM里Sequence只在
 #   LLMEngine -> CoreManager -> EngineCore（调度器）之间传递，ModelRunner拿到的是调度器打包好的ScheduledBatch
 #
-# 阅读路线（本文件约1200行，按出现顺序分6部分）：
+# 阅读路线（本文件约1300行，按出现顺序分6部分）：
 #   ① new_token_ids / BlockTable（含"科普：KV cache分块"）：token id、block id为什么用array("i")而不是list，block table的版本号
 #   ② Replay（含"科普：状态checkpoint与有界重放"）：【分支】带每请求状态的模型怎样从前缀缓存接上，第4、8批
 #   ③ SequenceStatus / SequenceType / get_exit_sequence：生命周期状态机①~⑩（图之前先讲PD分离、KV offload，图之后讲抢占）
@@ -253,7 +253,8 @@ def new_block_table(block_ids=()) -> BlockTable:
 #          ≈ 一层全注意力里512个token的KV（每token 2(K,V) × 2个kv头 × 256维 = 1024个数）；上下文1千还是100万，S都这么大
 #          （公式推导见model_config/qwen3_next.py科普②；状态槽位怎么分配见下方Sequence.__init__里has_per_req_cache处的科普）
 #        - DeepSeek-V4：每层的滑动窗口（只看最近W个token的KV，默认W=128，环形缓冲区）+ 压缩器还没凑满一组的token
-#          （压缩器把每compress_ratio个连续token的KV合并成1行，见atom/models/deepseek_v4.py的Compressor）
+#          （压缩器把每compress_ratio个连续token的KV合并成1行，V4的compress_ratio是4或128，见atom/models/deepseek_v4.py的
+#           Compressor；从MHA讲起的图解见config.py __post_init__里V4部分的【科普】DeepSeek-V4的压缩注意力（CSA / HCA））
 #      状态被原地覆盖：算到位置N时"位置N处的状态"只存在一瞬间。想让以后的请求从N接上，就得当时另存一份快照，
 #      这就是状态checkpoint。快照很占地方，所以只在少数位置存（BlockManager.checkpointers_at）：
 #        - 阶梯：每 Config.state_checkpoint_interval_tokens（默认8192）个token一级
