@@ -5443,14 +5443,26 @@ class Scheduler:
                 # propagate into seq.num_rejected / seq.num_bonus_tokens, then
                 # into seq.num_tokens via `preempt()`'s `-= mtp_k + num_rejected`,
                 # contaminating downstream logs and arithmetic with np.int32.
+                # 【译】int() 转换去掉了从 fwd_output 的 np.ndarray 索引出来的 np.int32 包装。没有它们，这些值会传播进
+                #   seq.num_rejected / seq.num_bonus_tokens，再经由 preempt() 的 `-= mtp_k + num_rejected` 进入 seq.num_tokens，
+                #   用np.int32污染下游的日志和算术。
+                # 解释：英文里提到的preempt()写法已经过时——现在preempt按num_placeholder_tokens删占位（见preempt里的说明）
                 num_rejected = int(fwd_output.num_rejected[idx])
                 num_bonus = int(fwd_output.num_bonus[idx])
                 offset = 0 if (num_new_token + num_rejected) == 1 else self.mtp_k
+                # num_rejected：被拒绝的草稿数；num_bonus：被接受的草稿数（这一行token数 = num_bonus + 1）
+                # offset决定要覆盖的那段占位有多长（required_placeholders = num_placeholder + offset）：
+                #   num_new_token + num_rejected == 1 → prefill步的输出（1个token、没有验证），或不开MTP的decode：
+                #     末尾的占位串长num_placeholder，offset=0
+                #   否则是验证步（num_new_token + num_rejected = k+1）：末尾的占位串长2k+1（=num_placeholder+k），offset=k
+                #   数字见函数开头时间线②的ⓑ、ⓒ
                 # Align stats with vLLM: only count steps that actually ran
                 # speculation (drafts proposed and validated). Skip the
                 # prefill-only step where no draft tokens were scored against
                 # the target — vLLM gates this via
                 # `if scheduled_spec_token_ids and generated_token_ids`.
+                # 【译】统计口径与vLLM对齐：只统计真正跑了投机（提出并验证了草稿）的步。跳过只有prefill的那一步——那一步没有草稿
+                #   拿去和目标模型比对；vLLM用 `if scheduled_spec_token_ids and generated_token_ids` 做这个判断。
                 if (
                     self.engine_stats.spec_enabled
                     and num_new_token > 0
@@ -5459,15 +5471,20 @@ class Scheduler:
                     self.engine_stats.update_spec(num_new_token)
                 seq.num_rejected = num_rejected
                 seq.num_bonus_tokens = num_bonus
+                # 存到序列上：下一次调度时ScheduledBatch用seq.num_rejected算窗口起点、交给runner；第2段据它少追加占位
                 # DSpark Phase 2: stash this step's scheduler-chosen ell on the
                 # seq so the NEXT decode schedule can size its verification to
                 # ell+1. Keyed by req_id (order-safe). Missing -> leave default
                 # (mtp_k), so a request never gets under-verified.
+                # 【译】DSpark第2阶段：把本步调度器选定的ell存到序列上，这样"下一次"decode调度可以把它的验证长度定为ell+1。
+                #   按req_id取（与顺序无关）。没有值 → 保持默认（mtp_k），保证请求永远不会被少验证。
+                # 【分支】DSpark投机解码（第7批），ell的含义见sequence.py的dspark_next_ell
                 if fwd_output.dspark_ell is not None:
                     ell_r = fwd_output.dspark_ell.get(seq.id)
                     if ell_r is not None:
                         seq.dspark_next_ell = int(ell_r)
                 required_placeholders = num_placeholder + offset
+                # 末尾应有的占位数不够时（output_tokens比它短）打警告并用eos补齐，保证下面按负下标覆盖时只落在占位上
                 missing_placeholders = required_placeholders - len(seq.output_tokens)
                 if missing_placeholders > 0:
                     logger.warning(
@@ -5479,6 +5496,7 @@ class Scheduler:
                     )
                     for _ in range(missing_placeholders):
                         seq.append_token(self.eos_token_id)
+                # 从占位串的开头起依次写入真实token（位置 = 长度 - required_placeholders + i），token_ids与output_tokens同步改
                 for i, el in enumerate(token_ids):
                     seq.token_ids[-required_placeholders + i] = el
                     seq.output_tokens[-required_placeholders + i] = el
@@ -5494,9 +5512,17 @@ class Scheduler:
                 # the trailing `eos` run is `2 * mtp_k + 1` while the recorded
                 # width was `mtp_k + 1 - num_rejected`, so a preemption left
                 # `mtp_k + num_rejected` of them in the recomputed context.
+                # 【译】这次写入没有用掉的那部分窗口。这些槽位仍是 eos_token_id，所以仍然是占位；在验证步上总会剩一些：
+                #   窗口比为它追加的那段宽 mtp_k（上面的 offset），而这一步为它交回 mtp_k - num_rejected + 1 个token。
+                #   在这里记录下来，而不是留给 preempt 去重新推导——num_placeholder_tokens 就是它读取的宽度，而在这一行之前，
+                #   它只描述了下面追加的那一段。实测的稳态（延迟输出、每步都有草稿）：末尾的 eos 串长 2*mtp_k+1，而之前记录的
+                #   宽度是 mtp_k+1-num_rejected，所以一次抢占会在重算的上下文里留下 mtp_k+num_rejected 个eos。
+                # 解释：验证步剩下 (2k+1) - (k+1-num_rejected) = k + num_rejected 个；第2段再追加 k+1-num_rejected 个，合计回到2k+1
+                #   （时间线②的ⓒ：剩4个，追加3个）；不开MTP时剩0个
                 seq.num_placeholder_tokens = max(
                     0, required_placeholders - len(token_ids)
                 )
+                # logprobs：每个占位追加时配了一个0.0，这里把末尾那一项改成真实值（不开MTP时末尾正好是刚覆盖的位置）
                 if seq.return_logprobs and token_logprob is not None:
                     if seq.logprobs:
                         seq.logprobs[-1] = token_logprob
@@ -5505,12 +5531,16 @@ class Scheduler:
             else:
                 num_rejected = 0
                 num_bonus = 0
+                # 没有占位：和nano-vllm一样，把本步的token直接append（num_tokens随之+1）
                 for token_id in token_ids:
                     seq.append_token(token_id)
                 if seq.return_logprobs and token_logprob is not None:
                     seq.logprobs.append(token_logprob)
             new_tokens = token_ids
+            # new_tokens：本步要发给客户端的token，下面可能被截断
 
+            # 【分支】PD分离的consumer（第9批）：第一次decode之前，_schedule_first_decode_after_remote_kv已把producer采样的T0
+            #   append进序列并记在_injected_t0；它不在本步的fwd_output里，所以在这里补到要发出去的token前面，只补一次
             injected_t0 = getattr(seq, "_injected_t0", None)
             if injected_t0 is not None:
                 new_tokens = [injected_t0] + list(new_tokens)
@@ -5522,6 +5552,11 @@ class Scheduler:
             # otherwise advance twice). The seq is handed off rather than
             # decoded here, so it keeps its empty spec_token_ids and the
             # consumer proposes for itself.
+            # 【译】只要runner跳过了 propose()，draft_token_ids 就是None——P/D producer每一步都这样：它关掉了延迟输出，
+            #   让consumer恰好只消费一次T0（否则KDA状态会前进两次）。这条序列会被交接出去，而不是在这里decode，
+            #   所以它保持空的 spec_token_ids，由consumer自己提草稿。
+            # 解释：spec_token_ids是下一步要验证的草稿，ScheduledBatch把它放进scheduled_spec_decode_tokens
+            #   （延迟输出时，跨步的序列由runner直接用GPU上的草稿，见model_runner.py的prepare_input_ids）
             if self.mtp_k > 0 and draft_token_ids is not None:
                 seq.spec_token_ids = draft_token_ids[idx]
 
@@ -5535,8 +5570,11 @@ class Scheduler:
                     seq.num_tokens,
                     len(seq.block_table),
                 )
+            # 真实长度 = 数组长度 - 草稿占位(k) - 被拒绝的草稿数；对照时间线②：ⓑ 8-3-0=5，ⓒ 12-3-1=8
+            #   不开MTP时覆盖之后已没有占位，num_tokens就是seq.num_tokens
             num_tokens = seq.num_tokens - num_placeholder_width - num_rejected
             leave_reason = None
+            # leave_reason：本步的结束原因，None表示继续；取值见_mark_finished上方的表
             # MTP edge case: `rejection_sampler` does NOT inspect EOS — it
             # only compares draft vs target_argmax for acceptance. So when
             # the verified token is EOS the kernel still emits 1+ accepted
@@ -5547,8 +5585,21 @@ class Scheduler:
             # `eos_idx=0`, `num_new=2`, `num_rejected=0` for V4-Pro MTP-1.
             # Track the earliest stop position so `num_tokens` can drop the
             # spurious tail below.
+            # 【译】MTP的边界情况：rejection_sampler 不检查EOS——它只比较草稿和目标模型的argmax来决定是否接受。所以当被验证的
+            #   token是EOS时，kernel仍会在EOS之后吐出1个以上被接受的bonus token（常常是BOS，因为模型很自然地开始一个新句子）。
+            #   不截断的话，这些EOS之后的token会漏进反分词后的输出（例如"...6.<EOS><BOS>"）。已用DIAG实测确认：
+            #   V4-Pro MTP-1 下 token_ids=[EOS=1, BOS=0]、eos_idx=0、num_new=2、num_rejected=0。
+            #   记录最早的停止位置，好让下面的 num_tokens 去掉这段多余的尾巴。
+            # stop_at_idx：本步token（token_ids）里的下标，输出保留到它为止（含）；None表示本步没有停止
             stop_at_idx: int | None = None
             # Check if sequence ends with any stop sequence
+            # 【译】检查序列是否以任何一个stop序列结尾
+            # ① stop序列（stop字符串分词后的token序列）：对本步每个新token的位置，看"以它结尾"的那一段是否等于stop序列；
+            #   offset = num_tokens - i，i=0是最后一个新token，所以从后往前找，找到就break
+            #   例：stop序列=[271, 25]，本步新增(…, 271, 25)，num_tokens=20 → i=0时token_ids[18:20]==[271,25] → stop_at_idx=最后一个
+            #   Python的for…else：循环没被break（没有任何stop序列命中，包括列表为空）时才执行else，所以eos只在stop序列都没命中时才检查
+            # 观察：一步多token（MTP）时，选中的是"列表里第一个命中的stop序列在本步里最靠后的结束位置"，而且一旦命中就不再看eos；
+            #   若同一步里更早的位置已出现eos或另一个stop序列，它们会留在输出里。不开MTP时每步只有1个新token，没有这个差别
             for stop_seq in seq.stop_token_sequences:
                 stop_len = len(stop_seq)
                 if num_tokens >= stop_len:
@@ -5560,6 +5611,7 @@ class Scheduler:
                             # `i` counts back from the last sampled token
                             # (i=0 = last). Truncate to include this stop
                             # sequence (drop everything after it).
+                            # 【译】i 从最后一个采样token往回数（i=0即最后一个）。截断到包含这个stop序列为止（丢掉它之后的一切）。
                             stop_at_idx = num_new_token - 1 - i
                             break
                     if is_stop:
@@ -5567,6 +5619,10 @@ class Scheduler:
                         break
             else:
                 # Check the last token in the list for EOS
+                # 【译】检查列表里最后一个token是否为EOS
+                # 解释：实际检查的是本步全部新token，取第一个eos的位置。② eos：只看本步拿到的真实token，不看token_ids末尾
+                #   （那里的占位值也是eos）；③ stop_token_ids：generation_config里除eos以外的结束token（LLMEngine.__init__已把eos
+                #   从中去掉），原因记为"stop_<id>"（如"stop_151645"）。ignore_eos=True时这两项都不查，stop序列和max_tokens照常生效
                 if token_ids and not seq.ignore_eos and self.eos_token_id in token_ids:
                     leave_reason = "eos"
                     stop_at_idx = token_ids.index(self.eos_token_id)
@@ -5584,6 +5640,12 @@ class Scheduler:
             # scheduled. Select the earlier boundary between a natural stop
             # above and the output cap, then reuse the common truncation path
             # for both internal and client-visible tokens.
+            # 【译】num_tokens 是验证之后的真实长度。一次MTP forward可以接受多个token，所以即使请求在被调度时还没到上限，
+            #   最后这一批也可能越过 max_tokens。在上面的自然停止和输出上限之间选更早的那个边界，然后让内部token和
+            #   客户端可见的token都走同一条截断路径。
+            # 例：max_tokens=10，本步之前已生成8个，本步接受了(61,62,70) → completion_tokens=11，overflow=1
+            #   → max_stop_at_idx = 3-1-1 = 1 → 只保留61、62，正好10个；本步没有自然停止时原因记为"max_tokens"
+            #   自然停止恰好落在上限上（stop_at_idx == max_stop_at_idx）时保留自然原因，不改成max_tokens
             completion_tokens = num_tokens - seq.num_prompt_tokens
             if completion_tokens >= seq.max_tokens:
                 overflow = completion_tokens - seq.max_tokens
@@ -5591,6 +5653,8 @@ class Scheduler:
                 # an injected P/D T0.  -1 therefore keeps T0 but no model
                 # output; when the cap retains no tokens, -2 is the boundary
                 # before T0.
+                # 【译】stop_at_idx 是本步模型输出里的下标，不含注入的P/D T0。所以 -1 表示保留T0、但不保留任何模型输出；
+                #   当上限一个token都不让保留时，-2 是T0之前的边界。
                 min_stop_at_idx = -1 - (1 if injected_t0 is not None else 0)
                 max_stop_at_idx = max(min_stop_at_idx, num_new_token - 1 - overflow)
                 if stop_at_idx is None or max_stop_at_idx < stop_at_idx:
@@ -5600,6 +5664,8 @@ class Scheduler:
             # Drop accepted-draft tokens past the stop position (MTP only —
             # for non-spec the sampler emits exactly 1 token so this is a
             # no-op).
+            # 【译】丢掉停止位置之后被接受的草稿token（只有MTP会这样——非投机时采样器只吐1个token，这里什么也不做）。
+            # 解释：例外是max_tokens<=0这类边界：stop_at_idx可以是-1，非投机时也会把本步的token去掉（但仍发一个结束事件，见下面）
             if stop_at_idx is not None and stop_at_idx < num_new_token - 1:
                 num_tokens -= (num_new_token - 1) - stop_at_idx
                 # The same truncation MUST apply to the EMITTED tokens, not just
@@ -5613,17 +5679,30 @@ class Scheduler:
                 # but flexible-extract's last-number picks up the leaked trailing
                 # digit. `injected_t0` (if present) prepends one slot not counted
                 # in stop_at_idx / num_new_token, so offset the cut by it.
+                # 【译】同样的截断必须作用于"发出去的"token，而不仅是内部的序列长度。客户端看到的文本是由 generate_async /
+                #   流式回调从 RequestOutput.output_tokens（new_tokens 的累积）拼出来的——不是从 completion_token_ids
+                #   （它受上面写 seq.num_tokens 的那一步控制）。这里不裁剪 new_tokens 的话，拒绝采样器在EOS之后吐出的停止后token
+                #   （它不检查EOS）就会漏进响应：strict-match仍然能找到答案，但flexible-extract取最后一个数字时会拿到漏出来的
+                #   尾部数字。injected_t0（如果有）在前面多占一个槽位，不计入 stop_at_idx / num_new_token，所以截断位置要按它偏移。
+                # 解释：strict-match / flexible-extract是lm_eval里GSM8K的两种答案抽取方式（CI精度门槛，见/ci-pr-guide）；
+                #   seq.num_tokens实际是在下面的_mark_finished里写的
                 keep = stop_at_idx + 1 + (1 if injected_t0 is not None else 0)
                 new_tokens = new_tokens[:keep]
                 if seq.return_logprobs:
                     # LLMEngine.postprocess returns the complete logprobs
                     # array rather than slicing it through num_tokens, so keep
                     # it aligned explicitly with the cropped completion.
+                    # 【译】LLMEngine.postprocess 返回完整的logprobs数组，而不是按 num_tokens 切片，所以这里要显式地让它
+                    #   与裁剪后的生成部分对齐。
                     del seq.logprobs[num_tokens - seq.num_prompt_tokens :]
 
             # Record TTFT from the finalized retained length, after rejected
             # speculative tokens and cap/stop overflow have been removed. A
             # terminal response with no completion tokens must keep TTFT zero.
+            # 【译】在去掉被拒绝的投机token和超出上限/停止位置的部分之后，用最终保留的长度记录TTFT。
+            #   一个没有任何生成token就结束的响应，TTFT必须保持为0。
+            # 解释：num_finalized_tokens = 主机侧已确定的长度（不含占位，见sequence.py）；first_token_time只在第一次出现真实生成token时
+            #   写一次（TTFT = first_token_time - arrive_time）
             seq.num_finalized_tokens = num_tokens
             if num_tokens - seq.num_prompt_tokens >= 1 and seq.first_token_time == 0.0:
                 seq.first_token_time = time.time()
@@ -5636,10 +5715,19 @@ class Scheduler:
             # the status line disagree with what the client received and with
             # `total_generation_tokens` below, which this same call derives
             # from the post-truncation length.
+            # 【译】在这里计数，而不是用上面的 len(token_ids)：new_tokens 才是到达 RequestOutput 的东西，它和forward的原始输出
+            #   在两个方向上都不同——上面的截断丢掉了EOS/stop之后被接受的草稿，injected_t0 又在前面加上了prefill进程采样的token。
+            #   用原始输出计数会让状态行和客户端实际收到的不一致，也和下面的 total_generation_tokens 不一致
+            #   （它在同一次调用里由截断后的长度算出）。
             num_new_generation_tokens += len(new_tokens)
 
             # Hash generated blocks. Deferred output: all tokens forwarded;
             # undeferred: last token not yet forwarded, so exclude it.
+            # 【译】登记生成部分的block的hash。延迟输出：所有token都已经forward过；不延迟：最后一个token还没forward，所以排除它。
+            # 解释：只有KV已写好的满block才能登记（hash_decode_blocks的committed_kv_len是一条硬线）。延迟输出时最后一个真实token
+            #   正是GPU上在途那一步的输入，它的KV由那一步写；不延迟时刚append的token要下一步才算KV。这样下一轮对话
+            #   （上轮prompt + 上轮回答）也能命中生成部分的block（sequence.py字段演化总表第4步）。
+            #   next_forward_tokens：下一次forward会带几个token，给状态checkpoint用（_checkpoint_room，第4批）；本步就结束时为0
             self.block_manager.hash_decode_blocks(
                 seq,
                 num_tokens - (0 if is_deferred_out else 1),
@@ -5651,15 +5739,24 @@ class Scheduler:
             if leave_reason is not None:
                 # Publish transfer metadata before constructing the terminal
                 # output. Aborts without sampled output use the same helper.
+                # 【译】在构造终止输出之前发布传输元数据。没有采样输出就被取消的请求也走同一个辅助函数。
+                # 解释：_mark_finished会调用connector的request_finished，PD producer在那里写好kv_transfer_params_output
+                #   （如mooncake_connector.py），下面的RequestOutput才能带上它
                 self._mark_finished(seq, leave_reason, num_tokens)
 
             # Prepare stream output
             # A terminal event is required even when truncation leaves no
             # tokens (for example max_tokens <= 0). Async consumers wait for
             # this finished RequestOutput and would otherwise block forever.
+            # 【译】准备流式输出。
+            #   即使截断后一个token都不剩（例如 max_tokens <= 0），也必须发一个终止事件。异步消费者在等这个已结束的
+            #   RequestOutput，否则会永远阻塞下去。
+            # 解释：RequestOutput（request.py）：output_tokens=本步新增的token、finished、finish_reason=leave_reason、
+            #   PD producer的kv_transfer_params_output、num_cached_tokens（取prefix_cache_hit_tokens，最终出现在usage里）
             if stream_output_queue is not None and (
                 new_tokens or leave_reason is not None
             ):
+                # new_tokens可能是runner给的tuple，也可能是上面拼接/切片得到的list；统一拷成一个新list
                 output_tokens_list = (
                     list(new_tokens)
                     if isinstance(new_tokens, tuple)
@@ -5693,14 +5790,23 @@ class Scheduler:
 
         if stream_output_queue is not None and stream_outputs:
             stream_output_queue.put_nowait(stream_outputs)
+        # 一步只放一个列表：EngineCore把它作为一条("STREAM", 列表)消息发给CoreManager，之后才发finished_seqs
 
+        # ---- 第2段：为下一步追加占位 ----
+        # 只给本步batch里的序列（seqs）追加：它们此刻都有一步在GPU上在途（延迟输出），或下一步要验证k个草稿（投机）。
+        #   已结束（FINISHED）的不追加；还在prompt中途的（is_partial_prefill）不追加，它的下一步仍是prefill chunk
         if need_placeholder:
             # placeholder for the each decode step
+            # 【译】为每个decode步放置占位
             for seq in seqs:
                 if seq.status == SequenceStatus.RUNNING and not seq.is_partial_prefill:
                     # Clamped because `preempt()` strips exactly this many:
                     # `range()` on a negative width appends nothing, so storing
                     # one unclamped would claim placeholders that are not there.
+                    # 【译】做下限截断，因为 preempt() 恰好删掉这么多个：range() 遇到负数宽度什么也不追加，
+                    #   所以不截断就存进去，会声称有并不存在的占位。
+                    # 解释：num = num_placeholder - 上一次验证被拒绝的草稿数。被拒绝的位置在上面覆盖时已经留成了占位
+                    #   （剩下k+num_rejected个），这里少追加num_rejected个，末尾占位总数回到2k+1（时间线②的ⓒ）
                     num = max(0, num_placeholder - seq.num_rejected)
                     for _ in range(num):
                         seq.append_token(self.eos_token_id)
@@ -5711,9 +5817,15 @@ class Scheduler:
                     # both are what `preempt` has to strip. `=` also undercounted
                     # a sequence that went two steps without a row -- nothing
                     # consumed the first run, and this one appends beyond it.
+                    # 【译】加到上面覆盖后没用掉的那部分上，而不是替换它：两段都是末尾的 eos_token_id，都是 preempt 要删的。
+                    #   用 `=` 还会少算一条连续两步都没有结果行的序列——第一段没被消费，这一段又追加在它后面。
                     seq.num_placeholder_tokens += num
+        # ---- 第3段：释放已结束序列的KV block ----
+        # 对比nano-vllm：nano-vllm判停后立刻deallocate + running.remove；ATOM先收集finished_seqs，循环之后统一释放，
+        #   中间多了connector的延迟释放（【分支】PD分离 / KV offload，第9批）
         for seq in finished_seqs:
             logger.debug("Freeing blocks for finished seq %s", seq.id)
+            # 被取消时还在prompt中途：修正_partial_prefill_count
             if seq.is_partial_prefill:
                 seq.is_partial_prefill = False
                 self._partial_prefill_count -= 1
@@ -5721,6 +5833,10 @@ class Scheduler:
                 # `request_finished` already ran once, above, while the reason
                 # was being settled -- it must not run again now that the claim
                 # it takes is a side effect.
+                # 【译】request_finished 已经在上面确定结束原因时运行过一次（_mark_finished里）——它会认领block，这是一个副作用，
+                #   所以现在不能再运行一次。
+                # 【分支】KV connector（第9批）：should_defer_free为True表示还有人在读这些block（PD producer的RDMA发送还没完成，
+                #   或KV offload还在把它们存到CPU/远端），不能马上放回空闲池
                 if self._connector_should_defer_free(seq):
                     protected = self._connector_protected_block_ids(seq)
                     state_safe = (
@@ -5733,9 +5849,14 @@ class Scheduler:
                         # finished request's block_table -- decode blocks, an
                         # unaligned prompt tail, already-saved ranges -- frees
                         # now instead of waiting behind `deferred_free_blocks`.
+                        # 【译】提前释放block：只有这次保存真正要读的源block保持钉住；这个已结束请求的block_table里其余的一切——
+                        #   decode阶段的block、没对齐的prompt尾部、已经保存完的区段——现在就释放，而不必在 deferred_free_blocks 后面等。
+                        # 解释：条件是connector能给出精确的受保护block集合（protected不为None），且每请求状态（若有）允许部分释放；
+                        #   受保护的block以"租约"形式保留，保存完成后由_drain_source_safe_releases释放
                         before = len(seq.block_table)
                         # `state_safe` holds on this branch; restate it so the
                         # block manager's own fail-closed check stays armed.
+                        # 【译】state_safe 在这个分支上必然成立；这里再显式传一遍，让block manager自己的"失败即关闭"（fail-closed）检查保持生效。
                         self.block_manager.deallocate_partial(
                             seq, protected, per_request_state_safe=True
                         )
@@ -5767,34 +5888,62 @@ class Scheduler:
                         # Stamp when the save was deferred so the reconciler
                         # can reclaim it if the completion report never
                         # arrives.
+                        # 【译】记下延迟保存开始的时间，这样如果完成报告一直不来，reconciler可以把它回收。
+                        # 解释：整条请求放进deferred_free_blocks，等_update_from_kv_xfer_finished收到发送/保存完成的报告再释放；
+                        #   报告丢了则由_reconcile_stalled_deferred_saves超时回收
                         seq._deferred_save_at = time.monotonic()
                         self.deferred_free_blocks[seq.id] = seq
                 else:
                     self.block_manager.deallocate(seq)
+            # 主干（没有connector）：引用计数减1，减到0的block回到空闲池；已登记hash的block内容留在显存里，
+            #   之后同前缀的请求仍可能命中（同nano-vllm）
             else:
                 self.block_manager.deallocate(seq)
             self.running.remove(seq)
 
+        # 吞吐统计：本步发给客户端的生成token数（状态行的generation throughput）
         self.engine_stats.update_throughput(
             num_generation_tokens=num_new_generation_tokens
         )
         return finished_seqs
 
+    # 把一条序列标记为结束（不释放block，释放在postprocess第3段）：写leave_reason → 通知connector → num_tokens截到真实长度
+    #   → FINISHED → 累加看板计数。调用方：只有postprocess（判停命中时，和序列已是ABORTED时）
+    # reason的取值（seq.leave_reason → RequestOutput.finish_reason → 对外的finish_reason）：
+    #   reason           │ postprocess里在哪判定                               │ OpenAI finish_reason（protocol.openai_stop_reason）
+    #   ─────────────────┼────────────────────────────────────────────────────┼──────────────────────────────
+    #   "stop_sequence"  │ token_ids末尾命中某个stop字符串的token序列            │ "stop"
+    #   "eos"            │ 本步token里有eos_token_id（ignore_eos时不查）         │ "stop"
+    #   "stop_<id>"      │ 本步token里有stop_token_ids中的某个，如"stop_151645"   │ "stop"
+    #   "max_tokens"     │ 生成数达到max_tokens（一步多token时截在上限处）        │ "length"
+    #   "aborted"        │ 序列已被abort_request标成ABORTED（running里的）         │ "stop"
+    #   不经过这里的两种：准入时被拒绝的"unschedulable: <原因>"（_schedule直接写leave_reason，经take_rejected交给EngineCore），
+    #   以及还在waiting里就被取消的"aborted"（_reject_aborted_waiting）
+    # 对比nano-vllm：nano-vllm只有eos和max_tokens两种结束，也不记录原因
     def _mark_finished(self, seq, reason, num_tokens):
         # Set the reason before the connector decides whether to claim the
         # source blocks. This runs exactly once, including early cancellation
         # without sampled output and requests without a stream queue.
+        # 【译】在connector决定是否认领源block之前先设置结束原因。这个函数恰好运行一次，包括没有采样输出的提前取消、
+        #   以及没有流式队列的请求。
         seq.leave_reason = reason
         if self.kv_connector is not None:
+            # 【分支】KV connector（第9批）：request_finished让connector决定是否认领这些block
+            #   （PD producer：登记待发送、写好kv_transfer_params_output）
             callback = getattr(self.kv_connector, "request_finished", None)
             if callable(callback):
                 callback(seq)
             if reason == "aborted":
                 # No peer will report a send for a cancelled request.
+                # 【译】被取消的请求不会有对端来报告发送完成。
+                # 解释：所以这里直接释放发送认领，否则这些block会一直等一个不会来的报告
                 self._connector_send_finished(seq.id)
+        # 长度截到真实长度：去掉末尾占位、被拒绝的草稿、停止位置之后的token。只改计数不删数组
+        #   （completion_token_ids按num_tokens切片；preempt删占位时也以它为界）
         seq.num_tokens = num_tokens
         seq.multimodal_data = None
         seq.status = SequenceStatus.FINISHED
+        # 看板计数只在请求生命周期的边界更新（见__init__）
         self.total_finished_requests += 1
         self.total_prompt_tokens += int(seq.num_prompt_tokens)
         self.total_generation_tokens += max(
