@@ -52,7 +52,7 @@
 #     再加上占位token的id（image_token_id等）。
 #   ATOM原生模式也跑视觉部分：get_hf_config把text_config当作hf_config，另把完整config存进Config.multimodal_config；
 #     ModelRunner按架构名Qwen3_5ForConditionalGeneration加载models/qwen3_5.py的Qwen3_5MultimodalModel
-#     （视觉编码器在models/qwen3_5_vl.py，用法见recipes/Qwen3.5_multimodel.md）。
+#     （它构造models/qwen3_5_vl.py的Qwen3VisionTransformer；用法见recipes/Qwen3.5_multimodel.md、atom/examples/multimodal_inference.py）。
 #     vLLM插件模式则不抽text_config，多模态交给vLLM处理（第10批）。
 #
 # ② M-RoPE（多模态RoPE，rope_parameters里的 mrope_section / mrope_interleaved）

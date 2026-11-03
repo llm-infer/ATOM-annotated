@@ -18,7 +18,8 @@ A video-chunk is the smallest independently processable unit of video.
 # 调用方：vLLM插件 plugin/vllm/models/kimi_k25.py，用hf_config里的vision_config、text_config重建KimiK25Config，
 #   再按它构造视觉塔（MoonViT3dPretrainedModel）和文本模型
 # 原生ATOM路径不用这个类：config.get_hf_config对model_type="kimi_k25"只抽出text_config，
-#   按text_config的model_type经_CONFIG_REGISTRY映射（如kimi_k2 -> deepseek_v3）后解析，见本批config.py
+#   按text_config的model_type经_CONFIG_REGISTRY映射（如kimi_k2 -> deepseek_v3）后解析，见本批config.py；
+#   原生的models/kimi_k25.py只跑文本主干，加载时跳过视觉塔和投影器的权重（与Qwen3.5不同，见qwen3_5.py科普①）
 # 【分支】vLLM插件见第10批；DeepSeek-V3结构（MLA、MoE）见第7批（"第N批"指仓库根目录ANNOTATION_PLAN.md里的阅读批次）
 #
 # =====================================================================================

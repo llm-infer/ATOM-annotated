@@ -378,7 +378,7 @@ class SequenceStatus(Enum):
 
 
 # 本step这条序列做的是prefill还是decode，由调度器在每次调度时设置
-# ScheduledBatch据此区分batch中的prefill序列和decode序列
+# ScheduledBatch据此区分batch中的prefill序列和decode序列（主调度器的一个batch实际只含其中一种，见is_partial_prefill处）
 class SequenceType(Enum):
     # 初始值：还没被调度过
     DUMMY = auto()
@@ -874,8 +874,11 @@ class Sequence:
         # garbage sampled tokens from intermediate chunks and to skip the
         # scheduler's Phase 1 scan when no partials exist.
         # 科普：分块prefill（chunked prefill）
-        #   一个很长的prompt（如3万token）如果一次prefill完，这一步会很久，同batch里正在decode的请求都要干等。
-        #   分块prefill把它切成若干chunk，每步只算一块（受每步token预算限制），和decode序列拼在同一个batch里。
+        #   每个step送进模型的token数有上限（max_num_batched_tokens）。一个很长的prompt（如3万token）超过上限时，
+        #   分块prefill把它切成若干chunk，每步只算一块，下一步由调度器的Phase 1优先接着算。
+        #   注意：ATOM主调度器的一个step要么全是prefill、要么全是decode，不会把chunk和decode序列拼进同一个batch
+        #     （scheduler.py的_schedule：本步排了prefill就直接返回prefill batch，那里还留着"mixed batch"的TODO）；
+        #     chunk之间想穿插decode步，要靠PrefillDelayer的decode保护（ATOM_PREFILL_DECODE_INTERVAL>0，见prefill_delayer.py）
         #   中间chunk结束时模型也会"顺手"采样出一个token，但它不是真正的下一个token，必须丢弃——这个标志就是干这个的。
         #   例：prompt 10个token、每步预算4：第1步算0~3、第2步算4~7（这两步is_partial_prefill=True），
         #     第3步算8~9，之后置False，第3步采样出的token才是第一个生成token
