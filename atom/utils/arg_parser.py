@@ -17,7 +17,7 @@ parser adds the missing counterpart automatically.
 # 本文件只有一个类FlexibleArgumentParser，所有命令行入口都用它代替argparse.ArgumentParser：
 #   examples/simple_inference.py、examples/multimodal_inference.py、examples/profile_offline.py、
 #   entrypoints/openai/api_server.py、entrypoints/atomesh/server.py、benchmarks/benchmark_serving.py
-# 引擎参数本身由EngineArgs.add_cli_args(parser)注册（见本批arg_utils.py），这里只负责"两种拼写都认"
+# 引擎参数本身由EngineArgs.add_cli_args(parser)注册（见atom/model_engine/arg_utils.py），这里只负责"两种拼写都认"
 # 例：注册了--max-num-seqs，那么--max_num_seqs 8也能用，二者写入同一个dest（max_num_seqs）
 # 单元测试：tests/test_arg_utils_spec.py 的 TestFlexibleArgumentParser
 # 为什么要这样做：vLLM/SGLang的命令行都是kebab-case，用户经常把它们的启动命令直接搬过来；

@@ -27,7 +27,7 @@ documented at the bottom of this file but NOT managed here.
 #   第三方 / 依赖库的环境变量（NCCL、torch、HuggingFace、AITER、FLA）在本文件底部有说明，但不在这里管理。
 #
 # 本文件是ATOM的"环境变量总表"：两百多个变量，绝大多数是kernel路径选择、性能优化开关和调试开关
-#   命令行参数（--max-num-seqs等，见本批arg_utils.py）管"引擎怎么配"；环境变量多用于"走哪条kernel路径、开不开某个优化"
+#   命令行参数（--max-num-seqs等，见atom/model_engine/arg_utils.py）管"引擎怎么配"；环境变量多用于"走哪条kernel路径、开不开某个优化"
 #   大多数默认值就是生产推荐值，平时不用设；排查精度/性能问题时才按需打开或关闭，做A/B对比
 # 机制：environment_variables是"变量名 -> 无参lambda"的字典；模块级__getattr__（PEP 562）在访问envs.XXX时调用对应lambda
 #   注意并没有缓存：每次访问都重新读一次os.environ。热路径代码通常在模块导入时就把值存进模块级常量
@@ -36,6 +36,7 @@ documented at the bottom of this file but NOT managed here.
 #   少数用_flag_env或.lower() in {...}，接受更多写法。设置时用1/0最稳妥
 # 文件里原有的`# --- xxx ---`分节标题只反映大致位置，很多变量后来被加在不相关的分节里。
 #   下面按功能重新分组；每个变量上方的中文注释都以【组名】开头，可以按组名搜索：
+#   （组名后括号里的"第N批"指ANNOTATION_PLAN.md的阅读批次，即这组开关的读取方在哪一批里讲；"【分支】…见第N批"同义）
 #
 #   【服务】进程、API前端、日志、指标、GC、追踪（第2批、第10批）
 #     ATOM_PROCESS_NAME_PREFIX、ATOM_SHUTDOWN_TIMEOUT_S、ATOM_LOG_MORE、
@@ -298,7 +299,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_PREFIX_CACHE_PROTECTED_RATIO", "0.5")
     ),
     # 背景：DeepSeek-V4的注意力有滑动窗口和"压缩器"（把每compress_ratio个相邻token的KV压成一条），它们的中间状态不是逐token存放的，
-    #   所以前缀命中只复用KV block还不够，还要恢复这些状态；下面这个开关提供"只重算一小段感受野"的恢复方式（状态checkpoint概念见下文【状态缓存】）
+    #   所以前缀命中只复用KV block还不够，还要恢复这些状态；下面这个开关提供"只重算一小段感受野"的恢复方式（状态checkpoint的概念见下文"科普·线性注意力 / 递归状态"）
     # 【状态缓存】ATOM_DSV4_STATE_REPLAY：DeepSeek-V4前缀命中时用"有界重放"重建压缩状态（默认关）；读取方：config.py、deepseek_v4_replay.py
     # DeepSeek-V4 bounded replay: when the compressed history hits further than
     # the nearest state checkpoint by more than the window's receptive field,
@@ -413,6 +414,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 科普·torch.compile与CUDA Graph：torch.compile（Dynamo抓图 + Inductor生成融合kernel）减少Python开销和小算子；
     #   CUDA Graph把一整串kernel launch"录像"下来，之后每步只需一次replay，省掉CPU逐个launch的时间（decode时这部分很可观），
     #   代价是输入形状必须固定，所以按batch大小分档（bucket）录多张图、不足的用padding补齐。PIECEWISE = 在注意力等"切分算子"处把图切开，分段录图（ATOM level 3的默认）。
+    #   更准确地说：--level 3（默认level）是"分段编译"；原生命令行默认的--cudagraph-mode是FULL整图，PIECEWISE要显式指定
+    #   （各模式的实际行为见config.py CUDAGraphMode上方的适用场景表）
     #   ATOM里见atom/utils/decorators.py（support_torch_compile）、docs/compilation_cudagraph_guide.md
     # 【插件】ATOM_SGLANG_PREFILL_COMPILE_ONLY：SGLang插件的prefill只编译、不捕获CUDA Graph（实验性）
     # Keep SGLang's tc_piecewise/Inductor compilation path for prefill, but
@@ -733,7 +736,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #   坏处是前缀复用时没法"取前N个token的KV"，只能复用在第N个token处保存下来的状态快照，这就是"状态checkpoint"。
     #   这些模型通常是线性注意力层与普通注意力层混合。实现见model_ops/attention_gdn.py、attentions/gdn_attn.py、fla_ops/
     # 【状态缓存】ATOM_STATE_CHECKPOINT_DEMAND：前缀命中因没有合适的状态checkpoint而被拒绝时，是否按需补放一个checkpoint（默认开）
-    #   背景：线性注意力层没有逐token的KV，前缀复用要靠在某些位置保存的递归状态快照（checkpoint），见第4批；读取方：block_manager.py
+    #   背景见上面的科普；机制在第4批；读取方：block_manager.py
     # Set to 0 to stop a refused state-cache hit from placing a checkpoint of
     # its own, leaving the prompt-end anchor as the only placement. Overrides
     # --state-checkpoint-demand so the policy can be flipped without touching a
@@ -1752,7 +1755,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 科普·TBO（Two-Batch Overlap）：把一个batch拆成两个微批（ubatch）A、B交替执行：A在做all2all / all-reduce通信时，B在GPU上计算，
     #   反之亦然，用计算掩盖通信。前提是两个微批工作量差不多，所以拆分要尽量对半；batch太小时拆了反而不划算（见下面的MIN_TOKENS）。
     #   实现见atom/utils/tbo/
-    # 【并行】ATOM_TBO_PREFILL_TOKEN_SPLIT：TBO（two-batch overlap：两个微批的计算与通信互相重叠）拆prefill时按token数精确对半切（默认开）
+    # 【并行】ATOM_TBO_PREFILL_TOKEN_SPLIT：TBO拆prefill时按token数精确对半切（默认开）
     #   【分支】TBO见第9批 utils/tbo/
     # Split prefill ubatches at the exact token midpoint (vLLM-DBO style),
     # cutting through a request if needed for perfectly balanced 50/50 ubatches.

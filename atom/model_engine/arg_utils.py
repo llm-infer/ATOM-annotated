@@ -24,6 +24,8 @@ logger = logging.getLogger("atom")
 
 # 本文件：引擎参数（EngineArgs），命令行与Config之间的一层
 # 离线示例（simple_inference.py）和在线服务（openai_server.py）都通过它解析参数、创建引擎
+# 注释里的"第N批"指ANNOTATION_PLAN.md的阅读批次（例：第5批=ModelRunner/CUDA Graph/编译，第9批=PP/DCP/PD分离/KV offload），
+#   表示"细节在那一批的文件里讲"，不是本文件里的位置
 #
 # 一个参数从命令行到生效的路径：
 #   EngineArgs.add_cli_args(parser)       在argparse上注册所有 --xxx 参数
@@ -168,19 +170,25 @@ def _is_offload_connector(cfg: object) -> bool:
 
 # 引擎参数：每个字段对应一个命令行参数（--xxx-yyy 对应字段 xxx_yyy），默认值也与命令行一致
 # 大部分字段同名传给Config；含义和取值影响在这里说明，Config里不再重复
+# 本类分两部分：① 字段（按"模型 / 并行 / 执行方式·KV·调度 / 日志 / PP动态分块 / 编译与CUDA Graph / MoE / 投机解码 /
+#   其余【分支】"分组，每组开头有"适用场景"）；② 方法：add_cli_args（注册命令行，每个参数上方是help的翻译）
+#   -> from_cli_args -> _get_engine_kwargs（改名/打包成子配置）-> create_engine
 #
 # 按目标挑起手配置（每组参数的细节见下面各分组开头的"适用场景"；这里是总览）：
 #   目标           主要动哪些参数                                              为什么
-#   低延迟         较小的--max-num-batched-tokens + --long-prefill-token-threshold   单步变短，长prefill不再挤占decode，ITL更平稳
+#   低延迟         较小的--max-num-batched-tokens + --long-prefill-token-threshold   每个prefill步变短（单靠它们不能让decode插队，见注①）
 #   （ITL/TTFT）   --scheduler-delay-factor 0（默认）；投机解码 --method mtp       不攒批；投机解码让每步出多个token
 #                  -tp 取大一些                                                  单请求的算力更多
 #   高吞吐         --max-num-seqs、--max-num-batched-tokens 取大；-dp 多副本       decode读一遍权重服务更多序列，固定开销被摊薄
 #                  MoE：--enable-dp-attention --enable-expert-parallel           KV容量随卡数增长，并发上得去
 #   长上下文       --max-model-len、--kv_cache_dtype fp8、-dcp（MLA模型）          KV按token切/减半，同样显存放更多token
-#                  chunked prefill保持开启（默认）                               长prompt分多步算，不阻塞decode
+#                  chunked prefill保持开启（默认）                               超过单步预算的长prompt才能分多步算完（关掉会被拒绝）
 #   显存紧张       --gpu-memory-utilization、--kv_cache_dtype fp8、较小的           KV用fp8；激活buffer、CUDA Graph占用变小
 #                  --max-num-batched-tokens / --max-num-seqs / --cudagraph-capture-sizes
 #                  --online_quant_config（权重FP8/MXFP4）                        权重本身变小
+#   注①：ATOM的基础调度器一步只做prefill或只做decode、从不混合，而且做到一半的chunked prefill下一步优先续算
+#     （scheduler.py _schedule的Phase 1），所以正在decode的请求要等这条prompt的全部chunk做完；想让decode
+#     在chunk之间插进来，要设ATOM_PREFILL_DECODE_INTERVAL>0（PrefillDelayer的decode保护，见envs.py【调度】）
 # 例（小模型、16GB卡、显存紧张，来自recipes/Qwen3-8B-FP8.md）：
 #   python -m atom.entrypoints.openai_server --model Qwen3-8B-FP8 --level 0 --kv_cache_dtype bf16 \
 #     --block-size 64 --max-model-len 19456 --gpu-memory-utilization 0.9 -tp 1
@@ -257,13 +265,15 @@ class EngineArgs:
     #                                                                                            block_table等buffer大小；长上下文时调大
     #   --block-size                  16（默认）                     16~64                        —（V4/V4.1/GLM-5.3会被Config强制覆盖）
     #   prefix caching                开（默认）；多轮/长系统提示词收益最大；压测随机prompt想测纯prefill时用--no-enable_prefix_caching
-    #   chunked prefill               开（默认）；关掉（--no-enable_chunked_prefill）后长prompt会独占整步
+    #   chunked prefill               开（默认）；关掉（--no-enable_chunked_prefill）后超过--max-num-batched-tokens的prompt
+    #                                 会被拒绝（scheduler.py的_unschedulable_reason）
     #   --enforce-eager               只在调试时开：不录CUDA Graph，decode会明显变慢
     #   例：延迟优先 -> --max-num-batched-tokens 4096 --long-prefill-token-threshold 2048
     #       长上下文 -> --max-model-len 131072 --kv_cache_dtype fp8（MLA模型再加 -dcp）
     #   （GLM-5.2的agentic recipe用 --max-num-batched-tokens 2048 搭配MTP3和DCP4，属于延迟优先的取法）
     # 强制eager模式：不捕获CUDA Graph（调试时用，性能会明显下降）
     #   CUDA Graph是什么、为什么能加速decode，见config.py里CUDAGraphMode上方的【科普】
+    #   原生ATOM里这是唯一真正关掉录图的开关：--cudagraph-mode NONE仍会录整图（见下面cudagraph_mode字段）
     #   注意：它只关CUDA Graph，不关torch.compile（--level仍生效）；CLAUDE.md提醒：被编译的函数里加调试代码
     #   即使--enforce-eager也会破坏Dynamo追踪
     enforce_eager: bool = False
@@ -273,9 +283,9 @@ class EngineArgs:
     #   例：2000 token的系统提示词 + 50 token的用户问题，第二个请求只需prefill约50 token。
     #   实现在 model_engine/prefix_hash.py（hash链）和 block_manager.py（命中/复用/淘汰）
     enable_prefix_caching: bool = True
-    # 引擎内部通信端口：ModelRunner用它设置MASTER_PORT，作为TP进程组的集合点；不是HTTP服务端口
-    #   更正/补充：torch.distributed主进程组的init_method用的其实是data_parallel_base_port
-    #   （model_runner.py里get_distributed_init_method(master_ip, data_parallel_base_port)）；
+    # 引擎内部通信端口：ModelRunner把它写进环境变量MASTER_PORT；不是HTTP服务端口
+    #   它不是torch.distributed主进程组的集合点：主进程组的init_method用的是data_parallel_base_port
+    #   （model_runner.py里get_distributed_init_method(data_parallel_master_ip, data_parallel_base_port)）；
     #   MASTER_PORT=port 是给读这个环境变量的组件用的（据utils/__init__.py的说明，custom all-reduce的
     #   rendezvous TCPStore绑在MASTER_PORT上）。HTTP端口是api_server的--server-port。
     #   同一台机器起两个ATOM实例时，--port要错开，否则会抢同一个端口
@@ -286,9 +296,9 @@ class EngineArgs:
     #   60GB的KV空间，bf16约放49万token，fp8约放98万token。fp8写入时量化、读出时乘scale反量化，
     #   有轻微精度损失；decode又是读KV受限的，读的字节少一半通常还更快。CLAUDE.md的启动示例都带--kv-cache-dtype fp8
     kv_cache_dtype: str = "bf16"
-    # 【分支】DSA稀疏注意力索引器的缓存类型（DeepSeek-V3.2/V4等），None表示跟随kv_cache_dtype，见第7、8批
-    #   更正：None不总是跟随kv_cache_dtype——Config.__post_init__里：DeepSeek-V4原生单节点默认fp4（gfx942上fp8），
-    #   V4插件模式或有KV传输时fp8，V4.1固定默认fp8，其他模型才等于kv_cache_dtype
+    # 【分支】DSA稀疏注意力索引器的缓存类型（DeepSeek-V3.2/V4等），见第7、8批
+    #   None表示由Config.__post_init__第13步按模型决定（不总是跟随kv_cache_dtype）：DeepSeek-V4原生单节点默认fp4
+    #   （gfx942上fp8），V4插件模式或有KV传输时fp8，V4.1默认fp8，其他模型才等于kv_cache_dtype
     # 【科普】DSA（DeepSeek Sparse Attention）：每个query不看全部历史token，而是先用一个很小的"索引器"
     #   给所有历史token打分，挑出top-k（如2048个）再做真正的注意力。索引器自己也要缓存每个token的key，
     #   这就是"索引缓存"，与主KV cache分开存放。实现见 model_ops/sparse_indexer_*.py 等
@@ -302,13 +312,13 @@ class EngineArgs:
     max_model_len: int | None = None
     # 单个step最多计算的token数（主要约束prefill；decode每条序列1个token，投机解码时是k+1个）
     #   调大：权重读取、kernel启动等固定开销被更多token摊薄，吞吐更高；
-    #         但单步更慢（decode请求的ITL变大）、激活显存更大（可用KV block变少）
+    #         但prefill步更长（decode请求要等它做完，ITL尖峰更大）、激活显存更大（可用KV block变少）
     #   调小：反之；配合chunked prefill，长prompt会被切成更多块
     #   它还限制了能录的CUDA Graph尺寸：ModelRunner会丢掉大于 min(max_num_seqs, 本值//(k+1)) 的捕获尺寸
     #   （k是投机token数，见model_runner.py capture_cudagraph前的检查）
     max_num_batched_tokens: int = 16384
     # chunked prefill时单个请求每步最多prefill多少token；0表示不限制（只受max_num_batched_tokens约束）
-    #   调小可以让长prefill和decode更均匀地穿插，降低decode的ITL
+    #   调小可以让多个prefill请求分摊每步预算，避免一条长prompt独占；它本身不会让decode插进来（见文件上方总览表的注①）
     long_prefill_token_threshold: int = 0
     # MLA注意力内部做chunked prefill时的token预算（第7批）
     #   具体是：prefill时若"已缓存的前缀"（前缀缓存命中的部分或前面chunk已算的部分）超过这个token数，
@@ -326,8 +336,9 @@ class EngineArgs:
     enable_decoder_swa_bounded_replay: bool = True
     enable_encoder_swa_bounded_replay: bool = True
     # chunked prefill：长prompt放不进单步预算时切成多块，分多个step算完
-    # 【科普】不切的话，一条很长的prompt要独占一整个step，期间所有decode请求都停下等它（ITL出现尖峰）；
-    #   切开后每步只算一块，剩余预算留给decode。
+    # 【科普】不切的话，一条超过单步预算（max_num_batched_tokens）的prompt放不进任何一步，会被拒绝；
+    #   切开后分多步算完，每步的激活显存都受预算约束。注意ATOM一步只做prefill或只做decode、不混合，且没算完的
+    #   prefill下一步优先续算，所以decode仍要等全部chunk做完（见文件上方总览表的注①）。
     #   例：max_num_batched_tokens=16384、一条40000 token的prompt，大约分3步：16384 + 16384 + 7232。
     #   切分逻辑在 model_engine/scheduler.py
     enable_chunked_prefill: bool = True
@@ -372,7 +383,8 @@ class EngineArgs:
     # ---------------- 编译与CUDA Graph（第5批） ----------------
     # 适用场景/调优建议（各cudagraph_mode、各level的完整适用场景表见config.py CUDAGraphMode / CompilationLevel上方）：
     #   开发调试：--enforce-eager（不录图）或 --level 0（不编译），启动快，便于加日志
-    #   生产默认：--level 3 --cudagraph-mode FULL；DeepSeek-V4.1只能FULL；DSpark用PIECEWISE（V4可用AF_PIECEWISE）
+    #   生产默认：--level 3 --cudagraph-mode FULL；DeepSeek-V4.1在level 3下只能FULL（deepseek_v41/config.py的
+    #     validate_runtime_config会拒绝其他模式）；DSpark用PIECEWISE（V4可用AF_PIECEWISE）
     #   --cudagraph-capture-sizes：最大值不必超过max_num_seqs（超出的尺寸会被ModelRunner丢掉）；
     #     并发集中在某段时把那段列密一些，减少padding。例：recipes/Agentic-GLM-5.2.md用 [1,2,4,8,16,24,...,256]
     #     （16以后每隔8一档）；列表越长，启动录图越久、图占的显存越多
@@ -388,6 +400,8 @@ class EngineArgs:
     level: int = 3
     # CUDA Graph模式：NONE、FULL（整个forward捕获成一张graph，默认）、PIECEWISE（按编译切出的片段
     #   分别捕获，attention走eager，需要--level 3）、FULL_AND_PIECEWISE、AF_PIECEWISE（attention也单独捕获）
+    #   注意原生行为（按ModelRunner._piecewise_cg_active）：NONE并不关图，仍走手动FULL整图捕获，真正不录图只能用
+    #   --enforce-eager；FULL_AND_PIECEWISE等同PIECEWISE。各模式的实际行为表见config.py CUDAGraphMode上方
     cudagraph_mode: str = "FULL"
     # 用假权重代替读取checkpoint（只测性能/调试时用）：empty不初始化、zero全0、xavier随机初始化
     load_dummy: str | None = None
@@ -655,6 +669,7 @@ class EngineArgs:
         )
         # 【译·help】索引缓存类型。原生单节点DeepSeek-V4默认为'fp4'，但在gfx942（MI300系列）上默认为'fp8'；
         #   其他模型默认与--kv_cache_dtype相同。
+        #   （注：help没写全，V4插件模式/有KV传输时也是fp8、V4.1默认fp8，见上面EngineArgs.index_cache_dtype字段）
         parser.add_argument(
             "--index-cache-dtype",
             "--index_cache_dtype",
@@ -690,6 +705,7 @@ class EngineArgs:
         # 【译·help】CUDA graph运行模式。FULL = 手动捕获整个forward（默认，原有行为）。
         #   PIECEWISE = 按片段捕获cudagraph，attention走eager（需要--level 3）。
         #   AF_PIECEWISE = 在PIECEWISE的基础上，attention核心也用零拷贝缓冲区单独捕获成一张cudagraph（DeepSeek-V4 DSpark）。
+        #   （注：help没说NONE和FULL_AND_PIECEWISE；原生下它们分别等同FULL、PIECEWISE，见上面EngineArgs.cudagraph_mode字段）
         parser.add_argument(
             "--cudagraph-mode",
             type=str,
@@ -868,6 +884,7 @@ class EngineArgs:
         )
         # 【译·help】chunked prefill时，把单个请求每步的prefill量限制在这么多token。0表示不限制
         #   （请求只受max_num_batched_tokens约束）。可让长prefill与decode交错，降低ITL。
+        #   （注：ATOM基础调度器不在同一步混合prefill和decode，单靠它不会交错，见文件上方总览表的注①）
         parser.add_argument(
             "--long-prefill-token-threshold",
             type=int,
