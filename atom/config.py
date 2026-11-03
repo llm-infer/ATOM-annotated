@@ -241,8 +241,8 @@ class KVCacheConfig:
 #
 # 适用场景（原生模式；命令行默认FULL；"实际行为"按ModelRunner._piecewise_cg_active/capture_cudagraph核实）：
 #   模式                实际行为（原生）                          什么时候选                             好处 / 代价
-#   NONE                与FULL相同：走手动整图捕获                几乎不用；想真正关图请用--enforce-eager    —（原生路径不认NONE；vLLM插件和
-#                       （ModelRunner不单独判断NONE）                                                     backends.py的copy_inputs分支才看它）
+#   NONE                与FULL相同：走手动整图捕获                几乎不用；想真正关图请用--enforce-eager    —（原生ModelRunner不认NONE；只有
+#                       （ModelRunner不单独判断NONE）                                                     backends.py的copy_inputs分支看它）
 #   FULL                decode按capture_sizes录整张forward图      默认；多数模型的标准选择；                 好处：CPU launch开销最低，一次回放
 #                       prefill/混合batch走eager                  DeepSeek-V4.1必须用它（Engram stream       代价：attention kernel必须可录制；
 #                                                                 fork/join要求整图），recipe里多数是FULL     超过最大capture size的batch退回eager
@@ -349,12 +349,16 @@ class CUDAGraphMode(enum.Enum):
 #
 # 适用场景：
 #   --level  什么时候选                                   好处                                代价
-#   0        排查"是不是编译导致的"数值/崩溃问题；           启动最快，没有Dynamo追踪的限制          没有算子融合；PIECEWISE类cudagraph用不了
-#            小模型做功能验证（如recipes/Qwen3-8B-FP8.md）
+#   0        排查"是不是编译导致的"数值/崩溃问题；           启动最快，没有Dynamo追踪的限制          没有算子融合；没有编译片段，选PIECEWISE类模式
+#            小模型做功能验证（如recipes/Qwen3-8B-FP8.md）                                           时等于不录图（据代码推断：手动整图捕获被关掉、
+#                                                                                                    又没有片段wrapper）
 #   1        只想确认模型能被Dynamo完整抓图                 能暴露graph break                      backend="eager"不生成新kernel，几乎没有加速
-#   2        需要编译、但不需要分段（例如只用FULL整图）       Dynamo只追踪一次，之后不走guard检查      不切图，所以同样不能配PIECEWISE类模式
+#   2        少见；同样经VllmBackend编译（按标了spliting_op   Dynamo只追踪一次，之后不走guard检查      Config只在level 3才设置splitting_ops、
+#            的注意力算子切图），但跳过Config的level 3设置                                            compile_sizes和cudagraph_mode默认值（第8步）
 #   3        生产默认                                       分段编译 + 允许任意cudagraph_mode        首次启动编译慢（之后读/root/.cache/atom/）；
 #                                                                                                    改代码后必须清缓存（CLAUDE.md）
+#   另：EAGLE3草稿、以及带独立--draft-model的DSpark草稿，会把自己那份config浅拷贝后把level改成0
+#     （eagle_proposer.py、dspark_proposer.py的_build_draft_model），所以草稿模型不受--level影响
 # 例：--level 0 --cudagraph-mode FULL 是合法组合：不编译，但decode仍录整图（FULL录图不依赖编译）
 class CompilationLevel:
     # constants for the levels of the compilation process
