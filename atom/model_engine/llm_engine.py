@@ -38,7 +38,8 @@ logger = logging.getLogger("atom")
 #   __init__第3步（TBO/PCP等兼容性检查）和get_*_statistics都是分支，第一遍可跳过。下游接着读engine_core_mgr.py → engine_core.py
 # 前置概念：TP/DP/PP/DCP等并行方式见第1批arg_utils.py"并行"一段；prefill/decode、continuous batching（连续批处理）、
 #   延迟输出的原理见engine_core.py文件开头的【1】~【3】；CUDA Graph见config.py里CUDAGraphMode上方的【科普】；
-#   DP-attention / EP / MLA见engine_core_mgr.py CoreManager.__init__第2步的【科普】
+#   DP-attention / EP / MLA见engine_core_mgr.py CoreManager.__init__第2步的【科普】；集合通信与进程组见engine_core_mgr.py
+#   _start_distributed_store的【科普】（__init__第3步的兼容性检查要用到，要点写在第3步的术语表里）
 #
 # 一个请求的完整生命周期（单机、DP=1、TP=2为例；箭头上标的是传输方式）：
 #
@@ -206,6 +207,11 @@ class LLMEngine:
         #   乘以原TP（见engine_core_mgr.py）；这里记录的是那之前的值
         # ---------- 3. 跨特性兼容性检查（TBO / PCP / PP / DP-attention），均为分支，见第9批 ----------
         # 术语（第一遍可以跳过整个第3步）：
+        #   集合通信                 all-reduce / all-gather / reduce-scatter / all-to-all这类"一组rank一起完成"的通信
+        #                            （nano-vllm里TP的dist.all_reduce就是一例）：组里每个rank都要以相同顺序调用同样的操作，
+        #                            有一个rank顺序不同或没调用，其他rank就永远等着——下面TBO相关的两处"卡死"都源于此
+        #                            （进程组见engine_core_mgr.py _start_distributed_store的【科普】，为什么会挂死见
+        #                            engine_core.py文件开头【4】）
         #   TBO（two-batch overlap） 把一个batch拆成两个微batch（ubatch）交替执行，让一个的通信与另一个的计算重叠
         #                            （详见utils/envs.py"科普·TBO"）
         #   PCP（prefill上下文并行） prefill时把一条长prompt的token切到多张卡上各算一段（详见utils/envs.py"科普·PCP"）
@@ -719,7 +725,12 @@ class LLMEngine:
 
     # 前缀缓存命中统计，跨DP rank聚合；调用方：api_server的/debug/cache_stats接口
     #   各计数器的定义见engine_stats.py的EngineStats（缓存部分细节见第4批）
-    #   前缀缓存是什么见utils/envs.py"科普·前缀缓存"；下面的"CPU offload层"（offload_tokens）见arg_utils.py"【科普】KV offload"
+    #   前缀缓存是什么见sequence.py Sequence类上方"科普：前缀缓存"；下面的"CPU offload层"（offload_tokens）见arg_utils.py"【科普】KV offload"
+    #   读懂这些比率还要知道状态checkpoint：有"每请求状态"的模型（GDN / KDA线性注意力、DeepSeek-V4的滑窗等）命中前缀时KV行还在，
+    #     但"第N个token时的状态"只有事先存过快照（状态checkpoint，默认每8192个token一个）的位置才能恢复。
+    #     例：KV池按hash链命中18432个token（compressed），状态只能从16384恢复（cached）；若每个block边界都有checkpoint本可以
+    #     从18432恢复（wanted），差的2048个token就记进lost_to_checkpoint。要点见scheduler.py文件开头【前置⑤】，
+    #     完整讲解见arg_utils.py state_checkpoint_interval_tokens上方的【科普】
     def get_cache_statistics(self, timeout: float = 30.0) -> dict[str, Any]:
         """Return aggregated prefix-cache statistics across DP ranks.
 

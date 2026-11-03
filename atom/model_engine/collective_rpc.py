@@ -26,6 +26,10 @@ from dataclasses import dataclass
 #   engine_core_mgr.py（CoreManager端按request_id路由回复、计算引擎侧时间预算）
 # 与主干的关系：主干的forward走call_func（只回rank 0、不带request_id）；集合RPC是旁路，
 #   给RL rollout等外部调用方"在每个TP rank上调一个方法并拿回每个rank的结果"，见第10批
+# 名字辨析：这里的"集合"（collective）只是说"发给每个rank、收齐每个rank的结果"，不是RCCL那种求和 / 拼接张量的集合通信
+#   （集合通信与进程组见engine_core_mgr.py _start_distributed_store的【科普】）。RpcPayload.barrier=True时，同一个engine的
+#   各worker进程执行完后在一个multiprocessing.Barrier上互相等齐（例：-tp 8时8个worker都读完同一块共享内存里的权重桶才各自返回）
+# RL rollout是什么、为什么要在每个rank上换权重：见engine_utility.py文件头【前置】RL训练里的rollout引擎
 
 # The utility-command name the dispatch layer registers. Shared so the manager
 # that sends it and the handler that receives it cannot drift apart.

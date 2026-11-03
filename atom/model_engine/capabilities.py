@@ -45,6 +45,9 @@ from dataclasses import dataclass, field
 # 调用方：rollout/async_engine.py 的 get_capabilities（经collective_rpc("get_worker_capabilities")收集每个rank，
 #   再用 EngineCapabilities.from_workers 汇总）；worker一侧的回答在 rollout/capabilities.py（ModelRunner的mixin）
 # 与主干的关系：不在推理主路径上；是【分支】RL rollout对接外部训练框架时的协商接口，见第10批
+# 前置：LumenRL是用ATOM做rollout（RL训练中"用当前权重生成样本"那一步）的外部RL训练框架，rollout是什么见
+#   engine_utility.py文件头【前置】；docstring说"只在部分rank上有的特性会让整个组死锁"，是因为集合操作要求组内
+#   每个rank都到场，少一个其余rank就一直等（见engine_core.py文件开头【4】）
 
 # Bump when the collective-RPC wire contract changes incompatibly. A consumer
 # that pins a version can refuse to negotiate rather than fail mid-collective.

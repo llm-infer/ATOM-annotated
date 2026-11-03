@@ -50,6 +50,14 @@ Phase 2 (weight sharing):
 #   每个张量只传几十字节的句柄和形状信息，不拷贝数据；一边写入、另一边就能读到（何时写完要靠消息告知，RapidServe用PrefillDone）。
 #   每个TP rank各自导出/导入自己那张卡上的显存（见上面"调用方"）
 #
+# 【前置】meta设备（下文导入权重时反复说"留在meta上"）
+#   torch.device("meta")是PyTorch的虚拟设备：张量只记shape和dtype，不分配任何内存，也不能参与真正的计算。
+#   例：一个[8192, 8192]的bf16权重在GPU上占 8192×8192×2B = 128MiB，在meta上占0字节。
+#   RapidServe的decode进程用它"搭空架子"：构造模型时把每个nn.Parameter都换成meta张量（buffer如RoPE缓存仍真实分配；
+#   model_runner.py RapidServeModelRunner._init_weight_params_on_meta），于是decode不占权重显存；
+#   随后import_model_weights把每个参数换成指向prefill显存的IPC视图。漏换的参数仍在meta上，forward用到它就会出错——
+#   所以import_model_weights末尾要检查"还有谁留在meta上"
+#
 # 为什么同机PD分离要共享显存，而不是各自加载一份：
 #   权重：例如一个70B模型的bf16权重约140GB，TP=8时每张卡约17.5GB；prefill、decode两个进程各放一份就是35GB/卡，
 #     多出来的17.5GB全部要从KV cache预算里扣掉，直接减少能同时服务的请求数
@@ -159,7 +167,8 @@ def import_kv_cache(meta: dict) -> torch.Tensor:
 # 导出模型的所有权重张量：参数、注册的buffer、以及模块上的普通张量属性
 # 输出：{"__param__名字" / "__buf__名字" / "__attr__模块.属性": 元数据dict}，前缀告诉导入端该放回哪里
 # docstring里的"MLA权重吸收"：MLA（DeepSeek-V2/V3等的注意力）的KV cache每token只存一个所有头共享的低维latent向量
-#   （图解见engine_core_mgr.py CoreManager.__init__第2步的【科普】）。加载后process_weights_after_loading把kv_b_proj
+#   （为什么相当于只有1个KV头见engine_core_mgr.py CoreManager.__init__第2步【科普】③；MLA与权重吸收的完整推导见
+#   arg_utils.py tensor_parallel_size下方的【科普】MLA、model_config/kimi_k25.py文件头【科普】文本部分）。加载后process_weights_after_loading把kv_b_proj
 #   （latent -> 每头K/V的上投影）拆成W_K、W_V（及其scale）另存为普通属性，decode时把W_K并到query一侧、W_V并到输出一侧，
 #   直接在latent空间里算注意力，不必把latent展开成每头完整的K/V（见第7批model_ops/attention_mla.py）
 def export_model_weight_handles(model: nn.Module) -> dict:
@@ -212,7 +221,7 @@ def export_model_weight_handles(model: nn.Module) -> dict:
 
 
 # decode端：用prefill显存上的视图替换本进程模型的参数/buffer/属性
-#   RapidServe的decode模型一开始就建在meta设备上（PyTorch的虚拟设备：张量只有形状和dtype，不分配显存；
+#   RapidServe的decode模型的参数一开始就建在meta设备上（meta是什么见文件头【前置】meta设备；
 #   见model_runner.py的RapidServeModelRunner._build_and_load_model），所以docstring说的"释放原来的权重"在v0.1.8里其实无可释放
 def import_model_weights(model: nn.Module, handles: dict) -> None:
     """Replace model parameters with views into another process's GPU allocation.

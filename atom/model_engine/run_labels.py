@@ -62,6 +62,11 @@ if TYPE_CHECKING:
 # 【导读】为每次forward生成profiler里的区段名（例如 "decode[bs=117/128 tok=117 d=117]"）
 # 调用方：ModelRunner在run_model时用它给torch.profiler.record_function命名（model_runner.py，第5批）
 # 与主干的关系：纯字符串函数，不影响计算；每次forward都会构建，但只在开了profiler（start_profile）抓trace时才有意义
+# 读标签要用到的两个前置：
+#   dummy_decode / dummy_eager_decode：DP>1时没活的rank每步陪跑的1个token假批（开MTP时k+1个；锁步，见engine_core.py
+#     DPEngineCoreProc类上方）；dummy_prefill是启动预热。它们都单独打标签、不混进prefill / decode的统计
+#   bs=117/128：真实117条，回放的是按128档捕获的CUDA Graph——Graph只按固定的batch档位捕获，不足的行补齐到最近的档位
+#     （见config.py CUDAGraphMode上方的【科普】）
 
 
 # 按上面的分类法拼出一次forward的标签字符串

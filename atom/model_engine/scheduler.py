@@ -209,7 +209,8 @@ if TYPE_CHECKING:
 #     各存一份：-dcp 4时token t的KV只在第t % 4张卡上，每卡只存1/4。于是一个block_table条目对应block_size × DCP = 16 × 4 = 64个
 #     全局token（4张卡在同一个block id里各放自己那16个，dcp_ops.dcp_prefill_slot_mapping），前缀hash也按64个token一块算
 #     （hash_block_size），而KV池按每卡的本地block数计
-#   【前置⑦】DP-attention与DP锁步（完整讲解：arg_utils.py enable_dp_attention字段上方；engine_core.py DPEngineCoreProc类上方）
+#   【前置⑦】DP-attention与DP锁步（完整讲解：DP-attention见 engine_core_mgr.py CoreManager.__init__ 第2步的【科普】（五步讲清）；
+#     DP锁步与dummy batch见 engine_core.py DPEngineCoreProc类上方）
 #     DP>1时每个DP rank各有一个EngineCore和一个调度器，管自己的请求和KV。常见用法是MoE模型的 -tp 8 --enable-dp-attention
 #     （改写成8个DP rank × TP 1）：注意力各算各的，MoE层的专家却分在8张卡上，每层都要跨rank交换token（all_gather / all-to-all）。
 #     集合通信要求每个rank以同样次数调用，所以只要有一个rank有活，所有rank每步都要一起forward：没活的rank跑一个1个token的

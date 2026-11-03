@@ -31,6 +31,18 @@ logger = logging.getLogger("atom")
 #     代价是一条慢命令执行期间，这个DP rank停止调度
 #   另外：push_metrics / collect_metrics 由busy_loop定时调用，把指标快照主动推给CoreManager（METRICS消息）
 #
+# 本文件的组织（约1100行；按名字查找，行号会漂移）：
+#   ① 文件头：命令一览 → 【前置】RL训练里的rollout引擎 → 围栏协议（为什么、图解）→ 一次分bucket同步的时序图
+#     → 睡眠 / 唤醒状态图 → 适用场景
+#   ② 模块级：FIRE_AND_FORGET_UTILITY_CMDS / WEIGHT_UPDATE_UTILITY_CMDS、completes_weight_sync、_ReplyQueue（给回复盖request_id）
+#   ③ class EngineUtilityHandler：_UTILITY_HANDLERS分派表 → process_queue（围栏 / 睡眠标志的状态机，busy_loop的入口）
+#     → _execute_utility_command → _handle_collective_rpc（集合RPC）→ 【分支】RL权重同步与显存管理（_begin_weight_sync ~
+#     _handle_clear_kv_cache）→ abort / hidden states / profile / MTP与缓存统计 → push_metrics / collect_metrics（定时指标推送）
+# 建议阅读顺序：命令一览 → process_queue → _execute_utility_command → _handle_abort_request（在线服务最常用的一条）；
+#   对接RL时再读【前置】、围栏协议、两张图和RL分支
+# 前置概念：工具命令怎么从CoreManager到达这里见engine_core_mgr.py文件开头的拓扑图；集合RPC的线路类型见collective_rpc.py；
+#   RL rollout见下面的【前置】
+#
 # 命令一览：
 #   get_mtp_stats / get_mtp_statistics      投机解码统计（前者只打日志、不回复）
 #   get_cache_statistics                    前缀缓存统计
@@ -42,6 +54,20 @@ logger = logging.getLogger("atom")
 #   release_memory / resume_memory / clear_kv_cache           显存释放、恢复，清空KV cache
 #   update_weights / update_weights_shm / update_weights_ipc  权重热更新（直接传张量 / POSIX共享内存 / CUDA IPC）
 #   discard_failed_weight_sync / finish_weight_sync / get_weight_sync_status  权重同步的放弃、提交、状态查询
+#
+# 【前置】RL训练里的rollout引擎——读下面的权重同步、睡眠 / 唤醒之前要知道的（第10批rollout/的入口概念）
+#   用强化学习（RLHF、GRPO等）微调一个LLM时，每一轮迭代是"生成 → 打分 → 训练"：
+#
+#       ┌─► ① rollout：用当前权重θ_k的模型，对一批prompt各采样若干条回答（纯推理，交给ATOM这样的推理引擎）
+#       │   ② 打分：奖励模型或规则给每条回答一个reward
+#       │   ③ 训练：外部训练框架（如capabilities.py里提到的LumenRL）按reward算梯度，把θ_k更新成θ_{k+1}
+#       └── ④ 权重同步：把θ_{k+1}推回推理引擎；下一轮rollout必须用新权重生成（PPO / GRPO这类on-policy算法要求样本来自当前策略）
+#
+#   "rollout引擎"就是第①步里负责生成的推理引擎，这里就是ATOM。和在线服务相比，它多出三个需求：
+#     · 每轮都要换一次全部权重，且不能重启进程（重启要重新加载权重、重新捕获CUDA Graph，分钟级）→ update_weights*（热更新）
+#     · 训练和推理常共用同一批GPU：训练时推理引擎要把权重 / KV占的显存让出来 → release_memory / resume_memory（睡眠 / 唤醒）
+#     · 每条回答必须明确是哪一版θ生成的，不能来自"半新半旧"的权重 → 下面的围栏协议
+#   例：70GB的FP8权重每轮都要推一遍，按默认2048MiB一桶要33个bucket（算法见下面"一次分bucket的权重同步"）
 #
 # 权重同步的"围栏（fence）"协议：
 #   收到任何 update_weights*：置fenced → busy_loop不再调度（EngineCore._is_idle_rl_weights_offloaded；
