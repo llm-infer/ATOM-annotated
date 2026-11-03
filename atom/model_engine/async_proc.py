@@ -143,6 +143,50 @@ logger = logging.getLogger("atom")
 #     而真正新增的内容只有约50个id
 #   为什么只有rank 0回传：EngineCore的postprocess只需要一份ScheduledBatchOutput，rank 0代表全组回传；
 #     需要确认"每个rank都做完了"的调用才走逐rank的集合RPC通道
+#
+# 四种调用方式对照（都经同一个MessageQueue下发，区别只在"谁回复、走哪条回程、调用方怎么等"）：
+#   ┌────────────────────────────┬────────────────┬─────────────────────┬──────────────────────────────────────────┐
+#   │ 调用方式                    │ 谁回复          │ 回程通道             │ 典型调用                                  │
+#   ├────────────────────────────┼────────────────┼─────────────────────┼──────────────────────────────────────────┤
+#   │ call_func(wait_out=False)  │ 没人（返回None）│ —                   │ process_kvconnector_output、            │
+#   │                            │                │                     │ release_multimodal_requests、            │
+#   │                            │                │                     │ poll_forward_metrics、exit               │
+#   │ call_func(wait_out=True)   │ 只有rank 0      │ 主通道 → outputs_queue│ forward、get_num_blocks、capture_cudagraph│
+#   │                            │                │ （阻塞，无超时）      │ dummy_execution、start/stop_profiler      │
+#   │ call_func_with_aggregation │ 每个rank        │ KV通道[r]（非阻塞，   │ async_proc_aggregation（KV传输完成状态）  │
+#   │                            │                │ 缺rank时返回None）    │                                          │
+#   │ collective_rpc/utility_rpc │ 每个rank        │ RPC通道[r]（有超时，  │ RL的权重更新、release/resume_memory、     │
+#   │                            │ （RpcResult）   │ 按rank收齐）          │ clear_kv_cache、白名单worker方法          │
+#   └────────────────────────────┴────────────────┴─────────────────────┴──────────────────────────────────────────┘
+#
+# 多步流水（TP=2，开延迟输出时；见engine_core.py文件开头【3】）：call_func("forward")在GPU还在跑本步时就返回，
+#   于是EngineCore可以在GPU执行第N步期间把第N步之后的旁路指令和第N+1步的forward继续写进MessageQueue：
+#
+#   EngineCore  │enq fwd N│等N-1的token│post N-1│sched N+1│enq fwd N+1│等N的token│post N│...
+#   MessageQueue│ [fwd N]                         [fwd N+1]          ← 环形缓冲区里可同时躺着几条未被读完的指令
+#   TP0  CPU    │   deq → launch N → 等N-1的D2H → 回传 │ deq → launch N+1 → 等N的D2H → 回传 │
+#   TP1  CPU    │   deq → launch N ───────────────────│ deq → launch N+1 ──────────────────│（不回传）
+#   TP0/1 GPU   │ ════ forward N（每层all-reduce经RCCL会合）════│════ forward N+1 ════│
+#   要点：两个rank各自launch，但GPU上的all-reduce把它们对齐；只要CPU侧每步的"出队+launch"比GPU一步短，GPU就不会空等
+#
+# 共享内存广播 vs 每个rank一条ZMQ socket：
+#   好处：① 一次pickle、一次写入，N个rank都能读到（ZMQ要发N份，或者至少N次内核收发）；
+#     ② 天然全序：所有rank按同一顺序拿到同样的指令（SPMD的前提，见下面"设计原理"）；
+#     ③ 读者轮询共享内存里的标志位即可取到，不经内核、不需要被唤醒，decode这种10ms量级的step上省下的是关键路径上的时间
+#   代价：① 读者忙轮询（按vLLM原版的实现：自旋并让出CPU），每个worker进程即使空闲也会占着CPU时间；
+#     ② 每条消息受max_chunk_bytes（这里16MiB）约束，环形缓冲区的块数也是固定的（vLLM原版默认10块，aiter移植版以其源码为准），
+#       写者在所有读者读完最旧那块之前不能覆盖它，所以一个卡住的rank会让enqueue也停下来；
+#     ③ 只能在同一台机器内使用：跨节点的reader要另走socket（这里n_local_reader=proc_num，所有worker都在本机）；
+#     ④ 回程仍然要ZMQ：共享内存只解决"一写多读"的下发，结果回传是"多写一读"，用PUSH/PULL更简单
+#
+# 适用场景（同一套代码，不同部署下的形态）：
+#   TP=1          proc_num=1：仍然是一个独立的worker进程和只有1个读者的MessageQueue。比nano-vllm（rank 0在主进程里）
+#                 多一跳IPC，换来的是调度和kernel发射不抢同一个GIL，以及worker崩溃时EngineCore能感知并干净退出
+#   TP>1          proc_num=TP：所有rank对称，都是EngineCore的子进程；rank 0只多一条主回程
+#   PCP>1         proc_num=TP×PCP：PCP的rank也是同一个manager下的worker，同样走这一个MessageQueue
+#   PP>1          每个stage是独立的EngineCore，各有自己的AsyncIOProcManager（进程数不乘PP）；stage之间的激活传递
+#                 走pp_transport.py，不经过这里
+#   DP>1          每个DP rank是独立的EngineCore + 独立的manager；DP rank之间的锁步由engine_core.py的DPEngineCoreProc处理
 
 
 # 【分支】KV聚合的"在途记录"，只在PD分离/KV offload时使用，见第9批

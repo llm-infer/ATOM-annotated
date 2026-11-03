@@ -209,6 +209,52 @@ class EngineCore:
     #   ④ CUDA Graph在KV分配之后捕获：graph里记录的是kernel参数中的显存地址，KV cache必须已经在它最终的地址上；
     #     graph私有内存池占的显存已经在②里用_estimate_cudagraph_overhead预留
     #   ⑤ 最后冻结GC（_freeze_after_startup）：启动期要活一辈子的对象此时都已建好，见gc_utils.py
+    #
+    # 启动流程图（单DP、非PD分离；每一格右边是"在哪个进程里做"）：
+    #   ┌───────────────────────────────────────────────┐
+    #   │ 启动输出线程、输入线程（握手空帧尽早发出）       │ EngineCore
+    #   │ init_exit_handler / _init_data_parallel        │ EngineCore（DP>1时在这里等所有DP rank会合）
+    #   └───────────────────────┬───────────────────────┘
+    #                           ▼
+    #   ┌───────────────────────────────────────────────┐
+    #   │ AsyncIOProcManager：spawn tp×pcp 个worker      │ 每个worker进程里：ModelRunner.__init__
+    #   │   load_model → _maybe_warmup（假prefill，        │   = 初始化RCCL → 加载本rank的权重分片
+    #   │   记下激活峰值）                                 │   → warmup测峰值
+    #   └───────────────────────┬───────────────────────┘
+    #                           ▼
+    #   _post_model_load_hook（基类空；RapidServe在这里交换权重IPC句柄）
+    #                           ▼
+    #   ┌───────────────────────────────────────────────┐
+    #   │ call_func("get_num_blocks")  → num_blocks      │ 只取rank 0的返回值
+    #   │ call_func("allocate_kv_cache", num_blocks)     │ 每个rank分配自己的那份KV
+    #   │ config.num_kvcache_blocks = num_blocks（回填）  │ EngineCore
+    #   └───────────────────────┬───────────────────────┘
+    #                           ▼
+    #   enable_dynamic_chunking？ ── 是 ──> call_func("profile_dynamic_chunking")（失败则关掉该特性）
+    #                           ▼
+    #   enforce_eager 或 本进程是PD分离的decode？ ── 否 ──> call_func("capture_cudagraph")
+    #                           │ 是：跳过（decode要等KV导入后在DecodeEngineCore.__init__里再捕获）
+    #                           ▼
+    #   Scheduler(config)（BlockManager按num_kvcache_blocks建block池） → 按需挂PrefillDelayer
+    #                           ▼
+    #   EngineUtilityHandler → _freeze_after_startup（本进程 + 每个worker都gc.freeze）
+    #                           ▼
+    #   _send_ready_signal：("READY", {"max_pool_tokens": ...}) ──输出线程──> CoreManager.__init__ 放行
+    #   任一步抛异常：finally里good=False → self._finalizer() → exit()，异常继续抛给run_engine
+    #
+    # 显存预算条（get_num_blocks的公式，model_runner.py；数字沿用上面②的例子：192GB的卡、util=0.9、
+    #   非PIECEWISE模式时graph池按"激活峰值×0.2"估计）：
+    #
+    #   0                                                                                        192GB（total）
+    #   ├─────── 权重 70 ───────┼激活峰值 8┼非torch≈2┼graph≈1.6┼余量3.8┼──────── KV cache ≈87 ────────┼不进预算 19.2┤
+    #   │◄──────── peak_torch（= max(peak, current)）──────►│         │        │                              │
+    #   │◄──────────────────────── budget = total × gpu_memory_utilization = 172.8GB ──────────────►│
+    #     非torch：RCCL/custom all-reduce缓冲等不经PyTorch分配器的显存 = (total−free) − memory_reserved()
+    #     graph：_estimate_cudagraph_overhead（enforce_eager时为0；PIECEWISE时按逐token字节数×捕获的token总数估计，上限约预算的15%）
+    #     余量：total × 2%；RapidServe再多扣 _kv_budget_extra_reserve = 4×2% = 8%；KV connector缓冲（若有）也先扣掉
+    #     最终 available_for_kv = min(上面算出的值, 实际空闲显存 − connector缓冲)，再交给plan_pools按各子池切分成block
+    #   读法：gpu_memory_utilization每调高0.01，在这张卡上就多出约1.9GB的KV（约760个2.5MB的block、约1.2万个token）；
+    #     调得太高的代价是分配器碎片、其他进程或之后的临时分配没有余地，运行中OOM
     def __init__(self, config: Config, input_address: str, output_address: str):
         self.label = "Engine Core"
         # input_queue：输入线程放入、busy_loop取出的新请求；每个元素是一个ADD帧带来的一批Sequence
@@ -371,6 +417,14 @@ class EngineCore:
             #   graph把整步录下来，之后一次replay就发射全部kernel。prefill的kernel大、形状多变，launch开销可以忽略
             #   捕获按config.capture_sizes从大到小进行（ModelRunner.capture_cudagraph里sort(reverse=True)）；运行时把实际
             #   batch大小向上取到最近的已捕获尺寸再replay（多出来的行是padding）
+            #
+            # 什么时候用 --enforce-eager（跳过这里的capture）：
+            #   适用场景：① 调试——kernel在graph里replay时出错很难定位，eager下能逐个kernel同步、打断点；
+            #     ② 想要更快的启动——捕获要对每个capture size各跑一遍forward（耗时见上面日志里的cap_cost，大模型常是几十秒）；
+            #     ③ 显存很紧——graph池（_estimate_cudagraph_overhead估计的那部分）可以全部让给KV cache；
+            #     ④ 只做prefill的进程——PrefillEngineCore强制eager，因为prefill的kernel大、launch开销占比小（见上面"为什么"）
+            #   代价：decode每一步都要由CPU逐个launch上千个kernel，batch越小越明显（GPU时间短，CPU发射时间占比大），ITL上升、吞吐下降
+            #   注意：enforce_eager只关掉CUDA Graph，torch.compile的级别由 --level 单独决定（CLAUDE.md："--level 0=eager"才是不编译）
             if not config.enforce_eager and not config.disagg_is_decode:
                 cap_cost, bs, pool_bytes = self.runner_mgr.call_func(
                     "capture_cudagraph", wait_out=True
@@ -782,6 +836,27 @@ class EngineCore:
     #   ⑥ scheduler.postprocess()：把token追加进序列、判断结束、释放block，产出流式增量和已结束序列（第3批）
     #   ⑦ 流式增量 -> output_queue（("STREAM", ...)），已结束的序列 -> output_queue（先STREAM后结束序列）
     # 对比nano-vllm：对应nano-vllm的LLMEngine.step()：schedule -> model_runner.call("run") -> postprocess
+    # 决策流程（与下面的代码一一对应）：
+    #   result = scheduler.schedule()
+    #   take_rejected()非空？ ── 是 ──> 释放其多模态缓存，作为"已结束"序列放进output_queue（不论本步有没有batch）
+    #            │
+    #   result为None 或 scheduled_batch为None？ ── 是 ──> _advance_idle_kv_transfer()；return False
+    #            │ 否
+    #   开了KV传输 且 batch带connector元数据？ ── 是 ──> call_func("process_kvconnector_output", meta)（不等待）
+    #            │
+    #   batch.req_ids非空？ ── 否 ───────────────────────────┐
+    #            │ 是                                         │
+    #   记指标 → call_func("forward", batch, wait_out=True)   │
+    #   有PrefillDelayer且本批含prefill？ 是 -> notify_prefill_executed()
+    #            │                                            │
+    #            ▼◄───────────────────────────────────────────┘
+    #   _poll_kv_transfer_progress()（未开KV传输时立即返回）
+    #            │
+    #   batch为空？ ── 是 ──> return False（不做postprocess）
+    #            │ 否
+    #   postprocess(seqs, fwd_out) ──► stream_output_queue里的每份增量 ──► ("STREAM", ...) ──► output_queue
+    #   finished_seqs非空？ 是 -> 释放多模态缓存 ──► output_queue.put(finished_seqs)（一定排在STREAM之后）
+    #   return True
     def _process_engine_step_inner(self):
         result = self.scheduler.schedule()
 
@@ -1519,6 +1594,50 @@ class DPEngineCoreProc(EngineCore):
 # 原理：prefill计算受限、decode带宽受限（见文件开头【2】），放在同一个step循环里会互相干扰——一次长prefill让所有decode停顿。
 #   RapidServe把两者拆成两个EngineCore进程，在同一组GPU上并发运行：各自用一个按CU屏蔽（CU mask）的stream池，
 #   分到不同的计算单元上；权重和KV cache通过CUDA IPC共用同一份显存（prefill直接写decode要读的KV缓冲区），不用拷贝KV
+#
+# 进程与通道（同一组GPU上的两个EngineCore；地址由DisaggCoreManager.__init__预先生成，写进两份deepcopy的config）：
+#
+#   DisaggCoreManager ──ADD（同一批seq，扇出给两边）──┬──────────────────────────────┐
+#                                                     ▼                              ▼
+#   ┌───────────── PrefillEngineCore（engine 0）─────────────┐      ┌───────────── DecodeEngineCore（engine 1）─────────────┐
+#   │ PrefillScheduler：没有BlockManager                      │      │ DecodeScheduler：拥有BlockManager                      │
+#   │ RapidServeModelRunner.prefill_forward（强制eager）       │      │ RapidServeModelRunner.forward（CUDA Graph）            │
+#   │ 拥有真正的权重和KV cache显存                            │      │ 权重和KV cache都是从prefill导入的IPC视图                │
+#   └──────────────────────────────────────────────────────────┘      └──────────────────────────────────────────────────────────┘
+#        PULL(bind d2p)  ◄══════ BlockAssignment / ABORT ═══════════  PUSH(connect d2p)
+#        PUSH(connect p2d) ═════ PrefillDone(第一个token) ══════════► PULL(bind p2d)
+#                                                                      输出线程 ──已结束序列/STREAM──► CoreManager（只有decode产出结果）
+#
+# 启动握手（两轮，都在各自READY之前）：
+#   Prefill                                                   Decode
+#   load_model（真实权重）                                     _build_and_load_model：参数建在meta设备上（不占显存）
+#   _post_model_load_hook：                                    _post_model_load_hook：
+#     export_model_weight_ipc_handles                            PULL connect weight_ipc，阻塞recv
+#     PUSH bind weight_ipc ──── 权重句柄文件路径 ────────────►   import_model_weight_ipc_handles（参数换成prefill显存的视图）
+#     PULL connect weight_ack，阻塞recv                          sleep(2) 等分配器回收
+#                         ◄──────────────── "ok" ──────────────  PUSH bind weight_ack
+#   get_num_blocks / allocate_kv_cache（显存只有一份权重）       get_num_blocks→0、allocate_kv_cache跳过（RapidServeModelRunner）
+#   _send_ready_signal：                                       （_ready_deferred：此时不发READY）
+#     export_kv_cache_ipc_handle                                 PULL connect kvcache_ipc，阻塞recv
+#     PUSH bind kvcache_ipc ── {句柄, num_kvcache_blocks} ───►   import_kv_cache_ipc_handle → 回填num_kvcache_blocks
+#     READY ──► CoreManager                                      capture_cudagraph → DecodeScheduler → gc.freeze → READY ──► CoreManager
+#   （上面DecodeEngineCore._post_model_load_hook的注释说decode"释放自己的那份权重"：v0.1.8的decode其实从未分配权重，
+#     参数一开始就在meta上，见model_runner.py的RapidServeModelRunner._build_and_load_model）
+#
+# 一个请求的时间线：
+#   decode：ADD到达 → extend → allocate_waiting分配block → BlockAssignment ──►
+#   prefill：ADD到达（进waiting）；收到BlockAssignment → _apply_pending_assignments填好block_table → schedule
+#            → prefill_forward（KV直接写进共享的KV池）→ PrefillDone(第一个token) ──►
+#   decode：on_prefill_done → 序列进running → 之后每步正常decode，流式输出和结束都由decode发给CoreManager
+#
+# 适用场景：同一台机器、同一组GPU，既要高吞吐又要稳定的ITL——长prompt的prefill不再插进decode的step里，
+#   decode的TPOT不会被几百ms的prefill打出尖峰（见文件开头【2】）
+# 好处：不需要跨节点KV传输（对比connector式PD分离，第9批）：KV只有一份、权重只有一份，零拷贝
+# 代价：① 两个进程争同一组GPU的算力：默认（disagg_constrained=False）只是各用独立的stream，互相抢占计算单元；
+#     disagg_constrained=True时才用按CU屏蔽的stream，并经一块4字节的共享内存交换decode的token数来动态划分CU，
+#     任何一侧都拿不到整卡算力；② prefill的KV预算要多留 4×2%=8% 余量（_kv_budget_extra_reserve）；
+#   ③ prefill一侧不用CUDA Graph，两侧都不挂PrefillDelayer（_init_prefill_delayer遇到enable_rapidserve直接返回）；
+#   ④ 启动多两轮握手（含decode侧固定的2秒sleep）
 
 
 # PrefillEngineCore：只做prefill的engine（DisaggCoreManager的engine 0）

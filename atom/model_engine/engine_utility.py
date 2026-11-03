@@ -51,6 +51,48 @@ logger = logging.getLogger("atom")
 #   混合模型，logits没有意义；而且RL需要知道每条rollout是哪个版本的策略生成的。DP>1时还要求所有engine一起切换，
 #   否则同一时刻不同rank上跑的是不同版本——所以本地成功也只能先停着，等CoreManager确认全体成功后统一放行
 # 对比nano-vllm：nano-vllm没有这一层（没有统计接口、profile、权重热更新）
+#
+# 一次分bucket的权重同步（atom/rollout/weight_sync.py的load_weights_via_shm，DP=2为例）：
+#   例：70GB的FP8权重、bucket_size_mb=2048（默认） → 约33个bucket（70e9 / 2^31 ≈ 32.6），前32个is_last=False，最后一个is_last=True
+#
+#   训练侧 / rollout（weight_sync.py）     CoreManager（engine_core_mgr.py）             EngineCore DP0 / DP1（本文件）
+#   with weight_sync_session():  ───────►  生成sync_id（uuid）
+#   打包bucket 1 进POSIX共享内存
+#   update_weights_shm(is_last=False) ──►  broadcast_utility_command_sync ──UTILITY──►  process_queue：
+#                                            （每个DP engine各一条，等全部回复）           置fenced（busy_loop停止调度）
+#                                                                                         sync_id是新的 → _begin_weight_sync
+#                                                                                         _update_on_every_rank：utility_rpc到每个TP rank，
+#                                                                                           barrier=True：所有rank读完同一块共享内存才继续
+#                                            ◄────────── UTILITY_RESPONSE（每个engine一条）
+#   ……bucket 2 … 32 同上（仍在围栏中，不服务）……
+#   update_weights_shm(is_last=True)  ──►  同上；所有engine都成功？
+#                                            ├─ 是 → FINISH(sync_id, completed_request_id) ──►  _handle_finish_weight_sync校验
+#                                            │                                                  sync_id/失败原因/awaiting_finish
+#                                            │                                                  → 解除fenced、清RL标志，恢复调度
+#                                            └─ 否（有engine报错或超时）→ DISCARD ──────────►  保持fenced，标记权重不一致，
+#                                                                                              各TP rank丢弃暂存
+#   要点：本地成功只是"候选"，必须等CoreManager确认每个DP engine都成功后由FINISH统一放行（见上面"为什么要围栏"）
+#
+# 睡眠 / 唤醒（AsyncLLMEngine.sleep / wake_up，atom/rollout/async_engine.py）与引擎标志：
+#
+#   sleep(level=1)：clear_kv_cache → release_memory(tags=["kv_cache"])          只放KV，权重还在 → 引擎标志不变
+#   sleep(level=2)：再加 release_memory(tags=["weights"]) ──► engine._is_rl_weights_offloaded = True
+#                                                              （部分rank释放失败也照样置True：宁可停服，不能半边模型）
+#        ┌────────────┐  release_memory(含weights)  ┌──────────────┐
+#        │   服务中    │ ──────────────────────────► │ 睡眠（offloaded）│ busy_loop每轮sleep 10ms，不调度
+#        └────────────┘ ◄────────────────────────── └──────────────┘
+#          ▲   resume_memory(含weights)成功 且 不在围栏中
+#          │                                              resume成功但仍在围栏中 → 权重回到显存，仍然不服务，
+#          │                                                等这次同步的FINISH（"保持服务关闭的是围栏，而不是驻留状态"）
+#          └────────────── finish_weight_sync 成功：同时清掉offloaded、fenced、inconsistent三个标志
+#
+# 适用场景：
+#   RL rollout（训练与推理共用同一批GPU）：一轮生成完 → sleep(level=2)把权重和KV的显存让给训练 → 训练出新权重
+#     → wake_up → load_weights（GPU上可用CUDA IPC，mode="auto"时有CUDA就选ipc，否则shm）→ 下一轮生成
+#   只更新权重、不让出显存：直接load_weights（不必sleep），围栏期间停止服务
+#   abort_request：客户端断开（openai api_server、atomesh服务里调用CoreManager.abort_request），尽快回收KV block
+#   get_cache_statistics / get_mtp_statistics：基准测试或客户端按需读计数器；start/stop_profile：抓torch profiler trace
+#   代价：所有命令都在busy_loop主线程里串行执行，一次权重更新（几十个bucket、每个都要所有TP rank读完）期间该DP rank完全不出token
 
 
 # Commands whose senders never wait, so their handlers answer nothing and a
@@ -811,6 +853,15 @@ class EngineUtilityHandler:
         #   running中：只把status改成ABORTED；下一次postprocess看到这个状态才把它以"aborted"结束并释放block
         # running不立刻释放的原因：它的block可能正被一次已经下发、尚未完成的forward读写（GPU是异步执行的），
         #   若马上把block分给别的请求，在途forward的写入就会覆盖新主人的KV；postprocess是forward结果已回收的安全点
+        # 流程图：
+        #   api_server（客户端断开）→ CoreManager.abort_request(req_id) → broadcast_utility_command（不等回复）
+        #     ══控制socket══► 每个DP rank的输入线程 → utility_queue → 下一轮busy_loop开头的process_queue → 这里
+        #                                  │
+        #                  Scheduler.abort_request(req_id)
+        #                  ├─ 在waiting里？ → 移出队列，标ABORTED → _rejected → take_rejected → 作为已结束序列发回
+        #                  ├─ 在running里？ → 只标ABORTED → 下一次postprocess以"aborted"结束它，释放block
+        #                  └─ 都不在（不在本DP rank、或已经结束）→ found=False，什么也不做
+        #   延迟：命令要等当前这一步的forward返回后才被处理，所以最多晚一个step（decode时约10ms量级）
         req_id = args.get("req_id") if isinstance(args, dict) else None
         if req_id is None or self.scheduler is None:
             return
