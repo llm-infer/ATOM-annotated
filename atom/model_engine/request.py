@@ -18,6 +18,46 @@ from typing import Any, Dict, List, Optional
 # 例：prompt后依次生成"Hello"" world""!"三个token（非投机、非延迟输出），回调大致收到三次：
 #   ([id_Hello], finished=False) -> ([id_world], False) -> ([id_!], True, finish_reason="eos"或"max_tokens")
 #   投机解码一步可能接受多个token，这时一次回调的output_tokens会有多个元素
+#
+# 时序图：一个在线流式请求的RequestOutput怎样回到客户端（已核对scheduler.py / engine_core.py /
+#   engine_core_mgr.py / api_server.py / streaming_dispatch.py）
+#
+#     客户端            api_server事件循环          CoreManager输出线程               EngineCore进程（调度器）
+#       │                     │                             │                               │
+#       │── POST(stream) ────>│                             │                               │
+#       │                     │ setup_streaming_request：   │                               │
+#       │                     │ preprocess(callback)        │                               │
+#       │                     │── add_request ─────────────>│                               │
+#       │                     │                             │ 回调存进_seq_id_to_           │
+#       │                     │                             │ callback，seq上置None         │
+#       │                     │                             │── (ADD,[seq]) ZMQ ───────────>│ scheduler.extend -> waiting
+#       │                     │                             │                               │ step k：prefill最后一个chunk
+#       │                     │                             │                               │ postprocess构造RequestOutput
+#       │                     │                             │<── (STREAM,[(id,out)]) ───────│ output_tokens=[t0]
+#       │                     │                             │ 查表调回调->enqueue           │
+#       │                     │<── call_soon_threadsafe ────│ 本批处理完才flush             │
+#       │                     │ collector合并未读chunk      │                               │
+#       │                     │ SSE读取时增量反分词         │                               │
+#       │<── SSE chunk ───────│                             │                               │
+#       │                     │                             │<── STREAM([t1]) ──────────────│ step k+1：decode（投机时可多个id）
+#       │<── SSE chunk ───────│<────────────────────────────│                               │
+#      ...                    │                             │                               │
+#       │                     │                             │<── STREAM(finished=True) ─────│ 命中eos/stop/max_tokens：
+#       │                     │                             │ 回调后删除该回调              │ _mark_finished、释放block
+#       │<── 最后一个chunk ───│<────────────────────────────│                               │
+#       │<── [DONE] ──────────│                             │<── (ADD,[结束的seq]) ─────────│ 同一步里排在STREAM之后
+#       │                     │                             │ 在线只做收尾；                │
+#       │                     │                             │ 离线交给generate              │
+#
+#   要点：
+#   - 同一步里STREAM先于"已结束的seq"入队（engine_core.py），所以客户端总是先拿到最后一个token再看到结束
+#   - RequestOutput只是"增量"：output_tokens是本步新增的token id，文本由前端事件循环增量反分词得到
+#   - 中间chunk的prefill步没有RequestOutput（postprocess对is_partial_prefill的序列直接continue）；
+#     投机解码一步接受3个token时output_tokens就是3个id
+#   - 从没运行就结束的请求（unschedulable、在waiting里被abort、PD接收KV失败，见sequence.py状态图⑨⑩）
+#     不会有STREAM，它们经take_rejected作为结束的seq回到前端，CoreManager在收到时
+#     由_deliver_terminal_output补一个output_tokens=[]、finished=True的RequestOutput
+#   - n>1：每个兄弟序列各一个回调（_send_stream_chunk_tagged），按sibling_index打标签后汇入同一个collector
 @dataclass
 class RequestOutput:
     """Output structure passed to stream callback."""

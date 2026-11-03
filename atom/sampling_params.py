@@ -18,6 +18,64 @@ from typing import Optional, Union
 #   4. 从剩下的分布里随机抽一个
 #   ATOM的抽样写法：argmax(p / E)，E是逐token的Exp(1)随机噪声，效果等价于"按概率p抽样"
 #     （见atom/model_ops/sampler.py；n>1的兄弟序列需要各自独立的E，见Sequence.needs_independent_noise）
+#   更正/补充：argmax(p / E)只是"不做top-k/top-p过滤"那条路径；batch里有人开了过滤时，走的是aiter的
+#     采样算子或torch.multinomial（见下面流程图）
+#
+# 采样流程图（ModelRunner.prepare_sample + Sampler.forward，已核对代码）：
+#
+#   batch的logits [bs, vocab]，以及ScheduledBatch收集好的temperatures / top_ks / top_ps数组
+#        │
+#        ▼
+#   ┌─ prepare_sample（CPU）───────────────────────────────────────────
+#   │ all_greedy  = 整个batch的temperature都 == 0
+#   │ temperature = max(temperature, 1e-10)（SAMPLER_EPS，避免除0）
+#   │ top_ks = 有人top_k != -1 ? （全batch相同则传标量，否则传GPU张量） : None
+#   │ top_ps = 有人top_p < 1.0 ? （同上） : None
+#   └──────────────────────────────────────────────────────────────────
+#        │
+#        ├── all_greedy ──────────────────────> argmax(logits)，平局取id小的   （纯贪心快路径）
+#        │
+#        ├── top_ks、top_ps都是None ─────────> p = softmax(logits / T)，token = argmax(p / E)，E~Exp(1)
+#        │                                     （mixed_sample_outer_exponential，一个融合kernel）
+#        │
+#        └── 需要过滤 ──> p = softmax(logits / T)
+#                          │
+#                          ▼
+#                    top-k：按概率排序只留前k个     ┐ 两个条件取交集
+#                    top-p：排它累计和 <= top_p    ┘ （未启用的那一项视为全部保留）
+#                    （"取交集"是回退实现_native_sample里的写法；aiter的top_k_top_p_sampling_from_probs在一个kernel里完成）
+#                          │
+#                          ▼
+#                    剩下的重新归一化 -> 按概率抽一个（aiter采样算子 / torch.multinomial）
+#        │
+#        ▼（后两条路径的最后一步）
+#   _apply_greedy_tokens：混合batch里T <= 1e-10（即请求T=0）的行，结果换成argmax
+#
+# 数值例子：5个token的词表[A, B, C, D, E]，logits = [3.0, 2.0, 1.0, 0.5, -1.0]
+#   ① 温度：p = softmax(logits / T)
+#        T=1.0 -> [0.624, 0.229, 0.084, 0.051, 0.011]
+#        T=0.5 -> [0.862, 0.117, 0.016, 0.006, 0.000]   （更尖：几乎总选A）
+#        T=1.5 -> [0.491, 0.252, 0.130, 0.093, 0.034]   （更平：D、E也有机会）
+#        T=0   -> 直接选A，不看后面几步
+#   ② top_k=3（以T=1为例）：只留A、B、C
+#   ③ top_p=0.8：排序后的排它累计和 = [0, 0.624, 0.853, 0.937, 0.989]，<= 0.8的只有A、B
+#   ④ 两者取交集 -> {A, B}，重新归一化：A = 0.624/0.853 ≈ 0.731，B ≈ 0.269
+#      （只开top_k=3时则是A 0.665、B 0.245、C 0.090）
+#   ⑤ 按[0.731, 0.269]抽样：约73%的概率输出A，27%输出B，C/D/E不可能出现
+#
+# 适用场景（以下为常见用法建议，不是ATOM的默认值）：
+#   参数组合                     适用场景                              好处 / 代价
+#   ──────────────────────────────────────────────────────────────────────────────────────────────
+#   temperature=0（贪心）        评测（lm_eval/GSM8K）、代码、结构化输出  好处：确定、可复现；整batch都贪心时走快路径
+#                                                                     代价：容易重复/啰嗦，n>1时n条结果一样
+#   temperature≈0.7~1.0          对话、创意写作                         好处：多样；代价：结果每次不同，偶尔跑偏
+#   + top_p≈0.9                  通用聊天的常见搭配                      按"概率质量"截尾：分布尖时只留很少几个，
+#                                                                     分布平时多留，比固定k更自适应
+#   + top_k（如20~50）           想要硬上限、防止长尾怪词                 候选数固定，与分布形状无关；k太小会变得死板
+#   ignore_eos=True              吞吐/延迟压测、profile                  每条恰好生成max_tokens个，结果可比；输出内容无意义
+#   max_tokens                   所有请求都应按需设置                     限制最长输出和KV占用；太小会被截断（finish_reason=length）
+#   n>1                          best-of-n、多数投票、RL rollout         prompt只分词一次；代价约n倍显存与算力，需要T>0
+#   代价提示：batch里只要有一条请求开了top_k/top_p，整个batch都离开argmax(p/E)那条融合快路径
 
 
 # 请求级采样参数，每个请求一份
