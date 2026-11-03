@@ -67,6 +67,17 @@ logger = logging.getLogger("atom")
 #   PD分离、插件模式，以及几十种模型各自不统一的HF config
 
 
+# 【科普】KV cache 与分页（paged）KV —— 读本文件和第4、5批的前置知识
+#   KV cache：decode时每生成一个token，都要和之前所有token的K、V做注意力。为了不每步重算，
+#     把每个token每层算出的K、V存起来，这就是KV cache。它通常是推理时最占显存的东西。
+#   分页：如果给每个请求按"最大长度"预留一整段连续显存，短请求会浪费大量空间。
+#     PagedAttention的做法像操作系统的虚拟内存：把整块KV显存切成固定大小的block（例如每个block存16个token），
+#     一个请求需要多少就领多少个block，block在显存里不必连续，用一张表（block_table）记下
+#     "这个请求的第0、1、2…个block分别是物理上的第几号block"。
+#   例：block_size=16，一个请求有40个token -> 需要3个block，block_table可能是[7, 2, 15]；
+#     第35个token存在第35//16=2个逻辑block，即物理block 15里的第35%16=3个位置。
+#   CPU侧的"账本"（谁占了哪些block）由第4批的BlockManager管，GPU侧整块显存由ModelRunner在启动时一次性分配（第5批）。
+#
 # KVCacheTensor：一层注意力的KV cache张量"句柄"
 # 谁创建：ModelRunner.allocate_kv_cache分配好整块KV显存后，遍历模型（和草稿模型）的每个module，
 #   调用注意力元数据builder的build_kv_cache_tensor(module)。builder把属于这一层的那片显存
@@ -162,6 +173,23 @@ class KVCacheConfig:
     kv_cache_tensors: list[KVCacheTensor]
 
 
+# 【科普】CUDA Graph 与 torch.compile —— 下面三个类（CUDAGraphMode、CompilationLevel、CompilationConfig）的前置知识
+#   ① 为什么decode会被"CPU卡住"：GPU上每个算子都是一次kernel launch，由CPU发起。一次forward有几百到几千个kernel，
+#     decode时batch小、每个kernel在GPU上只跑几微秒，CPU发命令的时间（每次也是几微秒）反而成了瓶颈，GPU在空等。
+#   ② CUDA Graph：先把一次forward的全部kernel launch"录"下来（capture），之后用一条命令整体"回放"（replay），
+#     CPU开销从几千次launch变成1次。限制：录下来的是固定的kernel序列、固定的显存地址和固定的张量形状。
+#     所以：(a) 输入必须写进事先分配好的固定buffer；(b) 每种batch size要单独录一张图，
+#     运行时把batch补齐（padding）到最近的已录尺寸。例：录了[1,2,4,8,16]，实际有5条序列 -> 补到8条回放。
+#     (c) 每张图都要占一些显存，所以只录有限几个尺寸（cudagraph_capture_sizes）。
+#   ③ torch.compile：Dynamo在运行时读Python字节码，把模型forward"抓"成一张计算图（FX graph）；
+#     Inductor再把图里相邻的小算子融合、生成更快的kernel（例如把 RMSNorm 的几步合成一个kernel）。
+#     guard：Dynamo记下"这张图成立的前提"（形状、dtype等），每次调用先检查，不满足就重新抓图。
+#   ④ 分段（piecewise）：注意力算子每步的输入元数据（序列长度、block_table）变化大，不适合放进编译图和CUDA Graph。
+#     于是在注意力处把图切开：注意力之间的稠密部分（投影、MLP、norm）各自编译并录成CUDA Graph，
+#     注意力本身在两段之间正常执行。这就是 --level 3 和 PIECEWISE 模式。
+#     FULL模式则是连注意力一起录成一张整图（需要注意力kernel本身支持被录制）。
+#   ATOM里的实现：录图在 ModelRunner.capture_cudagraph，编译后端在 utils/backends.py（第5批）。
+#
 # CUDAGraphMode：CUDA Graph的录制方式（--cudagraph-mode，含义见arg_utils.py的EngineArgs.cudagraph_mode）
 # 背景：CUDA Graph把一次forward里的几百个kernel launch录制下来，之后一次性回放，
 #   省掉decode阶段占比很高的CPU launch开销；代价是输入形状和地址必须固定（所以按batch size分桶录制）
@@ -286,6 +314,7 @@ class CompilationLevel:
 @dataclass
 class CompilationConfig:
     # 编译级别0~3（CompilationLevel里的常量）；dataclass默认0，但命令行默认传3
+    # 调大调小的取舍：level 3启动更慢（首次要编译，之后读缓存）但运行最快；排查编译相关问题时用0（eager）
     level: int = 0
     """The level of compilation:
 
@@ -469,6 +498,9 @@ class CompilationConfig:
     #   表示使用cudagraph的捕获尺寸。
     # 解释：列出的尺寸会被cuda_piecewise_backend.py按静态形状单独编译一份（其余形状共用动态形状版本）
 
+    # 科普：自定义算子（custom op）——用 torch.library 注册成"一个整体"的算子，torch.compile把它当成黑盒，
+    #   不会钻进去追踪。ATOM把注意力包装成这样的算子（如 aiter.unified_attention_with_output），
+    #   既能在它这里切图（见set_splitting_ops_for_v1），又避免Dynamo去追踪AITER kernel内部
     # 层名 -> 层对象的注册表。注意力层构造时把自己登记进来（例如paged_attention.py：MHA_<层号>/MLA_<层号>），
     #   torch.compile图里的自定义算子只携带layer_name字符串，运行时再到这里查回module本身，
     #   这样module内部的状态不进入图的参数列表（见module_dispatch_ops.py文件头）
