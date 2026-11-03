@@ -318,7 +318,7 @@ class ChatMessage(BaseModel):
 #                                                                           few-shot评测用它在"Question:"处截断
 #   ignore_eos              False     SamplingParams.ignore_eos             压测：每个请求都正好生成max_tokens个token
 #   n                       1         _coerce_n → 扇出n个兄弟Sequence        一次要多个候选（best-of / pass@k）；temperature≤0时
-#                                                                           折叠为1；共享prompt的前缀缓存，但KV和decode是n份
+#                                                                           折叠为1；prompt只tokenize一次，但调度上是n条序列
 #   stream                  False     流式 / 非流式两条路径                  见serving_chat.py文件头的"适用场景"
 #   seed、presence_penalty、 —        不使用（接受后丢弃）                   需要这些语义的客户端不会得到预期效果
 #     frequency_penalty

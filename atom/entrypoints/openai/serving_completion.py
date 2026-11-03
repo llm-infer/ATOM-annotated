@@ -14,6 +14,29 @@
 #   （如PD路由器、评测框架）。对chat模型直接发裸文本，等于让它在没有角色标记的格式上生成，质量通常明显变差
 # 流式帧序列：若干 {"choices": [{"text": "...", "finish_reason": null}]}
 #   → 最后一次发送里：最后一段文本帧 + 带finish_reason的空文本帧 + usage帧 + [DONE]
+#
+# ---- 适用场景：prompt的三种给法（CompletionRequest.get_prompt_or_tokens的优先级从上到下）----
+#   给法                                 服务端做什么                 适用场景
+#   ───────────────────────────────────  ───────────────────────────  ─────────────────────────────────────────────
+#   prompt_token_ids（或kv_transfer_      直接用，不tokenize           PD路由器、RL rollout：上游已有token id，避免两边
+#     params["prompt_token_ids"]）                                   tokenizer不一致；[]或两处不一致 → 400
+#   "prompt": [151644, 872, …]（数组）    同上，走预tokenize路径        OpenAI规范里的token数组形式；不支持二维批量
+#   "prompt": "Question: …\nAnswer:"     preprocess里tokenize          base模型续写、lm_eval（local-completions）的few-shot
+# ---- 与/v1/chat/completions的取舍 ----
+#   ┌───────────────────────┬─────────────────────────────────────┬─────────────────────────────────────┐
+#   │                       │ /v1/completions（本文件）           │ /v1/chat/completions                │
+#   ├───────────────────────┼─────────────────────────────────────┼─────────────────────────────────────┤
+#   │ chat template         │ 不套，prompt原样续写                │ 服务端渲染                          │
+#   │ 推理内容 / 工具调用    │ 不拆分，全部在choices[i].text里     │ 拆成reasoning_content / tool_calls  │
+#   │ 多模态                │ 不支持                              │ 支持（content片段列表）             │
+#   │ request_id前缀        │ cmpl-                               │ chatcmpl-                           │
+#   │ 适用场景              │ base模型、评测、压测、自带模板的上游 │ 对话 / 指令模型的常规调用            │
+#   └───────────────────────┴─────────────────────────────────────┴─────────────────────────────────────┘
+#   好处：路径最短、结果可预测（服务端不改动prompt和输出）；代价：对chat模型要由调用方自己保证格式正确
+# 例：{"prompt": "1+1=", "max_tokens": 4, "temperature": 0, "stream": true}
+#   → 假设逐step产出" 2"、"\n"、"1"、"+"，第4个token时到达max_tokens（leave_reason="max_tokens"）
+#   → 帧：{"text": " 2"} {"text": "\n"} {"text": "1"}，最后一次发送：{"text": "+"} + {"text": "", "finish_reason": "length"}
+#     + usage帧 + [DONE]——"length"告诉客户端输出被截断，而不是自然结束
 import logging
 import time
 from collections.abc import AsyncGenerator
