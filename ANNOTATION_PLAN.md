@@ -52,7 +52,7 @@
 | **B 精注** | 文件头总览；每个类和函数开头写用途、输入输出（张量形状）、调用方；函数体内只注释关键行：分支条件、数据流转折、不直观的技巧 | 主干的配套文件、扩展部分的核心文件，共 260 个 |
 | **C 导读** | 文件头写职责、调用方、与主干的关系（替代或扩展了哪一批的哪个机制）；每个类和公开函数一行用途 | kernel、协议适配、补丁、工具，共 431 个 |
 
-另有 35 个空的 `__init__.py` 或只有几行导出的文件不注释。9 个上游 vendored 文件不修改，见 1.4。
+另有 35 个空的 `__init__.py` 或只有几行导出的文件不注释。9 个上游 vendored 文件不修改，见 1.5。
 
 C 级示例：
 
@@ -90,7 +90,25 @@ C 级示例：
    if sampling_params is None:
    ```
 
-### 1.3 每批的执行与验收
+### 1.3 面向读者的写法（第 1、2 批回看后确定，之后每批照此执行）
+
+**目标读者**：只懂标准 Transformer + MHA / GQA（大致读过 nano-vllm），不懂推理系统和新架构。注释的唯一标准是"这个读者能不能读懂"。
+
+1. **新概念从 MHA / GQA 讲起，通俗易懂、图文并茂。** 遇到 kpool、DSA / 索引器、MLA、CSA、GDN / KDA、mHC、Engram、状态 checkpoint、投机解码、DP-attention、CUDA Graph 等机制名，不能只写名字，要在**第一次出现的最自然的位置**写一段【科普】：
+   - 先说读者已知的东西（"MHA 里新 token 的 q 要和全部 L 个历史 k 点积…"），再说新机制改了哪一步、为什么；
+   - 配 ASCII 图（数据怎么流、张量怎么排、token 怎么分组）；
+   - 配具体数字（"index_kpool=4 → 2048 个 token 只需选 512 个池"）；
+   - 写清"什么时候结果和朴素做法一样、什么时候不同"这类边界。
+   范例：`config.py` 中 `glm5_kpool_block_size` 上方的"【科普】什么是 k-pool"（四步：全量注意力的开销 → DSA → k-pool → 为什么 block 要变成 64）。
+2. **按 nano-vllm-annotated 的结构组织**：文件 / 类开头先给**概念**，再给**流程图 / 状态机 / 内存布局图 / 时序图**（方框图，和代码一一对应），再**用一条具体请求带数字走一遍**，最后写**适用场景 / 好处 / 代价**（选项、模式、并行方式都要有"什么时候用、代价是什么"）。
+3. **重点讲推理原理和"为什么这样设计"**，例如 prefill 计算受限 vs decode 带宽受限、为什么延迟输出能掩盖 CPU 时间、为什么 DP 要锁步。**简单代码略过**：读环境变量、getter、日志、自解释的 pydantic 字段不写。
+4. **一个概念只讲一次**：在最自然的位置讲透，其他地方写一行指针（"见 xx.py 的【科普】③"），并确认指针目标存在。不要在三个文件里用三种措辞讲同一件事。
+5. **长文件开头写阅读路线**：本文件分几部分、建议阅读顺序、需要的前置概念（指向对应【科普】）；必要时附术语表。
+6. **事实必须核实**："谁调用 / 谁读取 / 默认值 / 生效条件"都要用 grep 或读实现确认，写不出出处的就不写；从硬件规格、论文得来的数字注明来源。图表中的数字要能按代码里的公式算出来。
+7. **发现旧注释写错，直接改成正确说法**（必要时说明依据），不要留下"先写错、后面再更正"的两段；对上游代码本身的问题（疑似 bug、文档与实现不符），以"观察："写明事实，不改代码。
+8. **跨文件保持一致**：每批结束时，对本批涉及的关键事实做一次"读者视角通读"，专门找：先用后解释的术语、前后矛盾、重复讲解、失效的交叉引用（旧行号、不存在的路径）、与代码不符的图表。第 1、2 批通读中统一过的事实见 §4"已核实的关键事实"。
+
+### 1.4 每批的执行与验收
 
 - 改动后对修改过的文件跑两个检查脚本（在 [annotation_tools/](annotation_tools/) 下，需 Python ≥ 3.12）：
   - `python annotation_tools/verify_comments_only.py [--base daa4f1bb8] <files>`：对比 git HEAD（或 `--base` 指定的未注释上游版本）的 AST，证明只加了注释、没改代码，并跑 black --check 和 ruff；
@@ -99,8 +117,10 @@ C 级示例：
 - 每批完成后勾选 [ANNOTATION_CHECKLIST.md](ANNOTATION_CHECKLIST.md)，并提交一次，提交信息沿用 nano-vllm 格式：`【注释】第N批：调度器`。
 - 后 3 批文件多，按小节（如 8a、8b）拆给多个子任务并行注释，最后统一检查术语和交叉引用。
 - 注释不影响 Dynamo 追踪，但文件 hash 会变，`@support_torch_compile` 模型首次运行会重新编译。在 GPU 上运行前按 CLAUDE.md 清理 `/root/.cache/atom/*`。
+- 执行顺序（第 3 批起）：① 首次注释（翻译 + 1.2 / 1.3 的解释、【科普】、图表、适用场景）→ ② 读者视角通读修订（1.3 第 8 条）→ ③ 两个检查脚本 + 非注释 diff 为空 → ④ 勾选清单、提交。大文件可按函数区段拆给多个子任务并行，但每个子任务只改自己的区段，写入前重新读文件。
+- 编辑注意：本仓库的编辑钩子会对 Edit 工具改过的文件跑 `ruff --fix`，可能删掉已有的 `# noqa`。用脚本做精确替换（`str.replace` 并断言只出现一次），改完检查 `git diff HEAD -- <files> | grep '^[-+]' | grep -v '^[-+]\s*#'` 为空，且 `# noqa`、【译】的数量没有减少。
 
-### 1.4 不修改的文件
+### 1.5 不修改的文件
 
 - `atom/models/glm52/mono/kernels/`（9 个文件）：从 FlyDSL 上游 vendored，须与上游保持字节一致（见 `pyproject.toml` 的说明），改动会破坏对齐，还可能改变 FlyDSL 重写器的生成结果。它们的导读写在 `glm52/mono/runner.py` 和 `dispatch.py` 的文件头里。
 - 仓库中不属于 `atom/` 的部分（`tests/`、`tools/`、`scripts/`、`docker/`）不在计划内。`atom/mesh/` 主体是 Rust 代码，只注释其中一个 Python 脚本。
@@ -281,7 +301,7 @@ C 级示例：
 | 7a MoE 与专家并行 | `moe.py`（`FusedMoE`、`UnquantizedFusedMoEMethod`、`Fp8MoEMethod`、`moe_forward`；MXFP4 / NVFP4 等量化方法做 B 级）、`topK.py`、`qwen3_moe.py` | `fused_moe_triton.py`、`fused_moe/*`（modular kernel、MORI / RCCL 的 dispatch 与 combine、all2all）、`eplb.py`、`mixtral.py` |
 | 7b MLA 与 DeepSeek-V3 | `attention_mla.py`（V3 dense 路径：权重吸收、prefill 用 MHA 形式、decode 用 MQA 形式）、`attentions/aiter_mla.py`、`deepseek_v2.py`、`deepseek_mtp.py` | `triton_mla.py`、`triton_fused_mla_ctx_kv.py`、`mla_kv_pool.py`、`fused_mtp_prologue.py`、`eagle3_deepseek_mla.py` |
 | 7c 投机解码框架 | `spec_decode/drafter.py`、`eagle_proposer.py`、`rejection_sampler.py` | `draft_graph.py`、`draft_kv.py`、`dspark_proposer.py`、`dspark_scheduler.py`、`dspark_verify.py`、`calibration.py`、`dspark_markov_sample.py`、`models/dspark_draft.py` |
-| 7d DSA 稀疏索引器（V3.2 / GLM-5） | — | `model_ops/indexer/*`、`sparse_indexer_*.py`、`fp4_mqa_ragged_metadata.py`；`deepseek_v2.py` 中的 `Indexer` |
+| 7d DSA 稀疏索引器（V3.2 / GLM-5） | — | `sparse_indexer_*.py`（v0.1.8 没有 `model_ops/indexer/` 目录）、`fp4_mqa_ragged_metadata.py`；`deepseek_v2.py` 中的 `Indexer` |
 | 7e 其他 MoE 模型 | — | `glm4_moe.py` 及其 MTP、`gpt_oss.py`、`swiglu_oai.py`、`minimax_m2.py`、`mimo_v2.py` 及其 MTP、`kimi_k25.py` |
 
 本批也回头补全前几批里与投机解码相关的部分：`SpeculativeConfig`、`SpecDecodeMetadata`、`model_runner.propose_draft_token_ids`、`aiter_attention.prepare_mtp_decode`、`sampler.sample_verification_tokens`。
@@ -353,6 +373,19 @@ C 级示例：
 ---
 
 ## 4. 跨批备注（注释过程中发现、后续批次要交叉引用的事实）
+
+### 已核实的关键事实（第 1、2 批通读时统一，后续批次注释与之保持一致）
+
+- **一步只做 prefill 或只做 decode**：基础调度器 `_schedule` 排了 prefill 就直接返回，不把 prefill chunk 和 decode 拼进同一个 batch（混合批在源码中仍是 TODO）；做到一半的 chunked prefill 下一步优先续算。想让 decode 插进 chunk 之间，需 `ATOM_PREFILL_DECODE_INTERVAL>0`，且 DP=1、PP=1、`ATOM_ENABLE_PREFILL_DELAYER=1`、非 RapidServe（`engine_core.py` 创建 PrefillDelayer 处）。
+- **CUDA Graph**：原生模式下 `--cudagraph-mode NONE` 仍走整图捕获（`_piecewise_cg_active()` 为 False → 手动 FULL 路径），真正关闭捕获的是 `--enforce-eager`（它不关 torch.compile）；FULL_AND_PIECEWISE 在原生模式下等同 PIECEWISE。
+- **延迟输出**默认开启，条件是 `not is_pipeline_parallel and not hands_off_recurrent_state`（`model_runner.py`）。
+- **原生多模态**：`get_hf_config` 把 `text_config` 当 hf_config，完整 config 存进 `_multimodal_config`；Qwen3.5、Kimi-K3 原生会构建视觉塔，Mistral3、Kimi-K2.5、GLM-5.3 原生只跑文本。
+- **`num_cached_tokens`** 在 prefill 结束后停在 prompt 长度，decode 时不再增长（与 nano-vllm 不同）；`RequestOutput.num_cached_tokens` 取自 `prefix_cache_hit_tokens`。
+- **采样**：只有不做 top-k / top-p 过滤时才用 argmax(p/E)；开过滤时走 aiter 采样算子或 `torch.multinomial`。ATOM 没有 repetition / presence / frequency penalty。
+- **默认值**：HTTP 请求 `max_tokens` 默认 chat/completions 8192、messages/responses 4096；`index_cache_dtype` 默认 V4 为 fp4（gfx942、插件或有 KV 传输时 fp8）、V4.1 为 fp8、其余跟随 kv_cache_dtype。
+- **工具调用解析器**只有 qwen、kimi、kimi_k3、glm、dsml、dsml_v41、minimax，没有 Hermes。
+- **MI300X 规格**（估算用）：HBM ≈ 5.3 TB/s，FP8 稠密 ≈ 2600 TFLOPS，BF16 稠密 ≈ 1300 TFLOPS。
+- 不存在的路径：`model_ops/indexer`（DSA 索引器在 `deepseek_v2.Indexer` 和 `model_ops/sparse_indexer_*.py`；GLM-5.3 的在 `model_ops/glm5_next/`）。
 
 ### 来自第 1 批
 
