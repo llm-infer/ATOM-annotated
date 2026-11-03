@@ -4,6 +4,27 @@
 # 离线推理示例：读源码的起点（对应nano-vllm的example.py）
 # 运行方式（见CLAUDE.md）：
 #   python -m atom.examples.simple_inference --model <模型路径> --kv-cache-dtype fp8 -tp 8
+#   （CLAUDE.md里的命令不带-tp；-tp默认是1，即单卡，这里的-tp 8表示8卡张量并行）
+#
+# 本示例里常用的命令行参数（都由EngineArgs.add_cli_args注册，默认值见arg_utils.py的EngineArgs字段）：
+#   --model             HF模型目录或hub名，权重、config.json、tokenizer都从这里读
+#   -tp/--tensor-parallel-size  张量并行的GPU数（默认1），见下方TP科普
+#   --kv-cache-dtype    KV cache的存储类型，bf16（默认）或fp8；fp8省一半显存、能多放请求，精度略降
+#                       （注册名是--kv_cache_dtype，FlexibleArgumentParser让连字符写法也能用）
+#   --enforce-eager     不捕获CUDA Graph，每步都逐个launch kernel；启动快、便于调试，decode更慢
+#   --level             torch.compile级别，0=eager ... 3=piecewise编译+CUDA Graph（默认3）
+#   --max-num-seqs      同时在跑的请求数上限（默认512）
+#   --gpu-memory-utilization  允许使用的显存比例（默认0.9），扣掉权重和激活后剩下的都分给KV cache
+#   --torch-profiler-dir      设了才会真正采集torch profiler trace（见下方start_profile处）
+#   --temperature / --max-tokens  本脚本自己的采样参数，见下方
+# 用户看到的输出：先是大量引擎日志（加载权重、分配KV cache、捕获CUDA Graph），然后打印套好模板的prompts，
+#   最后对每条prompt打印一行"Prompt: ..."和一行"Completion: ..."（生成的文本）
+#
+# 科普·KV cache：自回归生成时，第t步的attention要用到前t-1个token的K和V；把它们缓存在显存里，
+#   每步只需算新token的K/V，不必重算整个前缀。ATOM把KV cache切成固定大小的block（类似nano-vllm），
+#   由调度器按需分配给各请求，见model_engine/block_manager.py和docs/scheduling_kv_cache_guide.md
+# 科普·TP（张量并行）：把每层的权重矩阵按列/行切到多张GPU上，每张卡算一部分，再用all-reduce汇总；
+#   例如-tp 8时每张卡只存1/8的attention头和1/8的MLP权重。每张卡对应一个ModelRunner进程，见docs/distributed_guide.md
 #
 # 整体流程：
 #   命令行参数 ──EngineArgs.add_cli_args──> argparse解析 ──EngineArgs.from_cli_args──> EngineArgs
@@ -53,6 +74,9 @@ parser.add_argument(
 )
 
 
+# 科普·CUDA Graph：decode每步要launch几百个小kernel，CPU发射kernel的开销可能比GPU计算还长。
+#   CUDA Graph先把"一整步forward的kernel序列"录制下来，之后每步只需一次replay；代价是输入形状（batch size）
+#   必须是录制时的固定值，所以要事先为若干batch size各录一份。录制逻辑见utils/cuda_graph.py和model_runner.py
 # 生成不超过max_size的2的幂：max_size=6 -> [1, 2, 4]
 # 用作CUDA Graph的捕获尺寸：decode时batch size向上取整到最近的捕获尺寸，回放对应的graph（第5批）
 # 这里只有6条prompt，batch最大为6，没必要捕获默认的[1,...,512]那么多graph，可以缩短启动时间
@@ -93,6 +117,9 @@ def main():
     engine_args = EngineArgs.from_cli_args(args)
     # create_engine：EngineArgs -> Config -> LLMEngine
     #   这一步会启动子进程、加载权重、预热、分配KV cache、捕获CUDA Graph，是最耗时的一步
+    # 科普·进程结构：当前进程（LLMEngine + CoreManager）用multiprocessing的spawn方式拉起EngineCore进程，
+    #   EngineCore再为每张GPU拉起一个ModelRunner进程；进程间用ZMQ socket收发请求和结果
+    #   （ZMQ科普见utils/__init__.py的make_zmq_socket处）。必须用spawn而非fork，原因见utils/__init__.py的get_mp_context
     llm = engine_args.create_engine()
 
     # 这里单独加载tokenizer只是为了套chat template；LLMEngine内部还有自己的tokenizer负责分词和反分词
@@ -123,6 +150,10 @@ def main():
 
     # 开始/停止torch profiler：向所有ModelRunner进程广播命令
     #   只有启动时指定了--torch-profiler-dir才会真正采集，trace文件写到该目录；否则这两个调用什么也不做
+    #   （准确地说：命令仍会发到各进程，只是ModelRunner.start_profiler发现profiler_dir为None就直接跳过）
+    # 科普·profiler trace：torch.profiler记录这段时间内每个CPU算子和GPU kernel的起止时间，
+    #   stop时导出为<dir>/<rank名>/<模型名>_ts_<时间戳>.pt.trace.json.gz（每个rank一个文件，见model_runner.py的start_profiler），
+    #   可以拖进ui.perfetto.dev或chrome://tracing按时间轴查看哪个kernel最耗时
     llm.start_profile()
     # 提交所有prompt并阻塞等待全部完成
     # 返回值是一个列表，与prompts一一对应（n=1时），每项是一个dict：
@@ -137,6 +168,7 @@ def main():
         print(f"Completion: {output['text']!r}")
 
     # 打印MTP投机解码的统计（草稿token接受率等）；没开投机解码时没有内容，见第7批
+    # 它是"发出去不等回复"的命令，统计打印在EngineCore进程的日志里，而不是这里的print输出
     llm.print_mtp_statistics()
     # 关闭引擎：通知EngineCore和ModelRunner子进程退出，释放GPU资源
     llm.close()

@@ -207,6 +207,14 @@ def get_device_indices(
 #   让Dynamo把它当成一个不透明节点：gen_fake提供fake实现（只推导输出形状），mutates_args声明会被原地修改的参数
 #   装饰器返回的仍是原函数；调用方通过torch.ops.aiter.<函数名>(...)调用才走注册的算子（如paged_attention.py）
 # 调用方：model_ops/base_attention.py的unified_attention_with_output_base等attention入口
+#   此外还有models/deepseek_v4.py、deepseek_v4_dspark.py、kimi_k3/model.py和plugin/vllm、plugin/sglang下的attention函数
+# 科普·为什么要注册成自定义算子：torch.compile（Dynamo）会逐行"追踪"Python代码生成计算图，
+#   遇到它看不懂的东西（调用AITER的C++/汇编kernel、按Python条件分支选kernel）就会报错或打断图。
+#   注册成torch.ops.aiter.xxx后，Dynamo把整个函数当成一个黑盒节点，只需要fake实现告诉它"输出是什么形状/dtype"，
+#   实际执行时再调用真函数。注册细节见utils/custom_register.py的direct_register_custom_op
+#   例：attention被标成切分点后，一层模型被切成"attention之前的线性层/归一化"、"attention"、"之后的MLP"几段，
+#   前后各段分别编译。默认--cudagraph-mode是FULL：整步forward（含attention）一起录进一张CUDA Graph；
+#   只有PIECEWISE模式才给每个编译段各录一张graph、attention段留在graph外执行（见utils/backends.py的split_graph附近）
 # 【分支】piecewise编译与CUDA Graph详见第5批
 def mark_spliting_op(
     is_custom: bool,
@@ -250,6 +258,8 @@ def get_hf_text_config(config: PretrainedConfig):
         return config
 
 
+# 科普·fork与spawn：fork把父进程的内存原样复制一份给子进程（快，但连已初始化的GPU驱动状态也复制了，子进程用不了）；
+#   spawn则启动一个全新的Python解释器，重新import模块后再运行目标函数（慢一些，但子进程里的GPU运行时是干净的）
 # 返回spawn方式的multiprocessing上下文（返回类型标注写了ForkContext，但实际永远是spawn）
 #   CLAUDE.md规定多进程必须用spawn：fork会把父进程已初始化的GPU运行时状态复制给子进程，子进程再初始化CUDA/HIP时会崩溃
 # 调用方：model_engine/async_proc.py创建ModelRunner子进程
@@ -286,6 +296,8 @@ def set_process_title(name: str, suffix: str = "", prefix: str | None = None) ->
     setproctitle.setproctitle(f"{prefix}::{name}")
 
 
+# 科普·DP/PP：DP（数据并行）是把整个模型复制多份，每份（一个EngineCore + 它的TP组）独立处理不同的请求；
+#   PP（流水线并行）是把模型的层切成几段放在不同GPU组上，请求依次流过各段。例如-dp 2 -tp 4共用8卡：2个EngineCore各管4卡
 # EngineCore进程的名字：PP>1时为EngineCore_PP<rank>，DP>1时为EngineCore_DP<rank>，否则就是EngineCore
 # 调用方：engine_core.py（用作进程标题和日志里的名字）
 def engine_process_name(config: "Config") -> str:
@@ -534,6 +546,10 @@ def get_tcp_uri(ip: str, port: int) -> str:
         return f"tcp://{ip}:{port}"
 
 
+# 科普·ZMQ（ZeroMQ）：一个消息队列库，用法像socket，但收发的是完整的"消息"而不是字节流，并自带重连、排队。
+#   地址写成"传输方式://位置"：ipc://<文件路径>（同机进程间，走Unix域socket）、tcp://host:port（跨机器）、
+#   inproc://<名字>（同进程内的线程间）。ATOM用它连接引擎的各个进程，例如CoreManager用ROUTER socket bind、
+#   EngineCore用DEALER connect来发请求；EngineCore用PUSH把结果推回CoreManager的PULL（见engine_core_mgr.py、engine_core.py）
 # 生成一个唯一的ZMQ进程内（inproc://）地址，只能在同一进程的线程之间通信；调用方：engine_core_mgr.py
 def get_open_zmq_inproc_path() -> str:
     return f"inproc://{uuid4()}"
@@ -934,6 +950,9 @@ def pack_rows(dst: np.ndarray, rows: Sequence) -> None:
         # 【译】（行尾）按目标数组的步长（列数）前进，而不是按这一行的长度
 
 
+# 科普·锁页内存（pinned memory）：普通CPU内存可能被操作系统换出到磁盘，GPU的DMA引擎不能直接读它，
+#   驱动只能先拷到一块内部暂存区再传（就是上面说的"悬崖"）；锁页内存保证常驻物理内存，
+#   GPU可以直接DMA读取，所以non_blocking=True的拷贝能立刻返回、与GPU计算重叠。代价是分配慢、占用不可换出的内存，故预分配复用
 # 一对同形状的缓冲区：cpu（pinned锁页内存）+ gpu，外加与cpu共享内存的numpy视图np
 # 典型用法（ModelRunner准备每步输入）：CPU侧写self.np / self.cpu -> copy_to_gpu(n)异步拷前n行 -> kernel读self.gpu
 #   锁页内存才能真正异步地做H2D拷贝；缓冲区预先分配、每步复用，避免反复分配（原因见上面_PAGEABLE_H2D_LIMIT的说明）

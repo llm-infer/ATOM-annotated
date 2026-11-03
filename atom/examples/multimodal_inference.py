@@ -11,6 +11,13 @@
 #   5. LLMEngine.generate_multimodal提交请求，阻塞到全部完成
 # 与主干的关系：结构与simple_inference.py（本批）相同，区别只是输入多了图片、调用generate_multimodal
 # 【分支】多模态输入的处理（media加载、各模型的input builder）见第2批 multimodal/*
+#
+# 科普·多模态输入：模型本身仍是"吃token序列"的Transformer。一张图片先被processor切成小patch、
+#   归一化成张量pixel_values；prompt里每张图对应一段图片占位token（数量由图片大小决定）。
+#   forward时视觉编码器（如models/qwen3_5_vl.py的Qwen3VisionTransformer）把pixel_values编码成向量，
+#   再把这些向量填到占位token的embedding位置上（qwen3_5.py的merge_multimodal_embeddings），后面就和纯文本一样
+#   image_grid_thw：每张图在(时间t、高h、宽w)三个方向各有多少个patch，用来算占位token数和位置编码（M-RoPE）
+# 用户看到的输出：输入token数、pixel_values形状、image_grid_thw，然后是生成文本和延迟/TTFT/TPOT统计
 import argparse
 import json
 
@@ -83,6 +90,8 @@ def main():
     # Load processor (handles media preprocessing and chat template)
     # 【译】加载processor（负责媒体预处理和chat template）
     # trust_remote_code=True：允许执行模型仓库自带的processor代码
+    # 注意：这里直接用AutoProcessor；在线服务（api_server.py）走的是multimodal/registry.py的get_native_multimodal_processor，
+    #   它会为DeepSeek-V4.1换成checkpoint自带的DeepseekV41ImageProcessor，本脚本没有这一步
     processor = AutoProcessor.from_pretrained(args.model, trust_remote_code=True)
 
     # The nth image marker refers to the nth entry in multi_modal_data["image"].

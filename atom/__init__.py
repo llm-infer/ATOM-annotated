@@ -40,6 +40,9 @@ __all__ = [
 
 
 # 模块级__getattr__（PEP 562，Python 3.7+）：访问atom.XXX而模块里找不到XXX时才会被调用
+#   例：`from atom import SamplingParams`直接拿到上面已导入的名字，不经过这里；
+#       `from atom import LLMEngine`（arg_utils.py里就是这么写的）找不到模块属性，于是调用__getattr__("LLMEngine")；
+#       而`import atom.config`只执行本文件顶部那两个轻量导入，完全不碰引擎
 # 输入：属性名；输出：LLMEngine类。只有LLMEngine走这里，第一次访问时才真正import引擎模块
 # 之后Python的import缓存（sys.modules）让重复访问几乎无开销
 def __getattr__(name: str):

@@ -6,6 +6,13 @@
 # 调用方：开发者手动运行；结构与simple_inference.py（本批）相同，只多了start_profile / stop_profile两步
 # 与主干的关系：LLMEngine.start_profile经CoreManager向每个EngineCore广播"start_profile"工具命令，
 #   最终由每个ModelRunner.start_profiler打开torch.profiler，trace按rank写到--torch-profiler-dir/<rank名>/下（见第2批、第5批）
+# 科普·profiler trace：torch.profiler在start/stop之间记录每个CPU算子和GPU kernel的起止时间（ModelRunner里开启CPU+CUDA两类活动），
+#   stop时每个rank导出一个<模型名>_ts_<时间戳>.pt.trace.json.gz（见model_runner.py的start_profiler）；
+#   把它拖进ui.perfetto.dev或chrome://tracing即可按时间轴看kernel耗时、空泡和通信
+#   ATOM_PROFILER_RECORD_SHAPES / ATOM_PROFILER_WITH_STACK / ATOM_PROFILER_PROFILE_MEMORY（或ATOM_PROFILER_MORE=1一次全开）
+#   可额外记录张量形状、Python调用栈、显存分配，代价是trace更大、导出更慢（定义见utils/envs.py）
+# 用户看到的输出：引擎日志 -> "Warming up..." -> "Starting profiling..." -> 各rank的"trace exported to ..."日志
+#   -> trace保存目录 ->（非--random-input时）每个请求的生成文本
 import argparse
 import random
 from transformers import AutoTokenizer
@@ -82,6 +89,8 @@ def main():
         prompt = """Artificial intelligence has revolutionized numerous fields in recent years, transforming the way we live, work, and interact with technology. Machine learning algorithms have become increasingly sophisticated, enabling computers to perform tasks that were once thought to require human intelligence. From natural language processing to computer vision, AI systems are now capable of understanding and generating human language, recognizing objects in images, and even creating original artwork and music. The applications of AI continue to expand rapidly across industries."""
         print(f"Input_prompt: {prompt}")
 
+    # ignore_eos=True：遇到EOS也不停，保证每个请求都正好生成--output-length个token，
+    #   这样每次profile的decode步数固定，trace之间可比
     sampling_params = SamplingParams(
         temperature=0.6,
         max_tokens=args.output_length,
@@ -90,6 +99,7 @@ def main():
 
     # TODO: remove warm up and skip cuda capture process in engine while profiling.
     # 【译】TODO：profiling时去掉预热，并跳过引擎里的cuda graph捕获过程。
+    # 预热：先跑一次，让首次调用才发生的开销（kernel JIT/调优、内存池扩张等）不落进trace里
     print("Warming up...")
     _ = llm.generate(["warmup"], sampling_params)
     print("Warm up done")
@@ -102,6 +112,7 @@ def main():
 
     # Create batch of prompts based on batch size
     # 【译】按batch size构造一批prompt
+    # --bs个完全相同的prompt一起提交：prompt较短时调度器通常会把它们放进同一个batch，trace里看到的就是batch size=bs时的kernel
     prompts = [prompt] * args.bs
     print(f"Processing batch of {args.bs} requests...")
 
