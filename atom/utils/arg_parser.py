@@ -19,6 +19,10 @@ parser adds the missing counterpart automatically.
 #   entrypoints/openai/api_server.py、entrypoints/atomesh/server.py、benchmarks/benchmark_serving.py
 # 引擎参数本身由EngineArgs.add_cli_args(parser)注册（见本批arg_utils.py），这里只负责"两种拼写都认"
 # 例：注册了--max-num-seqs，那么--max_num_seqs 8也能用，二者写入同一个dest（max_num_seqs）
+# 单元测试：tests/test_arg_utils_spec.py 的 TestFlexibleArgumentParser
+# 为什么要这样做：vLLM/SGLang的命令行都是kebab-case，用户经常把它们的启动命令直接搬过来；
+#   ATOM旧文档和脚本里又有不少snake_case写法（如CLAUDE.md里的--kv-cache-dtype和代码里注册的--kv_cache_dtype），
+#   两边都认，就不会因为一个"-"和"_"之差报 unrecognized arguments
 import argparse
 
 __all__ = ["FlexibleArgumentParser"]
@@ -64,4 +68,8 @@ class FlexibleArgumentParser(argparse.ArgumentParser):
                 # _option_string_actions是argparse内部的"选项字符串 -> Action"表，用来查是否已被注册
                 if alt not in expanded and alt not in self._option_string_actions:
                     expanded.append(alt)
+        # 与BooleanOptionalAction配合：父类会对expanded里每个--开头的名字都生成一个--no-版本，
+        #   例：--enable_prefix_caching 最终注册了4个写法（--enable_prefix_caching、--enable-prefix-caching、
+        #   --no-enable_prefix_caching、--no-enable-prefix-caching），已实测
+        # 注意：只补"全-"和"全_"两种写法；例：注册--a_b-c，会再加--a-b-c和--a_b_c，但用户输入--a-b_c仍不认
         return super().add_argument(*expanded, **kwargs)

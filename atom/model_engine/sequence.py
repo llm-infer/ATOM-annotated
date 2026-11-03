@@ -273,7 +273,7 @@ class Replay(NamedTuple):
 #   "踢回"等待队列：Scheduler.preempt把状态改回WAITING，删掉末尾的占位token，
 #   BlockManager.deallocate释放它的全部block（block_table清空、num_cached_tokens归0），再放到waiting队首。
 #   ATOM采用"重算"而不是"换出到CPU"：重新调度时把prompt+已生成的token整体当作prompt再prefill一遍
-#   （若它原来的block还在前缀缓存里没被覆盖，可以直接命中，少算很多）
+#   （释放前已登记hash的block若还没被别的请求复用，重新准入时可能命中前缀缓存，少算很多）
 class SequenceStatus(Enum):
     # 科普：PD分离（prefill/decode disaggregation）
     #   prefill是一次算很多token（算力瓶颈），decode是每步算1个token（显存带宽瓶颈），混在同一组GPU上会互相拖累。
@@ -448,13 +448,15 @@ class OffloadJointRecord:
 #   创建：num_tokens=10 -> num_blocks=3，last_block_num_tokens=2
 #   准入：BlockManager查前缀缓存。只有"填满的block"才有hash（token 0~3、4~7两块；token 8~9不满不算），
 #         假设两块都没命中 -> num_cached_tokens=0，block_table=[5,9,2]
-#   prefill（预算够，一次算完10个）-> postprocess：hash_blocks登记两个满block的hash，num_cached_tokens=10，
-#         追加第1个生成token -> num_tokens=11（block 2里有3个token）
-#   再decode 1步 -> num_tokens=12，block 2填满；hash_decode_blocks把它也登记进前缀缓存（num_hashed_tokens跟着增长）
-#   再decode 1步 -> 需要第13个位置，调度前BlockManager.may_append追加一个新block -> block_table=[5,9,2,7]
-#   若此时被抢占：block全部释放、block_table=[]、num_cached_tokens=0，token_ids里的12个真实token保留，
-#         重新准入时这12个token都按prompt处理再prefill一次
-#   同一prompt的第二个请求到来：前两块的hash命中 -> num_cached_tokens=8，只需算token 8~9
+#   prefill（预算够，一次算完位置0~9）-> postprocess：hash_blocks登记两个满block的hash，num_cached_tokens=10，
+#         追加第1个生成token -> num_tokens=11（它的KV还没算，下一步才写进block 2的第3格）
+#   decode步1：算位置10的KV，采样出新token -> num_tokens=12
+#   decode步2：算位置11的KV，block 2写满 -> hash_decode_blocks可把它登记进前缀缓存（num_hashed_tokens跟着增长），
+#         这样下一轮对话"上轮prompt+上轮回答"也能命中；num_tokens=13
+#   decode步3：要写位置12的KV，block 2已满 -> 调度时BlockManager.may_append追加一个新block -> block_table=[5,9,2,7]
+#   若此时被抢占：block全部释放、block_table=[]、num_cached_tokens=0，token_ids里的真实token保留
+#         （num_prompt_tokens仍是10），重新准入时把已有token整体再prefill一次，能命中前缀缓存的部分可跳过
+#   同一prompt的第二个请求到来：前两块的hash命中 -> num_cached_tokens=8，只需算位置8~9
 #
 # 科普：前缀缓存（prefix caching）与block hash
 #   很多请求共享开头（system prompt、多轮对话的历史），它们的KV完全相同，可以直接复用而不是重算。
@@ -517,8 +519,9 @@ class Sequence:
         self.type = SequenceType.DUMMY
         # 全部token id：prompt + 已生成的token（array("i")，见new_token_ids）
         self.token_ids = new_token_ids(token_ids)
-        # 最后一个（已追加的）token，decode时作为模型输入；append_token时同步更新
-        # 注意：延迟输出模式下末尾可能是占位token，postprocess原地覆盖token_ids时并不更新它
+        # 最后一个token（沿用nano-vllm的字段，nano-vllm把它作为decode输入发给其他rank）
+        # 核对代码：ATOM里只有append_token更新它，atom/下没有其他地方读取它；decode输入由调度器从token_ids切片得到。
+        #   延迟输出模式下postprocess原地覆盖token_ids末尾的占位时也不会更新它，所以它可能是占位值
         self.last_token = token_ids[-1]
         # 科普：投机解码（speculative decoding / MTP）
         #   decode每步只产出1个token，GPU大部分时间在等显存读权重。投机解码先让一个便宜的"草稿模型"
@@ -568,8 +571,8 @@ class Sequence:
             if self.cache_seed is None:
                 self.cache_seed = multimodal_cache_seed(multimodal_data)
         # 【分支】Qwen3.5等多模态模型的M-RoPE位置（文本/图像的三维位置编码），见第8批
-        # mrope_positions：prompt部分每个token的三维位置，由InputOutputProcessor.preprocess（get_mrope_input_positions）算好
-        # mrope_position_delta：prompt之后的位置偏移。图片的占位token在M-RoPE下"不占满"线性位置，
+        # mrope_positions：prompt部分每个token的三维位置，由InputOutputProcessor.preprocess_fanout调用get_mrope_input_positions算好
+        # mrope_position_delta：prompt之后的位置偏移。图片的占位token在M-RoPE下占用的位置编号通常少于token个数，
         #   所以生成token的位置 = 线性位置 + delta（见atom/model_ops/attentions/backends.py里的start + delta）
         self.mrope_positions = mrope_positions
         self.mrope_position_delta = mrope_position_delta
