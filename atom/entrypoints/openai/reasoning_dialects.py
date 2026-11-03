@@ -37,6 +37,7 @@ Two dialects today, named by format rather than model:
 #   2. "两种"指两种格式，DIALECTS实际有三项：MiniMax-M3的<mm:think>是内联形态的另一种拼写，单独占一项
 #
 # 【导读】推理通道的"方言表"：每种模型家族用什么标记包住推理内容（reasoning content）
+#   推理内容是什么、为什么要拆出来：api_server.py 中 chat_completions 里的【科普】推理内容；引擎一侧的分工见 reasoning.py 文件头
 # 调用方：reasoning.py（ReasoningChannel / ReasoningFilter / separate_reasoning读取方言的标记和split）；
 #   resolve_dialect由api_server.py和atomesh/atom_standalone_service.py在启动时各调用一次
 # 与主干的关系：纯数据 + 非流式切分规则，没有状态；流式那一半在reasoning.ReasoningFilter里，两边读同一份标记表

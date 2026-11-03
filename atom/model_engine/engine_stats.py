@@ -37,7 +37,24 @@ logger = logging.getLogger("atom")
 # 调用方：Scheduler.__init__创建（scheduler.py，每个调度器一个，存为scheduler.engine_stats）；调度器在postprocess、
 #   prefill准入时调用update_spec / update_cache / update_throughput；engine_utility.py读取它回答统计查询和推送指标
 # 与主干的关系：只做统计和打日志，不影响调度；缓存命中各个计数器的含义属于第4批（BlockManager）、投机解码属于第7批
-# 前缀缓存的几个计数器满足 cached <= wanted <= compressed <= reusable <= full（详见下面各属性的翻译）
+# 阅读路线（本文件约1000行，三部分互不依赖）：__init__（三组计数器）→ spec部分（update_spec / log_spec）
+#   → cache部分（update_cache、五个命中率属性和_log_*，最长）→ throughput部分（maybe_log_throughput）
+# 前置①投机解码（spec部分；完整讲解见arg_utils.py EngineArgs.method上方的"【科普】投机解码"）：草稿模型每步先猜mtp_k个token，
+#   主模型一次forward同时验证，从第1个起连续猜对的被接受，再加上主模型自己给出的1个token，所以一步产出1~mtp_k+1个token。
+#   update_spec收到的num_accepted_tokens含主模型那1个，num_bonus = 它 − 1 = 被接受的草稿数k，distribution[k]记这种步数。
+#   例：mtp_k=3、100步共接受180个草稿 → 草稿总数300，接受率 = 180/300 = 60%，Average toks/fwd = 1 + 180/100 = 2.8
+# 前置②前缀缓存的五个计数器（cache部分；前缀缓存与hash链见scheduler.py文件开头【前置③】，状态checkpoint见【前置⑤】）：
+#   prompt按hash block沿hash链逐块查缓存，能复用的前缀一层层收窄，满足 cached <= wanted <= compressed <= reusable <= full：
+#     full        prompt的全部token
+#     reusable    去掉最后一个hash block（prefill至少要算一块才有logits可采样，它永远不复用）——所有命中率的分母
+#     compressed  分页KV池里实际还在的那段前缀（状态门控之前；名字来自DeepSeek-V4的压缩KV池，普通模型就是分页KV的命中）
+#     wanted      假如每个边界都有状态checkpoint，状态门控会放行到哪里
+#     cached      真正被接受、prefill时跳过的前缀
+#   例：1000个token、hash block=16 → full = 1000，reusable = (⌈1000/16⌉−1)×16 = 62块 = 992；池里还剩前50块 → compressed = 800；
+#     递归状态只在第32块有checkpoint → cached = 512；假如每块都有checkpoint，SWA窗口仍完整的最远边界在第48块 → wanted = 768。
+#     于是Hit = 512/992 = 51.6%，paged-hit = 800/992 = 80.6%，state-hit = 512/800 = 64%（80.6% × 64% = 51.6%），
+#     Lost-to-checkpoint = 256/992 = 25.8%，Lost-unrecoverable = 32/992 = 3.2%，binding = state
+#   没有状态缓存（SWA、递归状态等）的普通MHA/GQA模型没有状态门控：cached = wanted = compressed，有命中时state-hit = 100%
 
 
 # 三部分各自开关、各自按自己的节奏打日志的统计对象
@@ -190,6 +207,7 @@ class EngineStats:
         #   它还会随序列长度悄悄地改变比例——那个达不到的block是固定的 hash_block_size，所以它占1k prompt的约13%，
         #   占275k prompt的约0.05%。因此一个除以 full 的命中率，即使两个池表现完全相同，也会随长度分布而移动，
         #   这正是让两次运行无法比较的那个混杂因素。
+        # 解释："1k prompt的约13%"是按hash_block_size=128算的（128/1000）；默认block_size=16、不开DCP时是16/1000 = 1.6%
         self.total_reusable_tokens: int = 0
         # Reuse the lmcache CPU offload tier served. Sits above the HBM walk
         # rather than inside the `cached <= ... <= reusable` chain (see

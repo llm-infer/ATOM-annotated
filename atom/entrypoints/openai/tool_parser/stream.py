@@ -44,6 +44,10 @@ compares them, but no second implementation to compare against.
 #   atomesh/atom_standalone_service.py 各自为每个请求（每个choice）创建一个 ToolCallStreamParser，逐个delta调用 process，结束时调用 flush；
 #   非流式——registry.parse_tool_calls -> read_whole
 # 与主干的关系：服务层的后处理，输入是detokenize后的文本增量，输出交给SSE组帧（见本批 sse.py / serving_chat.py）
+# 阅读路线（约1050行）：Region（区域缓冲）-> ToolCallStreamParser.process / flush -> _pump（主循环，对应上面1~3步）
+#   -> _announce（提前播报工具名）/ _closed_len（区域是否已闭合）-> _close_region（解析并按spans交错输出）-> _emit_call / _start_event；
+#   模块级的 _markup_spans / _region_tail / _region_owes_a_closer 是 _close_region 用到的判定，可以后读；
+#   文件末尾的 read_whole / read_whole_events / flatten_tool_events 是非流式入口
 
 import logging
 

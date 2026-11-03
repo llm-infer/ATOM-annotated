@@ -27,6 +27,10 @@ standalone router only needs to bridge requests and responses.
 #   StreamRequestState：流式请求的回调，把每批新token解码后作为事件放进stream_queue
 #   ChatCompletionStreamState / CompletionStreamState：drain时从stream_queue取事件，变成OpenAI格式的SSE chunk
 #   AtomStandaloneService：对Rust暴露的门面，负责请求校验、chat template、采样参数和流注册表
+# 阅读顺序（约1950行）：先读门面 AtomStandaloneService 的 chat_completions（非流式）和
+#   start_chat_completions_stream / drain_chat_completions_stream（流式），再顺着调用往下：
+#   AtomEngineService.generate / start_stream -> _worker_loop -> SingleRequestState / StreamRequestState.record
+#   -> ChatCompletionStreamState.drain；completions 那一套与 chat 同构，可以跳过
 # stream_queue里的事件有三种：{"index", "text", "token_ids", "finished", "finish_reason"[, "kv_transfer_params"]}、
 #   {"error": 信息}、{"done": True}（所有兄弟序列都结束）
 

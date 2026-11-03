@@ -27,6 +27,22 @@ for ``/v1/messages``.
 #     流式：ResponseStreamEmitter 把事件变成 response.created -> response.output_item.added -> ...delta -> ...done ->
 #       response.completed 这一串SSE事件，最后发 data: [DONE]
 #   两个方向的出口都经过 CodexToolContext.rewrite_*，把function_call还原成Codex原来的 custom_tool_call / tool_search_call
+# 前置：Responses API 与 chat completions 的区别（读本文件只需记住这几点）
+#   请求：对话不放在messages里，而是 instructions（相当于system消息）+ input——一个字符串，或一串带type的"项"，如
+#     {"type": "message", "role": "user", "content": [...]}、{"type": "function_call", "call_id", "name", "arguments"}、
+#     {"type": "function_call_output", "call_id", "output"}、{"type": "reasoning", ...}；工具定义是扁平的 {type, name, parameters}
+#   响应：output 也是一串项（reasoning / message / function_call），流式时每个项以 response.output_item.added 开始、
+#     以 response.output_item.done 结束，文本和工具参数在两者之间以delta事件逐段发出；
+#     而不是chat那样平铺的 content / reasoning_content / tool_calls 字段
+#   Codex额外的工具形态：custom（参数是一段自由文本而不是JSON，可附带grammar语法定义）、namespace（把一组子工具归在一个名字下）、
+#     tool_search（客户端执行的"搜索并加载暂未列出的工具"）；本文件把它们改写成普通function，响应时再还原
+#   推理内容、工具调用这两个概念的要点见 serving_anthropic.py 文件头【导读】里的"前置"
+# 阅读路线（约1200行，四部分，与代码里的 ── 分节线对应）：
+#   ① Codex工具形态的归一化 / 还原（CodexToolContext、normalize_codex_request 及其辅助函数）
+#   ② Responses -> 内部chat（responses_tools_to_openai、responses_to_openai_messages）
+#   ③ 非流式响应（build_responses_response）
+#   ④ 流式（ResponseStreamEmitter，占全文四成多，先读它的类注释）
+#   建议先读②③把两种格式的对应关系看懂，再读④；①只在对接Codex时需要
 
 from __future__ import annotations
 

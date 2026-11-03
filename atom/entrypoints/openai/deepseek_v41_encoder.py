@@ -11,9 +11,10 @@ ATOM's common controls and attach top-level tool schemas to the system turn.
 #
 #   prompt的构造仍由官方编码器完成。这些钩子只负责翻译ATOM的通用控制参数，并把顶层的工具schema挂到system轮次上。
 #
-# 【导读】DeepSeek-V4.1不用Jinja chat template，而是随checkpoint附带一个Python编码器（encoding_dsv41）；
-#   本文件是这个编码器的两个前处理钩子
-# 调用方：chat_encoder_adapters.py的_PREPARERS["encoding_dsv41"]（只有hf config的model_type为deepseek_v41时才选用），
+# 【导读】DeepSeek-V4.1不用Jinja chat template（chat template是什么见chat_encoders.py文件头【科普】），
+#   而是随checkpoint附带一个Python编码器（encoding_dsv41）；本文件是这个编码器的两个前处理钩子
+# 调用方：chat_encoder_adapters.py的_PREPARERS["encoding_dsv41"]（编码器模块名就是encoding_dsv41时直接选用；
+#   模块名是通用的"encoding"时，只有hf config的model_type为deepseek_v41才映射过来，见该文件的_MODEL_ENCODERS），
 #   chat_encoders.py渲染prompt前调用prepare_messages，编码器适配器调用prepare_kwargs
 # 与主干的关系：服务层prompt渲染的一个模型特化分支；【分支】DeepSeek-V4.1模型见第8批
 

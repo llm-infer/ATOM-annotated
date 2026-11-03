@@ -7,10 +7,12 @@
 #
 # 【导读】多模态输入的数据类型定义
 # 一个多模态chat请求在服务层的流程（本批2b）：
-#   chat_utils.parse_chat_messages：从OpenAI消息的content parts中拆出媒体，得到MultiModalDataItems（按模态分组的列表）
+#   entrypoints/chat_utils.py的parse_chat_messages：从OpenAI消息的content parts中拆出媒体，得到MultiModalDataItems（按模态分组的列表）
 #   -> processing.prepare_multimodal_inputs：parse.normalize_multimodal_data规范化 -> media.MediaLoader读取并解码（得到PIL图像）
 #   -> registry按模型架构选出输入构建函数（Qwen3.5-VL / Kimi-K3 / DeepSeek-V4.1），由它跑processor、展开占位token
 #   -> 得到(input_ids, multimodal_data)，交给LLMEngine（预处理时计算M-RoPE位置）构造Sequence
+#   （占位token、processor的要点见本包__init__.py的前置①②；M-RoPE：图片token的位置用(t, h, w)三个编号而不是一维序号，
+#    见model_config/qwen3_5.py文件头【科普】②）
 # 本文件只定义类型：媒体可以是URL/路径字符串、原始字节（EncodedMedia）或已解码的对象（PIL图像、AudioData、VideoData）
 # v0.1.8的原生引擎只支持image；audio / video的类型已经定义，但prepare_multimodal_inputs会在加载前拒绝它们
 

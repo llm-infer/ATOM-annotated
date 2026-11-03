@@ -14,11 +14,15 @@ constructed Python objects and uses them in ``AtomStandaloneRouter``.
 # atomesh是什么：atom/mesh 下的Rust项目（Atomesh，见 atom/mesh/README.md），本身是面向PD分离部署的模型路由网关
 #   （多worker负载均衡、重试、熔断、Prometheus指标）；编译产物 libmesh.so 同时是一个名为 atomesh_runner 的
 #   PyO3扩展模块（atom/mesh/src/python.rs），提供 parse_from / launch_mesh 等函数给Python调用
+#   PyO3：Rust与Python互相调用的绑定库——Rust代码编译成.so后Python可以直接import；Rust一侧也能先取得GIL
+#     （atom_standalone.rs里的Python::attach），再调用Python对象的方法。standalone模式正是靠后者让Rust的HTTP线程调用Python服务对象
 # 两种运行方式，由 main 按命令行里有没有 mesh-only 区分：
 #   1. ATOM standalone（默认）：Python在本进程内建好 LLMEngine 和 tokenizer，包装成 AtomStandaloneService
 #      （本目录 atom_standalone_service.py），交给Rust的HTTP服务；Rust负责HTTP、生命周期和可观测性，
 #      收到请求后经PyO3调用该服务对象的方法
 #   2. mesh-only：纯路由器，本进程不建引擎，把请求转发给外部的worker（可以是PD分离的prefill / decode节点）
+#      （PD分离：prefill和decode放在不同实例上跑，prefill实例算完把KV cache传给decode实例；
+#       入门见model_engine/arg_utils.py的【科普】PD分离）
 #      【分支】PD分离的路由与KV交接，见第9批
 # 与 api_server.py 的区别：api_server 是 FastAPI + uvicorn，HTTP层和OpenAI语义都在Python里；
 #   standalone模式下HTTP层换成了Rust，Python只保留OpenAI语义（chat template、推理内容分离、工具调用解析）。

@@ -45,6 +45,9 @@ Usage:
 #   chat template与特殊token → chat_encoders.py文件头；推理内容（<think>）→ 本文件chat_completions里；
 #   工具调用格式、前缀缓存与cached_tokens → serving_chat.py文件头；增量反分词与偏移量 → streaming_dispatch.py的
 #   IncrementalStreamDetokenizer前；图片占位token与视觉编码器 → examples/multimodal_inference.py文件头
+#   另有几条前置在本文件里就地交代（带数字，后文用到时指回这里）：prefill / decode的瓶颈 → 下面"引擎侧术语"的第一条；
+#   HTTP分块传输与SSE → 下面的SSE条目；分页KV与"为什么断开要abort" → 下面"原理"一节；推理内容的要点 → ① Global State里
+#   model_starts_in_reasoning前的"前置"
 # 注释里的记号（注释计划ANNOTATION_PLAN.md的约定）：
 #   "第N批"=按主题划分的阅读批次，用来指路：第1批配置与请求对象、第2批引擎主循环与服务层（2b多模态、2c本服务层）、
 #   第3批调度器、第4批KV cache、第5批ModelRunner、第7批投机解码、第8批新模型、第9批PD分离与分布式、第10批指标等周边；
@@ -91,11 +94,20 @@ Usage:
 # SSE（服务端推送事件）：一种HTTP流式响应。响应头 Content-Type: text/event-stream，响应体不一次性返回，
 #   而是一帧一帧地写，每帧形如 "data: {json}\n\n"；OpenAI的流式协议以 "data: [DONE]\n\n" 结尾。
 #   FastAPI的StreamingResponse包装一个异步生成器：生成器每yield一个字符串，就往socket写一次
-#   （具名帧"event: ...\ndata: ..."，以及为什么用SSE而不是WebSocket，见sse.py）
+#   前置（HTTP怎样"边生成边发"）：普通HTTP响应在头里声明Content-Length，正文一次写完；流式响应事先不知道总长度，
+#     HTTP/1.1下靠"Transfer-Encoding: chunked"（分块传输编码：正文切成若干段，每段先写本段字节数，最后写一个长度为0的段
+#     表示结束）。uvicorn对没有Content-Length的StreamingResponse自动这样发，每次yield就是一段；SSE是在这种正文里约定的帧格式
+#   （线上字节的样子、具名帧"event: ...\ndata: ..."，以及为什么用SSE而不是WebSocket，见sse.py）
 # 下文常用的引擎侧术语（一句话定义；带图的入门科普在括号里指向的位置）：
 #   prefill / decode：prefill是一次前向处理整段prompt、写入KV cache并采样出第1个token；decode是之后每步只喂上一个token、
-#     生成下一个（为什么一个计算受限、一个访存受限：model_engine/engine_core.py文件开头【2】）。
-#     KV cache按固定大小的block分给各序列（examples/simple_inference.py的"科普·KV cache"，第4批）
+#     生成下一个。两者的瓶颈不同，下面的TTFT / ITL都建立在这一点上：
+#     prefill的线性层是[T, hidden] × 权重，读一次权重就做T个token的计算 → 算力受限，耗时约与prompt长度T成正比；
+#     decode每条序列每步只有1个新token，batch为B时是[B, hidden] × 权重，每步都要把全部权重（外加各序列的KV）从显存
+#     读一遍 → 带宽受限。例：8B模型BF16权重≈16GB，按MI300X的HBM≈5.3TB/s，一步decode光读权重就要≈3ms，而32条序列的
+#     计算量2 × 8e9 × 32 ≈ 5e11 FLOP在BF16≈1300 TFLOPS下只要≈0.4ms，所以batch里1条还是32条耗时差不多。
+#     于是TTFT主要由prefill决定，ITL ≈ 一个decode step（70B模型的完整估算：model_engine/engine_core.py文件开头【2】）
+#     KV cache按固定大小的block分给各序列（完整讲解：model_engine/sequence.py BlockTable类上方"科普：KV cache分块"；
+#     本文件用到的要点和数字见下面"为什么客户端断开要立刻abort"）
 #   投机解码（MTP等）：先由便宜的草稿头猜出后面几个token，主模型一次前向同时验证，猜对几个就一个step输出几个
 #     （model_engine/arg_utils.py的"【科普】投机解码"，第7批）
 #   Sequence：引擎里"一条生成序列"的对象，带prompt token、采样参数、已生成的token和KV block表（第1批sequence.py）
@@ -113,10 +125,12 @@ Usage:
 #   3. 输出：token id → 文本（非流式一次decode，流式增量反分词），再拆出reasoning_content / tool_calls（serving_chat.py）
 #   4. 结束：引擎的leave_reason → finish_reason（stop / length / tool_calls，见protocol.openai_stop_reason*）
 #   5. 计量：usage = prompt_tokens（渲染模板后的prompt长度，含模板加的特殊token）/ completion_tokens /
-#      prompt_tokens_details.cached_tokens（前缀缓存命中、不用重新prefill的prompt token数，科普见serving_chat.py文件头）
+#      prompt_tokens_details.cached_tokens（前缀缓存命中、不用重新prefill的prompt token数；按整块命中，例：两条请求渲染后
+#      前100个token相同、block=16 → 96。科普见serving_chat.py文件头）
 # 为什么要流式：自回归生成的总时延 ≈ TTFT + (输出token数 - 1) × TPOT
-#   TTFT（首token时延）= 排队 + prefill；prefill是计算密集的，随prompt长度增长
-#   TPOT（每个输出token的时间）≈ 一个decode step的耗时；decode是访存密集的（每步都要读一遍权重和整段KV），随batch和上下文缓慢增长
+#   TTFT（首token时延）≈ 预处理（模板渲染、tokenize）+ 排队 + prefill；prefill是计算密集的，随prompt长度增长
+#     （/metrics里的TTFT从RequestTimingMiddleware收到请求时算起，所以包含预处理，见request_timing.py）
+#   TPOT（每个输出token的时间）≈ 一个decode step的耗时；decode带宽受限（见上面prefill / decode条目），随batch和上下文缓慢增长
 #   例：TTFT=0.3s、TPOT=20ms、输出500个token → 非流式要等 0.3 + 499×0.02 ≈ 10.3s 才看到第一个字；
 #     流式0.3s就开始显示，之后每20ms左右来一段。用户感知的快慢主要看TTFT和ITL（相邻两次输出的间隔，即逐段测得的TPOT；
 #     投机解码时一个step可能一次吐出多个token，ITL会"一阵一阵"的）
@@ -124,8 +138,14 @@ Usage:
 #   一个线程挂几千个协程就够了；真正的批处理（continuous batching：每个step都有序列加入或离开batch，
 #   见model_engine/engine_core.py文件开头【1】）在EngineCore进程的Scheduler里
 # 为什么客户端断开要立刻abort：KV cache是推理服务最稀缺的资源，它决定了能同时跑多少条序列。
-#   例：一条序列已有4000个token的KV，max_tokens还剩6000；客户端走了却不abort，它会继续占着KV block和batch里的一个位置
-#   再decode 6000步——这期间等待中的请求因KV不够而进不来，TTFT被拉长。abort后调度器在下一个step结束它并释放block
+#   前置（分页KV，只说这里用到的；完整讲解：model_engine/sequence.py BlockTable类上方"科普：KV cache分块"）：
+#     显存里的KV池切成固定大小的block（默认每块16个token）。调度器接纳一条序列时按整段prompt一次分给它⌈prompt长度 / 16⌉
+#     个block，之后decode每写满16个token再补一块；这些block一直归它，直到序列结束（正常停止，或被abort）才还回空闲池。
+#     也就是说，一条序列占多少KV只取决于它已有多少个token，与客户端还在不在无关——引擎不知道没人在读
+#   数字：32层、8个KV头、head_dim 128的GQA模型（如Llama-3-8B），BF16下每token的KV = 2 × 32 × 8 × 128 × 2字节 = 128KB
+#     （公式见model_engine/arg_utils.py kv_cache_dtype上方的【科普】），4000个token = 250个block ≈ 500MB
+#   例：一条序列已有4000个token的KV，max_tokens还剩6000；客户端走了却不abort，它会继续占着这250个block（之后还要再补375个）
+#     和batch里的一个位置再decode 6000步——这期间等待中的请求因KV不够而进不来，TTFT被拉长。abort后调度器在下一个step结束它并释放block
 # ---- 图1：一个流式chat请求的完整路径 ----
 #   客户端  POST /v1/chat/completions  {"messages": [...], "stream": true}
 #     │  uvicorn解析HTTP → FastAPI用pydantic校验JSON → ChatCompletionRequest
@@ -194,7 +214,7 @@ Usage:
 #   非流式请求（generate_async）不经过dispatcher：每次回调直接
 #     loop.call_soon_threadsafe(token_queue.put_nowait, {...})，handler里 await token_queue.get() 一直收集到结束
 #
-# ---- 图3：一个流式chat请求的具体时间线（数字为示意，取一台空闲服务器上8B级模型的典型量级）----
+# ---- 图3：一个流式chat请求的具体时间线（时间数字是便于心算的示意值，不是实测）----
 #   请求：POST /v1/chat/completions
 #     {"model": "Qwen/Qwen3-8B", "messages": [{"role": "user", "content": "用一句话介绍北京"}],
 #      "stream": true, "max_tokens": 64, "chat_template_kwargs": {"enable_thinking": false}}
@@ -210,7 +230,7 @@ Usage:
 #               data: {"id":"chatcmpl-…","object":"chat.completion.chunk",…,"choices":[{"index":0,
 #                      "delta":{"role":"assistant","content":""},"finish_reason":null,"logprobs":null}]}
 #               data: {…"choices":[{"index":0,"delta":{"content":"北京"},"finish_reason":null,…}]}
-#             _client_stream                 第一帧带生成内容 → timing.first_output：TTFT ≈ 30ms（含排队 + prefill）
+#             _client_stream                 第一帧带生成内容 → timing.first_output：TTFT ≈ 30ms（从t=0算起：含渲染/tokenize、排队和prefill）
 #   t≈50ms    同上，下一个decode step        data: {…"delta":{"content":"是"}…}         ITL ≈ 20ms（≈一个decode step）
 #   …         每≈20ms一帧                    中国的首都，…（事件循环忙时几个step会合并成一帧，见streaming_dispatch.py）
 #   t≈470ms   最后一个step                   第23个token是EOS → chunk带finished=True、finish_reason="eos"
@@ -433,6 +453,12 @@ tokenizer: AutoTokenizer | None = None
 #   工具调用（如果有的话）会作为普通文本交付——这一点在启动时就明确说出来，而不是到这里才发现。
 # main()中由resolve_tool_call_parser（tool_parser/registry.py）给出；--tool-call-parser可以显式指定
 tool_call_parser_cls: type | None = None
+# 前置：推理内容（下面model_starts_in_reasoning、reasoning_dialect、reasoning_toggle三个全局变量都为它服务；
+#   完整的【科普】推理内容在chat_completions里，本文件后面再用到时都指向那里）
+#   推理模型训练时学会了先在一对标记之间写草稿、再写答案。例：Qwen3.5的一次回答（<think>是特殊token，id 151667）
+#     <think>\n先算……\n</think>\n\n答案是42<|im_end|>   → 服务端拆成 reasoning_content="先算……"、content="答案是42"
+#   各模型的标记不同（"方言"）；有的模板把<think>预填在prompt末尾，模型输出里只出现</think>；DeepSeek-R1连prompt里都
+#   看不到开头。所以启动时要从chat template读出三件事：方言、是否默认从思考段内部开始、用哪个模板参数关掉推理
 # Whether this model's output begins inside the reasoning channel even when
 # nothing in the prompt or the output says so -- DeepSeek-R1 closes a block it
 # never opens. Read from the chat template at startup, because a single

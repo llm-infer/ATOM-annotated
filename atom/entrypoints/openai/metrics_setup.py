@@ -4,6 +4,8 @@
 #
 # 【导读】API服务进程的Prometheus指标装配：创建AtomMetricsExporter（渲染/metrics）、RequestMetrics（TTFT等请求延迟直方图）、
 #   StreamMetrics（流式交付指标），并把streaming_dispatch.longest_silence_seconds交给exporter，作为"最饥饿的流已等待多久"的数据源
+#   （Prometheus：拉取式监控系统，定期HTTP GET /metrics，拿到"指标名{标签} 数值"这样的文本行并存成时间序列；
+#    TTFT这类直方图指标按耗时分桶计数，监控端据此算P50 / P99）
 # 调用方：api_server.py在模块加载时调用一次create_metrics_exporter()
 # 与主干的关系：只做装配；指标本身定义在atom/metrics/下，【分支】指标与可观测性见第10批
 

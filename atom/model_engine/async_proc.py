@@ -94,6 +94,12 @@ logger = logging.getLogger("atom")
 #   是【分支】，第一遍可以跳过
 # 术语：TP rank = 张量并行组里的第几张卡；PCP = prefill上下文并行（-pcp，它的rank也是这里的worker）；
 #   SPMD、延迟输出、为什么一张卡一个进程：见engine_core.py文件开头【3】【4】；"第N批"的含义也见engine_core.py文件开头的术语速查；
+#   all-reduce与SPMD的要点（读懂本文件"为什么所有rank必须按同样顺序执行同样的指令"所必需；完整图解见engine_core.py文件开头【4】）：
+#     TP=2时每层的q/k/v投影按头切开——64个q头、8个KV头的模型，rank 0算q头0~31和KV头0~3，rank 1算其余；o_proj也只乘
+#     自己那一半，于是每张卡手里只有输出的部分和y0、y1。all-reduce（求和）让两张卡都拿到y = y0 + y1，才能进下一层；
+#     80层的模型每层约2次（注意力后、MLP后），一次forward约160次。all-reduce是"组里所有rank都到齐才返回"的会合点：
+#     任何一个rank少执行一次forward、或输入形状不同导致调用次数不同，其余rank就永远等在那里。所以TP组必须是
+#     SPMD（Single Program Multiple Data）：程序和调用顺序完全相同，只有手里的权重分片不同
 #   custom all-reduce：aiter实现的同机all-reduce，各GPU用IPC把彼此的一块显存映射进来直接读写、不走RCCL——
 #   worker意外变成孤儿时占住的"IPC资源"就是它（见下面AsyncIOProc.__init__开头）
 #
@@ -147,7 +153,7 @@ logger = logging.getLogger("atom")
 #     - forward指令里最大的block table只发增量（block_table_codec.py），nano-vllm每步重发整张表
 #
 # 设计原理：
-#   SPMD（TP的每个rank以同样顺序执行同样的方法、输入形状一致，否则all-reduce永久挂起；图解见engine_core.py文件开头【4】）：
+#   SPMD（TP的每个rank以同样顺序执行同样的方法、输入形状一致，否则all-reduce永久挂起；要点见上面的术语，图解见engine_core.py文件开头【4】）：
 #     MessageQueue是"一个写者、多个读者"的FIFO：EngineCore写一次，每个rank按同样的顺序读到同样的指令序列，天然满足这一点；
 #     同一个batch也只pickle一次，而不是给每个rank各pickle、各发一遍
 #   为什么用共享内存而不是socket下发：decode一步只有10ms量级，指令下发就在关键路径上。共享内存只需一次pickle和一次写入，
@@ -173,7 +179,7 @@ logger = logging.getLogger("atom")
 #   │                            │ （RpcResult）   │ 按rank收齐）          │ clear_kv_cache、白名单worker方法          │
 #   └────────────────────────────┴────────────────┴─────────────────────┴──────────────────────────────────────────┘
 #
-# 多步流水（TP=2，开延迟输出时；见engine_core.py文件开头【3】）：call_func("forward")在GPU还在跑本步时就返回，
+# 多步流水（TP=2，开延迟输出时；见engine_core.py文件开头【3】，launch为什么能立刻返回见【3】开头的前置"GPU的异步执行与stream"）：call_func("forward")在GPU还在跑本步时就返回，
 #   于是EngineCore可以在GPU执行第N步期间把第N步之后的旁路指令和第N+1步的forward继续写进MessageQueue：
 #
 #   EngineCore  │enq fwd N│等N-1的token│post N-1│sched N+1│enq fwd N+1│等N的token│post N│...
@@ -346,7 +352,8 @@ class AsyncIOProc:
         # 【译】与EngineCore那边的调用相比是次要的，但不是零：没有它的话，冻结仍会发生在一波请求的边界上，那时prefill的突发
         #   会产生足够多的对象，在这里触发第2代回收。它在模型构建之前运行，这样阈值能覆盖启动阶段的堆。冻结那个堆则发生在
         #   之后，通过EngineCore的 freeze_gc_heap RPC 完成。
-        # 解释：tune_gc按ATOM_GC_THRESHOLD调高本进程的GC阈值（未设置时什么也不做），见gc_utils.py
+        # 解释：tune_gc按ATOM_GC_THRESHOLD调高本进程的GC阈值（未设置时什么也不做），见gc_utils.py；
+        #   "第2代""阈值""冻结"的含义见gc_utils.py文件开头的【科普】CPython的分代GC
         tune_gc()
         maybe_attach_gc_debug_callback(name)
 
@@ -362,6 +369,8 @@ class AsyncIOProc:
         #   必须在任何大块分配 / 原生（mooncake）线程创建之前运行，这样子线程会继承CPU掩码，首次访问（first-touch）
         #   的内存也落在本地节点。节点内的GPU编号是 dp_local_rank*tp_size+tp_rank（engine_core_mgr中的GPU分配方式）。
         #   尽力而为：这里的任何失败都只记日志并跳过，而不会让worker挂掉，所以用了捕获一切的except。
+        # 解释：NUMA节点 = 一个CPU插槽的核 + 它直连的内存（每张GPU也挂在某个插槽的PCIe下）；first-touch = 物理页在第一次
+        #   写入时才分配，落在执行写入的那个CPU所在的节点。插槽/PCIe拓扑图见numa_utils.py文件开头
         try:
             cfg = args[0]
             # Node-local: this indexes a GPU on THIS machine. The global rank

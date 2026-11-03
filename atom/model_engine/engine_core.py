@@ -93,7 +93,10 @@ from atom.utils.gc_utils import (
 #                           文件开头_KV_OFFLOAD_MODES上方的【科普】；本文件末尾的RapidServe是"同一组GPU上"的PD分离
 #   KV connector            在实例之间、或GPU与CPU/存储之间搬KV的插件（mooncake、LMCache等，第9批）
 #   MTP                     投机解码的一种，decode每步要一起验证mtp_k个草稿token → arg_utils.py的method字段上方的【科普】
-#   ITL / TPOT / TTFT       相邻两个输出token的间隔 / 平均每个输出token的耗时 / 首token延迟
+#   ITL / TPOT / TTFT       相邻两个输出token的间隔 / 平均每个输出token的耗时 / 首token延迟。例（公式同llm_engine.py里的
+#                           TTFT/TPOT）：100.00s到达、100.25s出第1个token、102.25s出第21个 → TTFT = 0.25s，
+#                           TPOT = (102.25 − 100.25) / (21 − 1) = 0.1s；ITL是每个相邻间隔，平时约0.1s，若其间插进一次0.5s的
+#                           prefill（见【2】），那一个间隔就约0.6s——平均TPOT只多0.025s，P99 ITL却由这种尖峰决定
 #   H2D / D2H               主机→GPU / GPU→主机的拷贝
 #   RCCL / gloo             AMD的GPU集合通信库（相当于NCCL）/ PyTorch在CPU张量上做集合通信的后端
 #   CUDA IPC                同机进程间共享显存：一个进程把一块显存导出成句柄，另一个进程打开后看到的就是同一块显存，不拷贝
@@ -122,7 +125,7 @@ from atom.utils.gc_utils import (
 # 【2】prefill与decode：两种性质完全不同的负载
 #   prefill：一次处理T个prompt token（几百~几千），线性层是 [T, hidden] x [hidden, out]，每读一次权重做T份计算 → 计算受限
 #   decode：每个请求每步只有1个新token，batch=B时线性层是 [B, hidden] x [hidden, out]，每步都要把全部权重
-#     （外加所有请求的KV cache）从HBM读一遍，只做B份计算 → 访存带宽受限
+#     （外加所有请求的KV cache）从HBM（GPU的显存）读一遍，只做B份计算 → 访存带宽受限
 #   量级估算（70B稠密模型，FP8权重≈70GB；按MI300X理论峰值：HBM≈5.3TB/s，FP8稠密≈2600 TFLOPS（BF16稠密≈1300））：
 #     decode B=64：读权重 70GB / 5.3TB/s ≈ 13ms；计算 2×70e9×64 ≈ 9e12 FLOP ≈ 3.5ms → 由带宽决定，B翻倍耗时几乎不变
 #     prefill T=8192：2×70e9×8192 ≈ 1.1e15 FLOP ≈ 0.45s → 由算力决定，耗时近似与token数成正比
@@ -137,11 +140,20 @@ from atom.utils.gc_utils import (
 #     减少decode被打断的次数。vLLM V1等引擎则可以在同一步里混合prefill chunk和decode
 #
 # 【3】CPU调度与GPU执行的重叠：延迟输出（deferred output）
+#   前置：GPU的异步执行与stream（本文件的RapidServe部分、async_proc.py的多步流水图、utils/__init__.py的H2D拷贝都指回这里）
+#     CPU调用一个GPU算子只是"发射（launch）"：把kernel排进一个stream（GPU上的FIFO命令队列）就返回，只花几µs；GPU按队列
+#     顺序逐个执行。同一stream里的命令严格串行，不同stream之间可以并发
+#     CPU只在要读GPU结果时才必须等：.item()、.tolist()、不带non_blocking的.cpu()、torch.cuda.synchronize()、
+#     event.synchronize()（event = 排进stream的一个"执行到这里"的标记）——这些是同步点，CPU停在那里直到排在前面的命令都执行完
+#     例：decode一步约1200个kernel（80层×每层约15个），CPU发射完要几ms，GPU跑完要10ms量级；只要中途不碰同步点，
+#       CPU发射完就能去做别的事，GPU队列里的活也不会断
 #   朴素做法（nano-vllm）：CPU调度 → GPU forward → 同步等采样结果拷回CPU → CPU postprocess → 再调度，GPU在CPU干活时空闲。
 #     decode一步GPU只要10ms量级时，几ms的Python调度+postprocess就是两三成的GPU空转
 #   ATOM的ModelRunner默认开延迟输出（tokenID_processor.is_deferred_out：非PP、且不是"要交接递归状态的PD producer"时为True）：
 #     forward(第N步) 发射第N步的kernel并启动采样结果的异步D2H拷贝后，只等待并返回*第N-1步*的token；
 #     第N+1步decode的input_ids直接取GPU上的prev_token_ids，不需要先等CPU拿到token
+#     （实现：采样结果的D2H拷贝排在单独的async_copy_stream上，拷完record一个event；下一次forward才对这个event做
+#      synchronize取出token，见model_runner.py里tokenIDProcessor的send_to_cpu_async / recv_async_output）
 #   时间线：
 #     CPU(EngineCore): [sched N][launch N][等N-1的token][post N-1][sched N+1][launch N+1][等N的token][post N]...
 #     GPU:             ...forward N-1 ===][========== forward N ==========][========== forward N+1 ======...
@@ -236,6 +248,15 @@ class EngineCore:
     #   Scheduler随后读同一个对象；ATOM的ModelRunner在另一个进程里，它的改写对EngineCore不可见，所以要显式用RPC
     #   拿回block数，再写进本进程的config（Config.num_kvcache_blocks初始为-1）
     #
+    # 前置（下面的显存预算里，两项既不是权重也不是KV的开销）：
+    #   激活（activation）：forward中的中间张量——每层的输入/输出hidden、q/k/v、MLP中间结果、注意力的workspace……一层用完就释放，
+    #     下一层复用同一块显存，所以占用的不是所有层之和，而是某一时刻同时活着的最大值（峰值），并随一次forward的token数线性增长。
+    #     例（下面②里的70B模型：hidden=64×128=8192、MLP中间维28672；一次prefill max_num_batched_tokens = 16384个token，默认值）：
+    #     单是MLP的gate/up输出 [16384, 2×28672] BF16 就 ≈ 1.9GB。KV cache只能分配在这个峰值之外，否则运行中一次满额prefill就会OOM
+    #   CUDA Graph的私有内存池：录图时forward里的中间张量都从一个专用池分配，地址被写死进graph、回放时原地复用，
+    #     所以这块显存录完后一直被占着、不能再分给KV（各个batch尺寸的graph共用一个池，图解见utils/__init__.py里
+    #     weak_ref_tensor上方；CUDA Graph本身见config.py里CUDAGraphMode上方的【科普】）
+    #
     # 为什么启动顺序必须是 加载权重 → warmup → 测显存算block数 → 分配KV → 捕获CUDA Graph → 建Scheduler：
     #   ① warmup（ModelRunner.__init__末尾的_maybe_warmup → warmup_model）：先reset_peak_memory_stats，再跑一次
     #     max_num_batched_tokens量级的假prefill，让PyTorch分配器记下激活的峰值——相当于一次profile run
@@ -245,7 +266,7 @@ class EngineCore:
     #     例（量级，数字与预算条一致）：192GB的卡、utilization=0.9 → 预算172.8GB；权重70 + 激活峰值8 + 其他约7.4
     #       （非torch≈2 + graph池≈1.6 + 2%余量≈3.8）→ KV约87GB；
     #       80层、8个KV头（GQA：64个q头每8个共用一组K/V）、head_dim=128、FP8 KV的模型，
-    #       每token的KV = 2(K和V)×80×8×128×1B = 160KB；block_size=16 → 每个block 2.5MB → 约3.5万个block ≈ 56万个token的KV容量
+    #       每token的KV = 2(K和V)×80×8×128×1B = 160KB；block_size=16 → 每个block 2.5MB → 约3.5万个block ≈ 57万个token的KV容量
     #   ③ 为什么不能写死：权重大小、激活峰值、TP切分、KV dtype、同卡上的其他进程都会改变结果，只能在本机实测；
     #     而block数就是调度器的准入上限（BlockManager没有空闲block时请求只能等待或被抢占），所以必须测完才能建Scheduler
     #   ④ CUDA Graph在KV分配之后捕获：graph里记录的是kernel参数中的显存地址，KV cache必须已经在它最终的地址上；
@@ -292,10 +313,12 @@ class EngineCore:
     #   │◄──────── peak_torch（= max(peak, current)）──────►│         │        │                              │
     #   │◄──────────────────────── budget = total × gpu_memory_utilization = 172.8GB ──────────────►│
     #     非torch：RCCL/custom all-reduce缓冲等不经PyTorch分配器的显存 = (total−free) − memory_reserved()
+    #       （all-reduce见文件开头【4】；custom all-reduce是aiter实现的同机all-reduce，用IPC把各卡的一块缓冲互相映射后
+    #        直接读写、不走RCCL，术语见async_proc.py文件开头）
     #     graph：_estimate_cudagraph_overhead（enforce_eager时为0；PIECEWISE时按逐token字节数×捕获的token总数估计，上限约预算的15%）
     #     余量：total × 2%；RapidServe再多扣 _kv_budget_extra_reserve = 4×2% = 8%；KV connector缓冲（若有）也先扣掉
     #     最终 available_for_kv = min(上面算出的值, 实际空闲显存 − connector缓冲)，再交给plan_pools按各子池切分成block
-    #   读法：gpu_memory_utilization每调高0.01，在这张卡上就多出约1.9GB的KV（约760个2.5MB的block、约1.2万个token）；
+    #   读法：gpu_memory_utilization每调高0.01，在这张卡上就多出约1.9GB的KV（约790个2.5MB的block、约1.26万个token）；
     #     调得太高的代价是分配器碎片、其他进程或之后的临时分配没有余地，运行中OOM
     def __init__(self, config: Config, input_address: str, output_address: str):
         self.label = "Engine Core"
@@ -428,15 +451,25 @@ class EngineCore:
             #   扫描用的dummy forward会跨stage，必须锁步运行。
             # 【分支】动态分块的PP prefill，见第9批 dynamic_chunking.py
             # 【科普】动态分块（dynamic chunking）是什么——从chunked prefill和MHA的注意力开销出发：
+            #   前置①流水线并行PP（完整讲解见arg_utils.py pipeline_parallel_size上方的【科普】）：-pp 2时把80层的模型切成两段，
+            #     stage0（一个EngineCore + 它的GPU）算第0~39层，把hidden state交给stage1算第40~79层。同一个长prompt的各个chunk
+            #     可以流水起来：stage1算c0时，stage0已经在算c1（c1在stage0上只用到stage0自己存的、c0在第0~39层的KV）
+            #   前置②流水线气泡：某个stage手上没活、在等上游送来下一块的空闲时间。每块在各stage上耗时都是t_i时，一条prompt的
+            #     完成时间 = Σt_i + (stage数−1) × max(t_i)——最慢的那一块决定了气泡有多大
             #   长prompt按chunk分步prefill（见文件开头【2】）。一块有x个新token、前面已有L个token的KV时，
             #   这一块的注意力工作量 ∝ 2Lx + x²（2Lx：新token对前缀；x²：块内），L越大越慢：
             #     固定x=8k：块0(L=0) 1份   块1(L=8k) 3份   块2(L=16k) 5份   块3(L=24k) 7份     （以x²=8k×8k次点积为1份）
             #   PP下每块依次流过各stage，后一块总比前一块慢，下游stage就要空等（流水线气泡）：
             #     stage0: [c0][ c1 ][  c2  ][   c3   ]
             #     stage1:     [c0]..[ c1 ]..[  c2  ]...[   c3   ]         （..=等上游送来下一块）
+            #     只算注意力项、-pp 2：完成时间 = (1+3+5+7) + 1×7 = 23份；同样32k个token若切成4块等耗时的块（注意力总量
+            #     不变，仍是(32k)² = 16份，每块4份），完成时间 = 16 + 1×4 = 20份。-pp 4时是 16+3×7 = 37份 对 16+3×4 = 28份
             #   动态分块用延迟模型 t(L,x) = c + γ·L + b·x + a·(2Lx + x²) 给后面的块选更小的x，让每块耗时接近第一块，
             #   再按--dynamic-chunking-smooth-factor（默认0.75）在固定块和等耗时块之间插值，且不小于最小块（默认4096）。
-            #   b、c由这里的启动扫描测出，a、γ在服务中用真实prefill校准（见下面的英文注释）；
+            #   代价：块数变多，每块都要付的c和γ·L也多付几次；所以只在一个请求独占prefill时才缩块（别的请求本身就能填气泡，
+            #     dynamic_chunking.has_sole_prefill，见docs/dynamic_chunking_guide.md的Runtime behavior一节）
+            #   b由这里的启动扫描测出（同时得到c的初值）；a、γ、c在服务中用真实prefill拟合（dynamic_chunking.py模块docstring：
+            #     "Startup dummy forwards fit b; a two-size runtime prefill sweep fits a, gamma and c"；另见下面的英文注释）；
             #   详见docs/dynamic_chunking_guide.md，模型在dynamic_chunking.py，每块大小由Scheduler._dynamic_chunk_limit决定
             if config.enable_dynamic_chunking:
                 # Startup profiling only measures the chunk cost that carries no
@@ -1409,7 +1442,9 @@ class EngineCore:
 #     rank0：本rank的64个decode token ─► 注意力（只读自己请求的KV）─┐                          ┌► 专家FFN ─► 送回 ─► 下一层
 #                                                                  ├► MoE：按router结果把token ─┤
 #     rank1：本rank的 0个token        ─► 注意力                    ─┘  发给持有对应专家的rank   └► 专家FFN ─► 送回 ─► 下一层
-#     （MoE/专家并行是什么见arg_utils.py的enable_expert_parallel字段上方的【科普】）
+#     （前置：MoE层把FFN换成很多个"专家"FFN，router给每个token只选其中top-k个，如256选8；专家并行把专家分到各卡上，
+#      256个专家、DP=2时每个rank放128个。每层先把token发到它选中的专家所在的rank（dispatch），算完再收回（combine），
+#      这两次是all-to-all，组里每个rank都必须参加。完整讲解见arg_utils.py的enable_expert_parallel字段上方的【科普】）
 #     专家分散在各rank上，rank0的token会有一部分路由到rank1上的专家：rank1即使自己没有请求，也必须参加每一层的这次交换。
 #     rank1什么都不做 → rank0停在第0层的交换里等它 → 整个DP组卡死。dummy batch = 让rank1带1个假token
 #     （id=-1、token全为0、block_table=[0]，见下面_execute_dummy_batch）也跑完同样的80层、参加同样次数的集合通信，结果丢弃
@@ -1659,7 +1694,7 @@ class DPEngineCoreProc(EngineCore):
 # 【译】分离式的prefill/decode engine core
 # 【分支】PD分离（同GPU的RapidServe，由DisaggCoreManager启动），见第9批
 # 原理：prefill计算受限、decode带宽受限（见文件开头【2】），放在同一个step循环里会互相干扰——一次长prefill让所有decode停顿。
-#   RapidServe把两者拆成两个EngineCore进程，在同一组GPU上并发运行：各自在自己的stream上发kernel，默认两边都能用整卡的
+#   RapidServe把两者拆成两个EngineCore进程，在同一组GPU上并发运行：各自在自己的stream（见文件开头【3】的前置）上发kernel，默认两边都能用整卡的
 #   计算单元（CU），disagg_constrained=True时才按CU屏蔽（CU mask）划分（见下面"代价①"）；权重和KV cache通过CUDA IPC
 #   共用同一份显存（prefill直接写decode要读的KV缓冲区），不用拷贝KV
 #

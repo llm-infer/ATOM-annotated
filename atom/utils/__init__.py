@@ -14,6 +14,10 @@
 # 调用方遍布全仓库：EngineCore / AsyncIOProc / ModelRunner（第2批、第5批）用进程与ZMQ工具，
 #   ModelRunner和各attention backend用CpuGpuBuffer、upload_numpy，utils/backends.py等编译代码用编译辅助
 # 注意：任何`import atom.utils.xxx`（包括`from atom.utils import envs`）都会先执行本文件，连带导入torch、zmq、transformers
+# 阅读路线（本文件约1450行，各组互不依赖，按需跳读）：读第2批时看1（进程管理）和2（网络与ZMQ），它们撑起engine_core.py /
+#   async_proc.py的多进程结构；读第5批时再看3（CPU→GPU搬运）和4（编译 / CUDA Graph辅助）
+#   前置概念：fork与spawn见get_mp_context上方；ZMQ见get_open_zmq_inproc_path上方的"科普·ZMQ"；stream与锁页内存见
+#   _PAGEABLE_H2D_LIMIT上方的"科普·锁页内存与stream"；CUDA Graph与piecewise编译见config.py里CUDAGraphMode上方的【科普】
 import contextlib
 import copy
 import dataclasses
@@ -424,6 +428,8 @@ def enable_orphan_reaping(sig: int = signal.SIGKILL) -> bool:
     #   注意：``PR_SET_PDEATHSIG``在*创建本进程的那个线程*退出时触发，而不是在父进程整体退出时。
     #   只能在创建者线程与进程同生命周期的进程里设置它——ATOM从主线程spawn worker，所以满足这一点；
     #   如果创建者是一个短命线程，就可能触发过早的kill。
+    # 解释：custom all-reduce = aiter实现的同机all-reduce（不走RCCL）：每张卡分配一块缓冲，用hipIpcGetMemHandle导出句柄交给
+    #   其他卡映射，kernel直接读写彼此的缓冲来求和（all-reduce本身见engine_core.py文件开头【4】）
     if not sys.platform.startswith("linux"):
         return False
     try:
@@ -822,6 +828,14 @@ def zmq_socket_ctx(
         ctx.destroy(linger=linger)
 
 
+# 科普·锁页内存与stream（下面的英文注释、upload_numpy和CpuGpuBuffer都要用到）：
+#   stream：GPU上的FIFO命令队列。CPU发射kernel或拷贝只是把命令排进当前stream就返回，GPU按顺序执行；CPU只在同步点
+#     （.item()、event.synchronize()……）才等（要点与时间线见engine_core.py文件开头【3】的前置）
+#   锁页内存（pinned memory）：普通（可分页，pageable）CPU内存可能被操作系统换出到磁盘，GPU的DMA引擎不能直接读它，驱动只能先拷到
+#     一块内部暂存区（staging）再传；锁页内存保证常驻物理内存，GPU可以直接DMA读取，所以non_blocking=True的拷贝能作为一条命令
+#     排进stream后立刻返回、与GPU计算重叠。代价是分配慢、占用不可换出的内存，故预分配复用（下面的CpuGpuBuffer）
+#   下表的"悬崖"：可分页拷贝不超过驱动暂存区时（表中512KB）驱动先暂存、立刻返回；超过之后（表中560KB起）CPU要等这次拷贝真正
+#     做完，而它排在当前stream里已有的4ms工作之后——于是CPU白等约3ms
 # A pageable host-to-device copy larger than the driver's staging buffer cannot
 # be handed off and returned from: the host waits for it, and because it goes
 # out on the current stream it waits behind everything already queued there.
@@ -950,9 +964,7 @@ def pack_rows(dst: np.ndarray, rows: Sequence) -> None:
         # 【译】（行尾）按目标数组的步长（列数）前进，而不是按这一行的长度
 
 
-# 科普·锁页内存（pinned memory）：普通CPU内存可能被操作系统换出到磁盘，GPU的DMA引擎不能直接读它，
-#   驱动只能先拷到一块内部暂存区再传（就是上面说的"悬崖"）；锁页内存保证常驻物理内存，
-#   GPU可以直接DMA读取，所以non_blocking=True的拷贝能立刻返回、与GPU计算重叠。代价是分配慢、占用不可换出的内存，故预分配复用
+# 锁页内存是什么、为什么non_blocking拷贝要用它：见上面_PAGEABLE_H2D_LIMIT上方的"科普·锁页内存与stream"
 # 一对同形状的缓冲区：cpu（pinned锁页内存）+ gpu，外加与cpu共享内存的numpy视图np
 # 典型用法（ModelRunner准备每步输入）：CPU侧写self.np / self.cpu -> copy_to_gpu(n)异步拷前n行 -> kernel读self.gpu
 #   锁页内存才能真正异步地做H2D拷贝；缓冲区预先分配、每步复用，避免反复分配（原因见上面_PAGEABLE_H2D_LIMIT的说明）

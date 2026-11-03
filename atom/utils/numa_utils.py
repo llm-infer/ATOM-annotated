@@ -32,12 +32,15 @@ logger = logging.getLogger("atom")
 
 
 # 本文件在系统中的位置：ModelRunner进程启动时（AsyncIOProc.__init__，在构造ModelRunner之前）调用numa_bind_to_node
+#   前置：NUMA（Non-Uniform Memory Access，非一致内存访问）——多路服务器上每个CPU插槽有自己直连的内存，访问本插槽的内存快，
+#     访问另一插槽的内存要经插槽间互连、更慢也更挤；操作系统把"一个插槽的核 + 它直连的内存"叫一个NUMA节点（拓扑图见下面）
 #   为什么要绑：多路CPU服务器上，每张GPU挂在某一个CPU插槽（NUMA节点）下。worker线程跑在远端节点的核上、
 #   或者内存分配在远端节点时，主机侧的数据准备和H2D拷贝要跨插槽访存，会变慢
 #   默认关闭（ATOM_NUMA_BIND=0）；只影响性能，不影响正确性
 # 决定节点的顺序：ATOM_NUMA_NODE显式列表 → amdsmi查询 → sysfs（/sys/class/drm）推断
 #
 # 例：8卡机器，GPU 0-3挂在节点0、4-7挂在节点1；节点0的cpulist为"0-63,128-191"
+#   （典型的2×64核、开超线程的机器：0-63是插槽0的64个物理核，128-191是它们的超线程兄弟；节点1是64-127,192-255）
 #   → rank 5的worker被绑到节点1的那些核上，内存优先从节点1分配
 #
 # 为什么NUMA位置会影响推理（以双路机器、每路一个NUMA节点为例）：
@@ -55,6 +58,8 @@ logger = logging.getLogger("atom")
 #   ③ CPU本身：worker的Python主循环访问的对象、numpy缓冲区落在远端内存时，每次cache miss都更贵；
 #     不固定亲和性时，OS还可能把线程在两个插槽之间迁移，缓存反复变冷
 #   绑定后：worker只在GPU所在插槽的核上运行，内存优先从本地节点分配（加上Linux的first-touch），三条路径都留在插槽内
+#     first-touch：malloc / torch.empty只分配虚拟地址，物理页在第一次被写入时才分配，默认落在执行这次写入的CPU所在的节点——
+#     所以要"先绑核、再分配"（下面numa_bind_to_node的docstring要求在任何大块分配之前调用，就是这个原因）
 
 
 # 解析sysfs的cpulist格式，例如"0-2,8" → {0, 1, 2, 8}

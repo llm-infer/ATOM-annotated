@@ -36,6 +36,8 @@ against the bytes that arrived.
 #
 #   ns_token *不会*先被剥掉，尽管代码不再这样做之后，这里的文档还这么写了很久：在删掉它的副本上解析，
 #   会让每个偏移量相对于实际到达的字节都失去意义。
+# 解释：DSML是DeepSeek-V4的工具调用格式，参数写成 <｜DSML｜parameter name="city" string="true">Paris</｜DSML｜parameter>，
+#   参数名在name属性里；MiniMax则直接用参数名当标签名。DSML的完整格式见 deepseekv4_tool_parser.py 文件头
 #
 # 【导读】MiniMax-M3 工具调用格式的解析器（NAME="minimax"），启动时 registry.py 按模板中出现 ns_token 识别
 # 实现方式：ns_token 在正则里作为可选前缀匹配（_NS），并声明为 CALL_FILLERS，让 markup_begin/markup_end 越过它；

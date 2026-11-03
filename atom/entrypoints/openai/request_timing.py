@@ -3,7 +3,8 @@
 # 【译】HTTP API中按请求本地记录的首个输出耗时。
 #
 # 【导读】TTFT（time to first token，首个输出时间）的测量：从API进程收到请求算起，到第一个真正的生成内容发出为止
-# 机制：RequestTimingMiddleware是一个ASGI中间件，只拦截四个生成接口的POST请求，把RequestTiming放进ContextVar（每个请求独立）；
+# 机制：RequestTimingMiddleware是一个ASGI中间件（ASGI是什么见api_server.py文件头"几个第一次出现的概念"中的uvicorn一条），
+#   只拦截四个生成接口的POST请求，把RequestTiming放进ContextVar（每个请求独立）；
 #   流式：api_server的流包装函数用get_stream_timing()取出它，在第一个has_generated_output()为真的SSE事件处记一次
 #   非流式：api_server在收到第一个内部token时调用record_nonstream_first_token()
 # 调用方：api_server.py（add_middleware注册中间件，observe_ttft=RequestMetrics.observe_time_to_first_token）

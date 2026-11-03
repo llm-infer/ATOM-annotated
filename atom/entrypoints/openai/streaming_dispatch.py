@@ -20,7 +20,16 @@ when the SSE consumer reads, so a slow consumer does not accumulate decode work.
 #   [事件循环] _deliver → StreamOutputCollector.put_nowait（还没被读走的chunk就合并）→ Event.set()
 #             → SSE生成器 await collector.get() → IncrementalStreamDetokenizer.update（token id → 新增文本）
 #   示意图见api_server.py文件头的图2；调用方：api_server.setup_streaming_request*、serving_chat / serving_completion
-# 其余部分：
+# 前置（事件循环与线程，只说本文件用到的；完整讲解见api_server.py文件头的asyncio条目和图2）：
+#   API server进程里与本文件有关的线程有两类：uvicorn的事件循环线程（一个；所有请求的协程、asyncio.Event都属于它），和CoreManager的
+#   输出线程（每个DP rank一个，从ZMQ收EngineCore的结果、调用各序列的回调）。asyncio的对象不是线程安全的，输出线程不能直接
+#   Event.set()，只能用loop.call_soon_threadsafe(fn, ...)把fn排进事件循环、由事件循环线程去执行；每调用一次就唤醒一次
+#   事件循环，所以这里按step攒批：并发1000个流时，一个step是1次调用而不是1000次。另外CPython有GIL（同一时刻只有一个线程
+#   执行Python代码），几个输出线程各自反分词并不会并行；放到事件循环的get()里做，还能先把落后的chunk合并再只解码一次
+# 阅读路线（本文件约890行；定义顺序与阅读顺序不同）：
+#   第一遍只读主路径：上面的"前置" → IncrementalStreamDetokenizer上方的【科普】（含BPE与UTF-8的前置）与update / _decode
+#     → merge_chunk与StreamOutputCollector（合并即背压）→ 文件末尾的StreamBatchDispatcher（enqueue → flush → _deliver）
+#   其余部分是优化与观测，第一遍可跳过：
 #   _DeltaReuse / enable_delta_reuse / _probe*：反分词的"增量复用"优化，启动时用探测文本验证安全后才开启
 #   FrameWait / longest_silence_seconds：流的静默看门狗（api_server._client_stream使用，/metrics导出）
 #   StreamDeliveryTiming：token间延迟（ITL）计时
@@ -137,7 +146,12 @@ _DELTA_REUSE = _DeltaReuse()
 # 增量反分词器：每个流一个，每次拿到新token，只返回"新增的文本"
 # 【科普】反分词（detokenize）与两个偏移量 —— 从"模型每步吐出一个token id"讲起
 #   模型每个decode step输出一个（投机解码时可能是几个）token id。tokenizer的词表把每个id对应到一段字节，
-#   decode就是"按id查出字节、按顺序拼起来、再按UTF-8变成字符串"。字节级BPE的词表里，一个token不一定是完整的字符：
+#   decode就是"按id查出字节、按顺序拼起来、再按UTF-8变成字符串"。读懂下面的图需要两点前置：
+#   · UTF-8是变长编码，一个字符占1~4个字节：ASCII（如"!"）1个，常用汉字（如"你"）3个，emoji（如😀）4个；
+#     只拿到一个字符的前几个字节时解不出这个字符，decode会用替换字符U+FFFD（显示为�）顶上
+#   · 字节级BPE（Qwen、DeepSeek等模型的tokenizer都属于这一类）：从256个单字节出发，训练时把语料里最常一起出现的相邻片段
+#     反复合并成新token。常见的字、词合并成了一个token；不常见的字符（很多emoji、生僻字）可能只合并到一半，被拆成几个token
+#   所以字节级BPE的词表里，一个token不一定是完整的字符：
 #       token：  T0          T1              T2              T3
 #       字节：   E4 BD A0    F0 9F           98 80           21
 #       文本：   "你"        （😀的前2个字节） （😀的后2个字节） "!"        ← 😀（U+1F600）的UTF-8是F0 9F 98 80

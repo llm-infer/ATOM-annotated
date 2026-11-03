@@ -40,9 +40,28 @@ instance) has to be sanitised before it gets here.
 # 调用方：serving_chat / serving_completion / atomesh的atom_standalone_service（data_frame）、
 #   serving_anthropic / serving_responses / api_server的Anthropic ping帧（event_frame）、api_server._client_stream（iter_sse_data，用于日志和TTFT）
 
+# 前置：HTTP响应怎样"不一次性写完"。普通响应在头里写Content-Length，正文一次写完；流式响应事先不知道总长度，HTTP/1.1用
+#   分块传输编码（Transfer-Encoding: chunked）：正文切成若干段，每段是"十六进制字节数\r\n" + 内容 + "\r\n"，最后一个长度为0的段
+#   表示响应结束。Starlette的StreamingResponse不设Content-Length，uvicorn就按这种方式发，生成器每yield一次（可能拼了几帧）
+#   就是一段。一个流式chat响应在线上大致是：
+#     HTTP/1.1 200 OK
+#     content-type: text/event-stream; charset=utf-8          ← media_type是text/开头时Starlette自动补上charset
+#     transfer-encoding: chunked
+#     （空行）                    ← 响应头结束：客户端此刻已拿到200，但还没有任何帧
+#     <字节数>\r\n                ← 第1次yield：role帧
+#     data: {…"delta":{"role":"assistant","content":""}…}\n\n\r\n
+#     <字节数>\r\n                ← 第2次yield：content帧
+#     data: {…"delta":{"content":"北京"}…}\n\n\r\n
+#     …
+#     <字节数>\r\n                ← 最后一次yield：finish帧 + usage帧 + [DONE]拼成一段（serving_chat.stream_chat_response）
+#     data: {…"finish_reason":"stop"…}\n\ndata: {…"usage":{…}}\n\ndata: [DONE]\n\n\r\n
+#     0\r\n\r\n                   ← 长度为0的段：HTTP层面的结束
+#   数字例：单独一帧"data: [DONE]\n\n"是6 + 6 + 2 = 14个字节，线上写成"e\r\ndata: [DONE]\n\n\r\n"（e = 14）。
+#   于是有两层"结束"：长度为0的段属于HTTP，data: [DONE]属于OpenAI协议（为什么还需要后者，见下面的原理）
 # 原理：为什么用SSE而不是WebSocket。生成是单向的（服务端 → 客户端），SSE就是一个普通的HTTP响应、只是不一次性写完，
-#   能穿过一般的HTTP代理和负载均衡，客户端用任何HTTP库逐行读即可。代价是协议本身没有"正常结束"的标志——
-#   连接断开既可能是生成完了，也可能是中途出错，所以OpenAI约定以 "data: [DONE]" 作为结尾哨兵，没收到它就说明响应不完整
+#   能穿过一般的HTTP代理和负载均衡，客户端用任何HTTP库逐行读即可。代价是SSE这一层没有"正常结束"的帧——SSE客户端
+#   （如浏览器的EventSource）只看到连接关闭，分不清是生成完了还是中途出错（上面HTTP层的0长度段并不作为一帧交给应用），
+#   所以OpenAI约定以 "data: [DONE]" 作为结尾哨兵，没收到它就说明响应不完整
 #   中间的代理若缓冲响应（例如nginx默认开启proxy_buffering），客户端会看到所有帧在最后一下子到达，流式就失去意义
 import re
 from collections.abc import Iterator

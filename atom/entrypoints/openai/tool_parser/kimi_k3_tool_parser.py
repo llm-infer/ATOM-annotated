@@ -18,23 +18,23 @@ parses once at flush. Plain (non-tool) answers also carry channel framing
 tokens, which are stripped from ``content``.
 """
 
-# 【译】Kimi-K3 的频道格式（channel format）工具调用：
+# 【译】Kimi-K3 的通道格式（channel format）工具调用：
 #       <|open|>call tool="NAME" index="i"<|sep|>                                         （调用开始）
 #         <|open|>argument key="K" type="T"<|sep|>VALUE<|close|>argument<|sep|> ...         （每个参数，带类型）
 #       <|close|>call ...                                                                   （调用结束）
 #   参数的 VALUE 按类型原样书写（字符串不加引号，数字/布尔/对象写成字面量），先做类型转换，再为每个调用组装成一个JSON对象。
 #   与类XML格式不同，类型随线上数据一起传输（``type="..."``），所以不需要请求的 ``tools`` schema；``tools`` 不被使用。
 #
-#   K3 在一个带频道框架的流里交错输出 think/response/tools 几个段，所以按部分chunk解析不可靠：这个解析器缓冲整个输出，
-#   在flush时一次性解析。普通（非工具）回答也带着频道框架token，它们会从 ``content`` 中被剥掉。
+#   K3 在一个带通道框架的流里交错输出 think/response/tools 几个段，所以按部分chunk解析不可靠：这个解析器缓冲整个输出，
+#   在flush时一次性解析。普通（非工具）回答也带着通道框架token，它们会从 ``content`` 中被剥掉。
 # 解释：这段docstring已部分过时——
 #   1. tools 现在会用于截断判定中的"名字是否已声明"（_is_truncated_call），只是不用于类型转换；
-#   2. 现在并不缓冲整个输出：response 频道边到边流式输出，只有 call / tools 段作为区域缓冲，
+#   2. 现在并不缓冲整个输出：response 通道边到边流式输出，只有 call / tools 段作为区域缓冲，
 #      最后一个 <|close|>call 之后的 <|close|>tools 一到，基类 region_end 就判定区域闭合（见下方类docstring）；
 #   3. 框架token由 stream.py 的扫描器在 opens_region 返回False时丢弃
 #
-# 【导读】Kimi-K3 频道格式工具调用的解析器（NAME="kimi_k3"），在 registry._DETECT_ORDER 中排第一
-# 特点：K3 的每个回答都包着频道框架（<|open|>response<|sep|> ... <|close|>response<|sep|><|end_of_msg|>），
+# 【导读】Kimi-K3 通道格式工具调用的解析器（NAME="kimi_k3"），在 registry._DETECT_ORDER 中排第一
+# 特点：K3 的每个回答都包着通道框架（<|open|>response<|sep|> ... <|close|>response<|sep|><|end_of_msg|>），
 #   所以 START_MARKERS 包含全部框架token（不能被chunk切开），但 opens_region 只对 call 前缀和 tools 段开始返回True，
 #   其余框架token由引擎直接丢弃——这就是 opens_region 与 START_MARKERS 分开的原因
 # token 字面量统一来自 kimi_k3_tokens.py（推理内容分离 reasoning_dialects.py 也读它）
@@ -59,7 +59,7 @@ from .tool_parser import (
 
 # K3 channel tokens this parser matches on. Kept local so the parser is
 # self-contained; the reasoning splitter declares its own copies.
-# 【译】本解析器匹配用到的 K3 频道token。放在本地，让解析器自成一体；推理拆分器声明了它自己的副本。
+# 【译】本解析器匹配用到的 K3 通道token。放在本地，让解析器自成一体；推理拆分器声明了它自己的副本。
 # 解释：已过时——两边现在都从 kimi_k3_tokens.py 取token；这几个本地常量只剩 is_kimi_k3、START_MARKERS、_REGION_MARKERS 在用
 KIMI_K3_CALL_PREFIX = '<|open|>call tool="'
 KIMI_K3_TOOLS_START = "<|open|>tools<|sep|>"
@@ -135,7 +135,7 @@ _K3_ARG_RE = re.compile(
 # (`tool="..."`, `key="..."`) so they cannot be declared as literals, and they
 # only ever occur inside a tools section, where `_K3_CALL_RE` and `_K3_ARG_RE`
 # account for them.
-# 【译】这种格式包裹在每个回答外面的频道框架，无论有没有工具调用。只声明一次，只消费一次：`START_MARKERS` 列出它们，
+# 【译】这种格式包裹在每个回答外面的通道框架，无论有没有工具调用。只声明一次，只消费一次：`START_MARKERS` 列出它们，
 #   使预读不会把其中某个切开；`opens_region` 对它们说"否"，使读取器丢弃它们；这是唯一删除它们的地方。过去在 `parse` 里还有
 #   第二次删除——用一份手工维护的列表副本构建的正则——而两者对四个token的看法不一致，这些token流式时原样到达客户端，非流式时被删掉。
 #
@@ -233,9 +233,9 @@ class KimiK3Parser(ToolCallParser):
     them. It is the common path for this model, not an edge case.
     """
 
-    # 【译】Kimi-K3 频道格式：缓冲tools段，在flush时解析并发出。
+    # 【译】Kimi-K3 通道格式：缓冲tools段，在flush时解析并发出。
     #
-    #   tools段被整体解析，因为 K3 的参数是交错的，解析一部分会发出垃圾。*response* 频道不是tools段，它随到随流式输出：
+    #   tools段被整体解析，因为 K3 的参数是交错的，解析一部分会发出垃圾。*response* 通道不是tools段，它随到随流式输出：
     #   它是被框架包着的普通文本，这些框架在非流式时也由本格式删除。
     #
     #   缓冲一切更简单，理由是"输出都很短"。每个 K3 回答都以 `<|open|>response<|sep|>` 开头，而它是下面的标记之一，
@@ -262,14 +262,14 @@ class KimiK3Parser(ToolCallParser):
     # The two that mean a tool call is coming. Every other marker above is
     # channel framing that wraps every answer this model gives, so they are
     # literals the read-ahead must not split and nothing more.
-    # 【译】表示有工具调用要来的那两个。上面其他每个标记都是包裹这个模型每个回答的频道框架，所以它们只是预读不能切开的字面量，仅此而已。
+    # 【译】表示有工具调用要来的那两个。上面其他每个标记都是包裹这个模型每个回答的通道框架，所以它们只是预读不能切开的字面量，仅此而已。
     _REGION_MARKERS: ClassVar[frozenset[str]] = frozenset(
         {KIMI_K3_CALL_PREFIX, KIMI_K3_TOOLS_START}
     )
     # The tools channel closing after the last call. Framing would drop it
     # anyway once it is handed back, but naming it here keeps the newline
     # between the two tokens out of the answer.
-    # 【译】最后一个调用之后关闭的tools频道。一旦被交还，框架处理反正也会丢掉它，但在这里把它列出来，可以让两个token之间的换行不进入回答。
+    # 【译】最后一个调用之后关闭的tools通道。一旦被交还，框架处理反正也会丢掉它，但在这里把它列出来，可以让两个token之间的换行不进入回答。
     # 解释：这段注释说的是下一行的 CALL_CLOSERS（TOOLS_END）；CALL_OPENERS 是 tools 段的开始标记
     CALL_OPENERS: ClassVar[tuple[str, ...]] = (k3.TOOLS_START,)
     # With the separator, because that is where the model puts it. Spelled

@@ -36,7 +36,8 @@ if __name__ == "__main__":
 # 以下代码在"被import"和"直接运行"时都会执行：main在导入阶段就已确定
 from atom.utils import envs, set_ulimit
 
-# envs.X每次访问都重新读os.environ（见第1批utils/envs.py），所以这个开关要在启动前设置
+# envs.X每次访问都重新读os.environ（见第1批utils/envs.py），但这里只在模块导入时读这一次、决定导入哪个main，
+#   所以这个开关要在启动前设置
 if envs.USE_ATOMESH_ENTRYPOINTS:
     from atom.entrypoints.atomesh.server import main
 else:

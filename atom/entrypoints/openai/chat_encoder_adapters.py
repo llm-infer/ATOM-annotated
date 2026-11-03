@@ -6,6 +6,8 @@
 # 【译】为动态加载的chat编码器提供的、按模型定制的适配器。
 #
 # 本文件（第2批2c，B级）：MessageEncoderAdapter——把模型仓库里附带的Python编码函数（encode_messages）包装成统一的可调用对象
+#   前提：编码函数和Jinja chat template的作用相同——把消息列表拼成带特殊token的prompt字符串（例子、为什么必须用模型自己的格式，
+#     见chat_encoders.py文件头的【科普】chat template与特殊token）；DeepSeek-V4、Kimi-K3这类模型随权重发布的是这样一个Python函数
 #   1. prepare_messages：按模型改写消息（DeepSeek-V4：在最前面插一条携带工具的system消息；V4.1：deepseek_v41_encoder.py的钩子）
 #   2. __call__：补默认参数、按模型改写kwargs，再按编码器的函数签名过滤掉它不接受的kwargs，最后调用编码器
 #   3. supports_tools / preserve_content：是否支持工具、是否保留消息content的原始（列表）形式

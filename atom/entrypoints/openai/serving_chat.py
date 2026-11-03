@@ -9,9 +9,17 @@
 #   校验：normalize_chat_tools、validate_tool_list、validate_chat_request、resolve_thinking
 #   流式：stream_chat_response（n=1）、stream_chat_response_fanout（n>1）——从StreamOutputCollector取chunk，产出SSE帧
 #   非流式：build_chat_response / build_chat_response_multi——把generate_async*的结果dict组装成ChatCompletionResponse
+# 阅读路线（本文件约970行）：文件头依次是 两道处理（含推理过滤器的前提）→ 帧序列 → 【科普】工具调用 → 完整流程图
+#   → 工具调用往返的例子 → 【科普】前缀缓存与cached_tokens → stream与非stream的适用场景；代码按上面三组函数的顺序排列，
+#   n>1的流式版stream_chat_response_fanout在最后。第一遍建议：流程图 → stream_chat_response → _build_chat_choice，其余按需查。
+#   前置概念：推理内容（下面"推理过滤器的前提"）、SSE帧格式（sse.py）、collector与增量反分词（streaming_dispatch.py）
 # 每段生成文本都要经过两道处理（流式时逐chunk进行，非流式时对全文一次完成）：
 #   原始文本 ──推理过滤器（reasoning.py）──> reasoning_content片段 / content片段
 #            content片段 ──工具调用解析器（tool_parser/）──> 普通文本 / tool_calls
+#   推理过滤器的前提：推理模型先在一对标记之间写草稿、再写答案，例如Qwen3.5输出"<think>\n先算……\n</think>\n\n答案是42"；
+#     过滤器按启动时从模板读出的标记（方言），把"先算……"切进reasoning_content、"答案是42"切进content。标记本身也可能被切在
+#     两个chunk之间，所以流式时它是跨chunk的状态机。为什么要拆、"回复从思考段内部开始"是怎么回事，
+#     见api_server.py chat_completions里的【科普】推理内容
 # 一个流式响应的帧序列（每行是一帧 "data: {...}"，这里省略了id、model等公共字段）：
 #   {"choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": null}]}  ← 第一个chunk到达时
 #   {"choices": [{"index": 0, "delta": {"reasoning_content": "先想一想"}, ...}]}                      ← 思考段
@@ -93,6 +101,8 @@
 #   要点：服务端全程不执行工具；被max_tokens截断在工具区域中间时报"length"而不是"tool_calls"（protocol.openai_stop_reason_with_calls）
 #
 # ---- 【科普】前缀缓存与usage里的cached_tokens —— 从"注意力是因果的"讲起 ----
+#   （这里只讲读懂cached_tokens所需的要点；完整讲解见model_engine/sequence.py Sequence类上方"科普：前缀缓存"，
+#     调度器怎样用命中结果见model_engine/scheduler.py文件开头【前置③】）
 #   ① MHA / GQA的因果注意力里，第i个token在每一层的K、V只取决于第0~i个token。所以两个请求只要开头的token完全相同，
 #     这段开头在每一层算出的K/V也完全相同：前一个请求算过的KV还留在显存里，后一个请求直接拿来用，这部分不必再prefill
 #   ② ATOM把KV cache按block管理（--block-size默认16个token一块，有的模型在config.py里改写它）。每个装满的block按
@@ -104,11 +114,15 @@
 #       block：      blk0   blk1   blk2   blk3   blk4   blk5   blk6
 #       B查A留下的： 命中   命中   命中   命中   命中   命中   不命中（96~99相同、100起不同）→ 停
 #     → B的usage：prompt_tokens仍是完整prompt的长度，prompt_tokens_details.cached_tokens = 6 × 16 = 96，
-#       只有96之后的token真正做了prefill，TTFT相应变短
+#       只有位置96起的token真正做了prefill，TTFT相应变短
 #   多轮对话同理：第2轮的prompt通常以第1轮的prompt开头，这一段整块命中；但模板渲染历史时若改了文字
 #     （如Qwen3.5的生成提示以"<think>\n"结尾，而历史回合里不再写它），命中只到第一处不同之前（见tests/test_state_checkpoint.py）
-#   cached_tokens因此总是block大小的整数倍。chat（流式和非流式）、/v1/responses报告它，/v1/messages叫cache_read_input_tokens，
-#     /v1/completions的usage里没有这个字段
+#   所以对普通模型，cached_tokens总是hash block的整数倍（hash block = block_size × DCP，默认16个token）。例外：带每请求状态、命中后
+#     要往前退几行重算的模型（如开了ATOM_DSV4_STATE_REPLAY的DeepSeek-V4有界重放），报的是退回后的起点（scheduler.py里replays_hit的分支）；
+#     PD分离的decode节点报的是prefill节点传来的命中数（第9批）
+#   chat（流式和非流式）、/v1/responses报告它，/v1/messages叫cache_read_input_tokens，/v1/completions的usage里没有这个字段。
+#     观察：非流式的多模态（generate_async_multimodal）和n>1（generate_async_fanout）的结果dict里没有num_cached_tokens，
+#     这两条路径的cached_tokens恒为0
 #   引擎侧的开关是--enable-prefix-caching（默认开，见model_engine/arg_utils.py的enable_prefix_caching）
 #
 # ---- 适用场景：stream与非stream ----

@@ -67,8 +67,8 @@ from .tool_parser import ToolCall, ToolCallParser
 #                         which GlmParser.detect checks for explicitly.
 # 【译】在一份完整输出上按顺序检查。Kimi（K2）不在列表里：它是最终的兜底，因为它的 parse() 也定义了"完全没有工具调用"的结果。
 #
-#   K3 最先          —— 它的 `<|open|>...<|sep|>` 频道token与其他任何格式的标签都不相交，所以从不冲突；
-#                        它还会从普通回答中剥掉自己的频道框架（最后兜底的 K2 不会这样做）。
+#   K3 最先          —— 它的 `<|open|>...<|sep|>` 通道token与其他任何格式的标签都不相交，所以从不冲突；
+#                        它还会从普通回答中剥掉自己的通道框架（最后兜底的 K2 不会这样做）。
 #   MiniMax 在 DSML 之前 —— 两者都用 `<invoke name=..>`；MiniMax 还会在每个标签前加 ns_token 前缀。
 #   GLM 在 Qwen 之前 —— 两者都用 `<tool_call>`；GLM 从不输出 `<function=`，GlmParser.detect 会显式检查这一点。
 # 解释：这段注释已有部分过时——按模块docstring，现在这个顺序只用于启动时在渲染出的chat模板上识别格式

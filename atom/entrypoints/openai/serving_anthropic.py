@@ -19,6 +19,9 @@ Anthropic-compatible tools to use ATOM as a backend.
 # 与主干的关系：
 #   请求方向：anthropic_to_openai_messages / anthropic_to_openai_tools 把Anthropic的消息和工具定义转成OpenAI chat格式，
 #     之后与 /v1/chat/completions 走同一条路：chat template渲染 -> generate_async -> LLMEngine -> CoreManager（本批）
+#   前置（响应方向要用到的两个概念）：推理模型先写一段被<think>…</think>之类标记包住的思考、再写答案，服务端要把两者拆开；
+#     工具调用在模型看来只是按约定格式写的一段文本（如<tool_call>…</tool_call>），服务端要把它解析成结构化的调用。
+#     入门科普分别见 api_server.py 中 chat_completions 里的【科普】推理内容、serving_chat.py 文件头的【科普】工具调用
 #   响应方向：引擎吐出的增量文本先经推理内容分离（reasoning.py 的 ReasoningChannel），再把content片段交给
 #     工具调用解析器（tool_parser/ 的 ToolCallStreamParser），得到有序事件 (类型, 数据)，
 #     类型为 "reasoning" / "content" / "tool_call_start" / "tool_call_args" / "tool_call_end"
@@ -28,6 +31,16 @@ Anthropic-compatible tools to use ATOM as a backend.
 # Anthropic与OpenAI chat的关键差别：Anthropic把响应组织成有序的、带index的content块（text / thinking / tool_use），
 #   块的种类一变就要先stop旧块再start新块；OpenAI chat的字段是平铺的（content、reasoning_content、tool_calls）。
 #   所以本文件的docstring大多在讲"如何保住事件的先后顺序"
+# 例：同一个回答（先思考，再说一句话，再调用工具）在两种格式里——
+#   OpenAI chat：{"role": "assistant", "reasoning_content": "要查天气…", "content": "我查一下",
+#                 "tool_calls": [{"id": …, "type": "function",
+#                                 "function": {"name": "get_weather", "arguments": "{\"city\": \"北京\"}"}}]}
+#   Anthropic：  {"role": "assistant", "content": [{"type": "thinking", "thinking": "要查天气…", "signature": …},
+#                 {"type": "text", "text": "我查一下"},
+#                 {"type": "tool_use", "id": …, "name": "get_weather", "input": {"city": "北京"}}]}
+#   （OpenAI的arguments是JSON字符串，Anthropic的input是JSON对象）
+#   请求侧另有两处不同：system是顶层字段而不是一条消息；工具结果放在下一条user消息的tool_result块里
+#   （OpenAI是role=tool的消息），见 anthropic_to_openai_messages
 
 import base64
 import hashlib

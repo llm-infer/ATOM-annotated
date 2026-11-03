@@ -8,6 +8,7 @@
 # 【导读】多模态请求的输入准备入口：把"对话 + 媒体"变成(input_ids, multimodal_data)
 # 调用方：api_server._prepare_multimodal_inputs（在线服务；放进线程池执行，避免下载图片和processor计算阻塞事件循环）、
 #   examples/multimodal_inference.py（离线示例，第1批）；expand_media_placeholders由models/kimi_k3_vl.py调用
+# 前置：占位token与视觉编码器的要点见本包__init__.py的前置①②（为什么每个视觉向量要对应一个占位token）
 # 流程：normalize_multimodal_data规范化 -> 只允许image -> registry按架构选输入构建函数 -> MediaLoader加载图片
 #   -> 把对话中第n个图片标记绑定到第n张图 -> 构建函数（各模型的processor逻辑）输出token id和多模态数据
 # 与主干的关系：产出的multimodal_data随请求进入LLMEngine -> Sequence.multimodal_data -> 调度器 -> ModelRunner

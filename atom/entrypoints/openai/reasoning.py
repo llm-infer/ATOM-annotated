@@ -21,6 +21,8 @@ this module contains no per-model conditions. Add a model there, not here.
 # 要解决的问题：思考模型（DeepSeek-R1、Qwen3、Kimi-K3、MiniMax-M3等）把思考过程和回答写在同一个输出流里，
 #   靠标记分隔（<think>...</think>、<mm:think>...</mm:think>、K3的<|open|>think<|sep|>...<|close|>think<|sep|>）；
 #   OpenAI接口要求思考放进reasoning_content字段、回答放进content字段（Anthropic接口则是thinking块和text块）
+#   下文的"推理通道"就是被这对标记包住的那段思考；一族模型的这套标记写法叫一种"方言"（dialect，定义在reasoning_dialects.py）
+#   入门科普（推理模型为什么先写思考、模板怎样把开标记预填在prompt末尾，带图）：api_server.py 中 chat_completions 里的【科普】推理内容
 # 这一组文件的分工：
 #   reasoning.py（本文件）：方言无关的引擎
 #     ReasoningChannel：一次响应"怎么读推理通道" = (方言, 输出是否一开始就在通道内) 两个事实绑在一起；
@@ -29,6 +31,7 @@ this module contains no per-model conditions. Add a model there, not here.
 #     template_opens_reasoning_implicitly / prompt_starts_in_reasoning / thinking_switched_off：决定starts_open的输入
 #   reasoning_dialects.py：每种方言的标记和非流式split规则，以及启动时选方言的resolve_dialect
 #   marker_scanner.py：流式路径上"能放出多少字节而不切断一个标记"的唯一实现，与工具调用解析器共用
+#     （标记可能被chunk边界切开：上一个chunk以"<th"结尾、下一个以"ink>"开头，所以"<th"要先扣住；例子见该文件头）
 #   kimi_k3_tokens.py：Kimi-K3通道格式的token字面量，推理方言和K3工具调用解析器共用
 # 调用方：
 #   启动时：api_server.py（以及atomesh/atom_standalone_service.py）调resolve_dialect从chat template确定方言，

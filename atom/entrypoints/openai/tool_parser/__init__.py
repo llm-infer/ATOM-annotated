@@ -54,7 +54,7 @@ reader, and it is the only reader for both delivery modes.
 #
 #   模块                          格式
 #   `kimi_tool_parser`            Kimi-K2 的 ``<|tool_call_begin|>`` 特殊token
-#   `kimi_k3_tool_parser`         Kimi-K3 的 ``<|open|>call tool="`` 频道格式
+#   `kimi_k3_tool_parser`         Kimi-K3 的 ``<|open|>call tool="`` 通道格式
 #   `qwen3_tool_parser`           Qwen3（qwen3_coder / qwen3_xml）的 ``<function=`` XML
 #   `deepseekv4_tool_parser`      DeepSeek-V4 的 ``<｜DSML｜invoke>`` 标记
 #   `glm_tool_parser`             GLM-4.5/4.6/5.x 的 ``<tool_call>``/``<arg_key>``
@@ -81,6 +81,13 @@ reader, and it is the only reader for both delivery modes.
 # 要解决的问题：模型用各自的文本标记写出工具调用（如 Qwen 的 <tool_call><function=...>），而 OpenAI / Anthropic 协议要的是结构化的
 #   tool_calls / tool_use；流式时还要边收token边判断"这段是普通回答还是工具调用"——既不能把半截标记发给客户端，
 #   也不能把在谈论语法的普通文字误判成调用
+#   入门科普（工具定义怎样经chat template进prompt、模型怎样"写"出一次调用）：serving_chat.py 文件头的【科普】工具调用
+# 术语（各格式文件都会用到）：
+#   区域（region）：从一个会"移交"的起始标记（如Qwen的<tool_call>）开始、由引擎整段缓冲、闭合后交给该格式 parse_region 解析的一段输出；
+#     区域之外的文字作为content边到边放出。例："好的。<tool_call><function=f>…</function></tool_call>稍等" ->
+#     content"好的。"，区域"<tool_call>…</tool_call>"解析出1个调用，之后的"稍等"回到content（逐chunk的演示见stream.py文件头）
+#   span：区域里属于标记本身、要从回答里删掉的字节范围（一般每个调用一个，见tool_parser.py的RegionParse）
+#   框架标记（framing）：START_MARKERS里不打开区域、被引擎直接丢掉的标记（如Kimi-K3包住每个回答的<|open|>response<|sep|>）
 # 文件分工：
 #   tool_parser.py    基类 ToolCallParser（每种格式只声明标记字面量 + 实现 parse_region）、ToolCall、RegionParse 和共用判定函数
 #   stream.py         唯一的解析引擎 ToolCallStreamParser：预读、缓冲区域、判定闭合、提前播报工具名、按顺序产出事件；

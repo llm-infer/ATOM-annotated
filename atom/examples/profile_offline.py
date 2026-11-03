@@ -8,11 +8,12 @@
 #   用ignore_eos固定输出长度、把同一个prompt复制--bs份提交，并且不套chat template
 # 与主干的关系：LLMEngine.start_profile经CoreManager向每个EngineCore广播"start_profile"工具命令，
 #   最终由每个ModelRunner.start_profiler打开torch.profiler，trace按rank写到--torch-profiler-dir/<rank名>/下（见第2批、第5批）
-# 科普·profiler trace：torch.profiler在start/stop之间记录每个CPU算子和GPU kernel的起止时间（ModelRunner里开启CPU+CUDA两类活动），
-#   stop时每个rank导出一个<模型名>_ts_<时间戳>.pt.trace.json.gz（见model_runner.py的start_profiler）；
-#   把它拖进ui.perfetto.dev或chrome://tracing即可按时间轴看kernel耗时、空泡和通信
-#   ATOM_PROFILER_RECORD_SHAPES / ATOM_PROFILER_WITH_STACK / ATOM_PROFILER_PROFILE_MEMORY（或ATOM_PROFILER_MORE=1一次全开）
-#   可额外记录张量形状、Python调用栈、显存分配，代价是trace更大、导出更慢（定义见utils/envs.py）
+# profiler trace是什么、文件名与查看方式（ui.perfetto.dev / chrome://tracing）：见simple_inference.py中llm.start_profile()上方的
+#   "科普·profiler trace"（本批）。这里补充两点：
+#   ① ModelRunner同时开启CPU和CUDA两类活动（见model_runner.py的start_profiler），所以trace里CPU算子和GPU kernel
+#     在同一条时间轴上，能看出kernel之间的空泡和通信
+#   ② ATOM_PROFILER_RECORD_SHAPES / ATOM_PROFILER_WITH_STACK / ATOM_PROFILER_PROFILE_MEMORY（或ATOM_PROFILER_MORE=1一次全开）
+#     可额外记录张量形状、Python调用栈、显存分配，代价是trace更大、导出更慢（定义见utils/envs.py）
 # 用户看到的输出：引擎日志 -> "Warming up..." -> "Starting profiling..." -> 各rank的"trace exported to ..."日志
 #   -> trace保存目录 ->（非--random-input时）每个请求的生成文本
 import argparse

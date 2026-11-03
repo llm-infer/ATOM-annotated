@@ -13,6 +13,7 @@ Implementations are imported only when their architecture is selected.
 # 【导读】多模态的"按模型架构分派"表：hf_config.architectures[0] -> 模块路径字符串，用到时才import_module
 #   （用字符串而不是直接import，导入本模块时不会把各个多模态模型都加载进来）
 #   _MULTIMODAL_ARCH_TO_MODEL：提供M-RoPE位置计算的模型类（Qwen3.5 / Qwen3.5-MoE / Qwen4-exp）
+#     （M-RoPE：图片token的位置用(t, h, w)三个编号而不是一维序号，带例子的讲解见model_config/qwen3_5.py文件头【科普】②）
 #   _MULTIMODAL_ARCH_TO_INPUT_BUILDER：自定义输入构建函数（DeepSeek-V4.1、Kimi-K3）；其他架构默认用qwen3_5_vl.build_qwen_vl_inputs
 #   _MULTIMODAL_ARCH_TO_PROCESSOR：checkpoint自带processor的架构（DeepSeek-V4.1）；不在表中时调用方回退到AutoProcessor
 # 调用方：api_server.py（get_native_multimodal_processor）、processing.py（get_multimodal_input_builder）、

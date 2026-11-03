@@ -22,9 +22,11 @@
 #
 # 科普·KV cache：自回归生成时，第t步的attention要用到前t-1个token的K和V；把它们缓存在显存里，
 #   每步只需算新token的K/V，不必重算整个前缀。ATOM把KV cache切成固定大小的block（类似nano-vllm），
-#   由调度器按需分配给各请求，见model_engine/block_manager.py和docs/scheduling_kv_cache_guide.md
+#   由调度器按需分配给各请求，见model_engine/block_manager.py和docs/scheduling_kv_cache_guide.md；
+#   带图的完整科普见config.py中的【科普】KV cache 与分页（paged）KV
 # 科普·TP（张量并行）：把每层的权重矩阵按列/行切到多张GPU上，每张卡算一部分，再用all-reduce汇总；
-#   例如-tp 8时每张卡只存1/8的attention头和1/8的MLP权重。每张卡对应一个ModelRunner进程，见docs/distributed_guide.md
+#   例如-tp 8时每张卡只存1/8的attention头和1/8的MLP权重。每张卡对应一个ModelRunner进程，见docs/distributed_guide.md；
+#   带数字的完整科普见model_engine/arg_utils.py中EngineArgs.tensor_parallel_size字段上方的【科普】
 #
 # 整体流程：
 #   命令行参数 ──EngineArgs.add_cli_args──> argparse解析 ──EngineArgs.from_cli_args──> EngineArgs
@@ -76,7 +78,8 @@ parser.add_argument(
 
 # 科普·CUDA Graph：decode每步要launch几百个小kernel，CPU发射kernel的开销可能比GPU计算还长。
 #   CUDA Graph先把"一整步forward的kernel序列"录制下来，之后每步只需一次replay；代价是输入形状（batch size）
-#   必须是录制时的固定值，所以要事先为若干batch size各录一份。录制逻辑见utils/cuda_graph.py和model_runner.py
+#   必须是录制时的固定值，所以要事先为若干batch size各录一份。录制逻辑见utils/cuda_graph.py和model_runner.py；
+#   完整科普（为什么decode会被CPU卡住、按batch size分桶录制与补齐）见config.py中CUDAGraphMode上方的【科普】CUDA Graph 与 torch.compile
 # 生成不超过max_size的2的幂：max_size=6 -> [1, 2, 4]
 # 用作CUDA Graph的捕获尺寸：decode时batch size向上取整到最近的捕获尺寸，回放对应的graph（第5批）
 # 这里只有6条prompt，batch最大为6，没必要捕获默认的[1,...,512]那么多graph，可以缩短启动时间
@@ -119,7 +122,7 @@ def main():
     #   这一步会启动子进程、加载权重、预热、分配KV cache、捕获CUDA Graph，是最耗时的一步
     # 科普·进程结构：当前进程（LLMEngine + CoreManager）用multiprocessing的spawn方式拉起EngineCore进程，
     #   EngineCore再为每张GPU拉起一个ModelRunner进程；进程间用ZMQ socket收发请求和结果
-    #   （ZMQ科普见utils/__init__.py的make_zmq_socket处）。必须用spawn而非fork，原因见utils/__init__.py的get_mp_context
+    #   （ZMQ科普见utils/__init__.py中get_open_zmq_inproc_path上方的"科普·ZMQ"）。必须用spawn而非fork，原因见utils/__init__.py的get_mp_context
     llm = engine_args.create_engine()
 
     # 这里单独加载tokenizer只是为了套chat template；LLMEngine内部还有自己的tokenizer负责分词和反分词
@@ -169,6 +172,8 @@ def main():
         print(f"Completion: {output['text']!r}")
 
     # 打印MTP投机解码的统计（草稿token接受率等）；没开投机解码时没有内容，见第7批
+    #   （投机解码：先用很小的草稿模型/草稿头猜出后面几个token，主模型一次前向同时验证，猜对几个就一步输出几个；
+    #    科普见model_engine/arg_utils.py的【科普】投机解码）
     # 它是"发出去不等回复"的命令，统计打印在EngineCore进程的日志里，而不是这里的print输出
     llm.print_mtp_statistics()
     # 关闭引擎：通知EngineCore和ModelRunner子进程退出，释放GPU资源
