@@ -131,6 +131,18 @@ logger = logging.getLogger("atom")
 #     - 多了两类逐rank通道：KV传输状态聚合（PD分离/KV offload，见第9批）和集合RPC（要求每个rank都回复）
 #     - 多了一个监控线程：任何rank意外退出就关闭整个管理器，避免EngineCore永远卡在等结果上
 #     - forward指令里最大的block table只发增量（block_table_codec.py），nano-vllm每步重发整张表
+#
+# 设计原理：
+#   SPMD：TP的每个rank必须以相同的顺序执行相同的方法、输入形状一致，否则模型内部的all-reduce会配不上对而永久挂起。
+#     MessageQueue是"一个写者、多个读者"的FIFO：EngineCore写一次，每个rank按同样的顺序读到同样的指令序列，天然满足这一点；
+#     同一个batch也只pickle一次，而不是给每个rank各pickle、各发一遍
+#   为什么用共享内存而不是socket下发：decode一步只有10ms量级，指令下发就在关键路径上。共享内存只需一次pickle和一次写入，
+#     读者轮询标志位即可拿到；ZMQ的ipc socket每条消息都要经过内核的收发
+#   为什么block table只发增量：block table每个请求一行、每步整行都在，decode时每行只是偶尔多一个block。
+#     block_table_codec.py的估算：50个请求×100k上下文 ≈ 31.3万个block id，每步每个rank要pickle/unpickle约1.2MiB，
+#     而真正新增的内容只有约50个id
+#   为什么只有rank 0回传：EngineCore的postprocess只需要一份ScheduledBatchOutput，rank 0代表全组回传；
+#     需要确认"每个rank都做完了"的调用才走逐rank的集合RPC通道
 
 
 # 【分支】KV聚合的"在途记录"，只在PD分离/KV offload时使用，见第9批
@@ -507,6 +519,10 @@ class AsyncIOProc:
     #   → rank 0放进io_queues[1]由发送线程发回；rank 1没有主通道，结果丢弃
     # 注意：普通调用的返回值为None时不回送任何东西，所以用wait_out=True调用一个返回None的方法会让调用方永远等下去
     #   （ModelRunner.freeze_gc_heap特意返回一个计数就是为此）
+    # SPMD：每个rank都跑这同一个循环，从同一个FIFO里按同样顺序取到同样的指令，所以各rank进入forward、以及forward内部
+    #   每一次集合通信的顺序都一致。即使只有rank 0的返回值有用（get_num_blocks、capture_cudagraph……），其他rank也照样执行：
+    #   这些方法内部同样有集合通信（capture_cudagraph要在每个rank上把带all-reduce的forward录进graph；get_num_blocks在PP>1时
+    #   做all_reduce(MIN)），任何一个rank跳过都会让其余rank卡住
     def busy_loop(self):
         """Main event loop: dequeue RPCs and dispatch to runners."""
         # 【译】主事件循环：从队列取出RPC并分派给runner。
@@ -817,6 +833,7 @@ class AsyncIOProcManager:
         self._dead_ranks: dict[int, int | None] = {}
 
         # ---------- spawn每个worker进程 ----------
+        # 每张GPU一个进程（而不是线程）的原因见engine_core.py文件开头【4】：避免GIL串行化各rank的kernel发射
         for i in range(proc_num):
             # 例：proc_num=2 → "ModelRunner0/2"、"ModelRunner1/2"
             label = f"ModelRunner{i}/{proc_num}"

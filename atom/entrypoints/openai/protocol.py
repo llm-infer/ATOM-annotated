@@ -135,9 +135,9 @@ def openai_stop_reason(finish_reason: str | None) -> str | None:
         return None
     if finish_reason in ("stop", "length", "tool_calls"):
         return finish_reason
-    # 其余一律报"stop"，包括aborted和unschedulable: ...——客户端从finish_reason上区分不出"自然结束"和"被引擎放弃"
     if finish_reason in ("max_tokens", "max_new_tokens"):
         return "length"
+    # 其余一律报"stop"，包括aborted和unschedulable: ...——客户端从finish_reason上区分不出"自然结束"和"被引擎放弃"
     return "stop"
 
 

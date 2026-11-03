@@ -12,6 +12,13 @@ prefill acknowledges the worker's lease. Decode carries no image payload.
 #   确认了worker端的租约之前发送它们。decode不携带图像载荷。
 #
 # 【导读】多模态prefill的运行时：图像经视觉编码器得到的embedding怎么缓存、怎么跨chunked prefill分批填进输入embedding
+# 原理：视觉-语言模型怎样"读"图片。图片先切成固定大小的patch，经视觉编码器（ViT）和投影层（projector）变成一串向量，
+#   每个向量的维度等于语言模型的hidden_size，可以和词嵌入放在同一个序列里。prompt里为每个视觉向量留一个占位token，
+#   prefill时把占位位置的词嵌入换成视觉向量，之后的Transformer层就把它们当作普通token处理（attention、KV cache都一样）。
+#   例（patch=14、2×2合并的ViT，Qwen2-VL一类结构）：448×448的图 → (448/14)²=1024个patch → 合并后256个视觉token，
+#     于是prompt里这张图占256个位置，也占256个token的KV cache
+#   为什么要缓存视觉embedding：视觉编码本身是一次不小的前向；chunked prefill下同一张图可能跨多个chunk，不能每个chunk重算一遍
+#   为什么前缀缓存要带cache_seed：占位token的id对所有图片都一样，只看token id会让"同样的文字 + 不同的图"误命中别人的KV
 # 背景：多模态prompt里每张图对应一段连续的占位token（几百到上千个），prefill时要把这些位置的词嵌入替换成视觉编码器的输出。
 #   ATOM支持chunked prefill，一张图的占位段可能被切进多个chunk，所以需要：
 #   1. 视觉编码只做一次，结果在ModelRunner进程里缓存，直到该请求结束（VisionEmbeddingCache，按cache_seed去重）

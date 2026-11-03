@@ -72,6 +72,63 @@ from atom.utils.gc_utils import (
 #   ATOM把这三步原样搬进了EngineCore进程的busy_loop（_process_engine_step_inner），区别在于：
 #   ① 请求和结果经ZMQ进出（输入、输出各一个I/O线程）；② step循环自己转，不由调用方驱动；
 #   ③ 多了控制命令、指标推送、KV传输轮询、DP同步等旁路
+#
+# ======================= 读本文件前需要的推理原理（不对应某一行代码） =======================
+#
+# 【1】引擎step与连续批处理（continuous batching，又叫iteration-level scheduling）
+#   自回归生成：一个请求 = 1次prefill（处理整个prompt，顺带采样出第1个token）+ 若干次decode（每次1个token）。
+#   引擎以"一次forward"为调度粒度，每一步都重新决定这一步算谁——busy_loop里 schedule → forward → postprocess 的循环就是它。
+#   静态批处理一次凑一批、整批跑完才换下一批；连续批处理每一步都允许新请求进来、结束的请求离开。
+#   例：A要生成3个token，B要生成8个，C在第1步之后到达（P=prefill，D=decode，.=占着槽位空等或排队）
+#     静态批处理  step: 1  2  3  4  5  6  7  8  9  10
+#              A:     P  D  D  .  .  .  .  .            ← A第3步就完了，槽位和KV一直空占到整批结束
+#              B:     P  D  D  D  D  D  D  D
+#              C:     .  .  .  .  .  .  .  .  P  D ...  ← 必须等整批结束
+#     连续批处理（按ATOM的规则：一步要么全是prefill、要么全是decode，见【2】）
+#                step: 1  2  3  4  5  6  7  8  9
+#              A:     P  .  D  D                        ← 第4步拿到第3个token，postprocess立刻释放它的KV block
+#              B:     P  .  D  D  D  D  D  D  D
+#              C:        P  D  D  ...                   ← 第2步就被调度（这一步是C的prefill，A、B的decode停一步）
+#   代价：每一步都要在CPU上做一次调度和postprocess，这部分CPU时间必须很小或者被GPU时间盖住（见【3】）
+#
+# 【2】prefill与decode：两种性质完全不同的负载
+#   prefill：一次处理T个prompt token（几百~几千），线性层是 [T, hidden] x [hidden, out]，每读一次权重做T份计算 → 计算受限
+#   decode：每个请求每步只有1个新token，batch=B时线性层是 [B, hidden] x [hidden, out]，每步都要把全部权重
+#     （外加所有请求的KV cache）从HBM读一遍，只做B份计算 → 访存带宽受限
+#   量级估算（70B稠密模型，FP8权重≈70GB；按MI300X理论峰值：HBM≈5.3TB/s，FP8稠密≈1300 TFLOPS）：
+#     decode B=64：读权重 70GB / 5.3TB/s ≈ 13ms；计算 2×70e9×64 ≈ 9e12 FLOP ≈ 7ms → 由带宽决定，B翻倍耗时几乎不变
+#     prefill T=8192：2×70e9×8192 ≈ 1.1e15 FLOP ≈ 0.9s → 由算力决定，耗时近似与token数成正比
+#     分界点约 1300e12 / 5.3e12 ≈ 245 FLOP/字节；FP8权重每字节每token 2 FLOP → 一步大约超过120个token才转为计算受限
+#   推论：① decode要尽量把batch做大，让更多请求共摊一次权重读取——这正是连续批处理提高吞吐的来源；
+#     ② 一次prefill可能耗时几百ms，这一步里正在decode的请求拿不到新token，表现为ITL/TPOT的尖峰
+#   ATOM基类Scheduler的选择（scheduler.py的_schedule："Tries prefill first; if no new prefills are ready, falls back to
+#     decoding"，代码里留着"TODO for prefill/decode mixed batch"）：一个ScheduledBatch要么是prefill批、要么是decode批，
+#     与nano-vllm相同的prefill优先。长prompt靠chunked prefill（enable_chunked_prefill默认True，每步最多
+#     max_num_batched_tokens个token）切成多步；PrefillDelayer（见_init_prefill_delayer）把零散的prefill攒成一批再放行，
+#     减少decode被打断的次数。vLLM V1等引擎则可以在同一步里混合prefill chunk和decode
+#
+# 【3】CPU调度与GPU执行的重叠：延迟输出（deferred output）
+#   朴素做法（nano-vllm）：CPU调度 → GPU forward → 同步等采样结果拷回CPU → CPU postprocess → 再调度，GPU在CPU干活时空闲。
+#     decode一步GPU只要10ms量级时，几ms的Python调度+postprocess就是两三成的GPU空转
+#   ATOM的ModelRunner默认开延迟输出（tokenID_processor.is_deferred_out：非PP、且不是"要交接递归状态的PD producer"时为True）：
+#     forward(第N步) 发射第N步的kernel并启动采样结果的异步D2H拷贝后，只等待并返回*第N-1步*的token；
+#     第N+1步decode的input_ids直接取GPU上的prev_token_ids，不需要先等CPU拿到token
+#   时间线：
+#     CPU(EngineCore): [sched N][launch N][等N-1的token][post N-1][sched N+1][launch N+1][等N的token][post N]...
+#     GPU:             ...forward N-1 ===][========== forward N ==========][========== forward N+1 ======...
+#     postprocess(N-1)和schedule(N+1)发生在GPU执行第N步期间，被GPU时间盖住，GPU的队列里始终有活
+#   代价：scheduler.postprocess拿到的是上一步的结果，序列里要先放占位token（scheduler.postprocess里的num_placeholder），
+#     请求的结束（如采到EOS）也晚一步才被发现，多算的那一步结果被丢弃
+#
+# 【4】为什么每个TP rank一个进程，以及一步怎样广播给所有TP worker
+#   张量并行把每层权重切到TP张卡上，层内要做all-reduce。所有rank必须运行"同一个程序、同样形状的输入"（SPMD）：
+#     任何一个rank少调一次集合通信或形状不同，其他rank就会永远卡在那次集合通信里
+#   所以EngineCore只调度一次，把同一个ScheduledBatch经共享内存MessageQueue广播给每个worker（async_proc.py），
+#     每个rank执行完全相同的forward，只有rank 0把结果送回
+#   用进程而不是线程：每个rank独占一张GPU、各自发射大量kernel，Python里的kernel发射是CPU密集的，多线程会被GIL串行化；
+#     RCCL/NCCL的惯例也是一个进程一个rank。EngineCore自己也不兼任rank 0（nano-vllm是主进程兼任rank 0），
+#     于是调度/postprocess不会和rank 0的kernel发射争同一个GIL
+#   DP>1时还要跨DP rank锁步，见下面的DPEngineCoreProc
 logger = logging.getLogger("atom")
 
 # Pace of the idle KV drain. The busy loops never block, so an unpaced drain
@@ -138,6 +195,20 @@ class EngineCore:
     # 对比nano-vllm：nano-vllm的ModelRunner.__init__里allocate_kv_cache直接改写config.num_kvcache_blocks，主进程里的
     #   Scheduler随后读同一个对象；ATOM的ModelRunner在另一个进程里，它的改写对EngineCore不可见，所以要显式用RPC
     #   拿回block数，再写进本进程的config（Config.num_kvcache_blocks初始为-1）
+    #
+    # 为什么启动顺序必须是 加载权重 → warmup → 测显存算block数 → 分配KV → 捕获CUDA Graph → 建Scheduler：
+    #   ① warmup（ModelRunner.__init__末尾的_maybe_warmup → warmup_model）：先reset_peak_memory_stats，再跑一次
+    #     max_num_batched_tokens量级的假prefill，让PyTorch分配器记下激活的峰值——相当于一次profile run
+    #   ② get_num_blocks：预算 = 总显存×gpu_memory_utilization − (权重+激活峰值 + 分配器之外的RCCL等缓冲
+    #     + CUDA Graph池的估计 + 2%余量)，再与实际空闲显存取min；剩下的全给KV cache，除以每个block的字节数得到block数
+    #     例（量级）：192GB的卡、utilization=0.9 → 预算172.8GB；权重70GB + 激活峰值8GB + 其他约6GB → KV约88GB；
+    #       80层、8个KV头、head_dim=128、FP8 KV的模型，每token的KV = 2(K和V)×80×8×128×1B = 160KB；
+    #       block_size=16 → 每个block 2.5MB → 约35000个block ≈ 56万个token的KV容量
+    #   ③ 为什么不能写死：权重大小、激活峰值、TP切分、KV dtype、同卡上的其他进程都会改变结果，只能在本机实测；
+    #     而block数就是调度器的准入上限（BlockManager没有空闲block时请求只能等待或被抢占），所以必须测完才能建Scheduler
+    #   ④ CUDA Graph在KV分配之后捕获：graph里记录的是kernel参数中的显存地址，KV cache必须已经在它最终的地址上；
+    #     graph私有内存池占的显存已经在②里用_estimate_cudagraph_overhead预留
+    #   ⑤ 最后冻结GC（_freeze_after_startup）：启动期要活一辈子的对象此时都已建好，见gc_utils.py
     def __init__(self, config: Config, input_address: str, output_address: str):
         self.label = "Engine Core"
         # input_queue：输入线程放入、busy_loop取出的新请求；每个元素是一个ADD帧带来的一批Sequence
@@ -239,6 +310,7 @@ class EngineCore:
             # KV cache大小：ModelRunner用 显存×gpu_memory_utilization 减去权重、激活峰值等开销，算出能放多少个block（第5批）
             #   返回dict：num_kvcache_blocks、pool_entries、pool_entries_per_req、state_runtime；call_func只拿rank 0的返回值
             block_info = self.runner_mgr.call_func("get_num_blocks", wait_out=True)
+            # （此时每个worker的ModelRunner构造已经跑完warmup，激活峰值已记录在分配器统计里，get_num_blocks读的就是它）
             num_blocks = block_info["num_kvcache_blocks"]
             # Sizing happens in the runner subprocess, so nothing it wrote to
             # its own `config` is visible here. Carry the per-class entry table
@@ -294,6 +366,11 @@ class EngineCore:
                     config.enable_dynamic_chunking = False
             # 捕获CUDA Graph（--enforce-eager时跳过；PD分离的decode进程要等KV导入后再捕获），第5批
             #   返回 (耗时, 捕获的batch尺寸列表, graph内存池字节数)
+            # 为什么decode要用CUDA Graph：decode一步的GPU时间很短（10ms量级），却要发射"层数×每层十几个"小kernel，
+            #   例如80层×15≈1200次launch，每次几µs的CPU开销加起来与GPU时间同一量级，GPU反过来等CPU（launch-bound）；
+            #   graph把整步录下来，之后一次replay就发射全部kernel。prefill的kernel大、形状多变，launch开销可以忽略
+            #   捕获按config.capture_sizes从大到小进行（ModelRunner.capture_cudagraph里sort(reverse=True)）；运行时把实际
+            #   batch大小向上取到最近的已捕获尺寸再replay（多出来的行是padding）
             if not config.enforce_eager and not config.disagg_is_decode:
                 cap_cost, bs, pool_bytes = self.runner_mgr.call_func(
                     "capture_cudagraph", wait_out=True
@@ -623,6 +700,11 @@ class EngineCore:
     # 循环从不阻塞等待：没有请求时也一直空转（每轮只做几次队列和时间检查）
     # 对比nano-vllm：nano-vllm的generate里 while not is_finished(): step()，由调用方驱动，所有请求做完就返回；
     #   ATOM的busy_loop常驻，空闲时也在转，直到收到SHUTDOWN
+    #
+    # 为什么忙等（spin）而不是阻塞在队列上：decode一步只有10ms量级，阻塞的线程被唤醒、被OS调度回来再拿到GIL会带来
+    #   几十µs以上的抖动；空转只多占一个CPU核。可能耗时的ZMQ收发和pickle都放在输入/输出线程里，主线程每轮只做
+    #   不阻塞的queue检查。取舍：空转的主线程一直持有GIL，有新消息到达的I/O线程要等解释器的切换间隔
+    #   （sys.getswitchinterval()，默认5ms）才能抢到GIL；forward期间主线程阻塞在call_func里，GIL是释放的
     def busy_loop(self):
         shutdown = False
         # 指标推送间隔：ATOM_METRICS_UPDATE_INTERVAL_S（默认1.0秒）
@@ -747,6 +829,7 @@ class EngineCore:
             self.scheduler.metrics.record_forward(scheduled_batch, seqs)
             # ★ forward：ScheduledBatch经共享内存广播给所有TP worker，每个worker都执行ModelRunner.forward；
             #   wait_out=True：阻塞到rank 0把ScheduledBatchOutput（每个请求采样出的token等）发回来
+            #   开延迟输出时（默认），它在GPU还在执行本步时就会返回：rank 0只等上一步的token，见文件开头【3】
             fwd_out = self.runner_mgr.call_func(
                 "forward", scheduled_batch, wait_out=True
             )
@@ -775,6 +858,8 @@ class EngineCore:
         # Pass stream_output_queue to postprocess for streaming callbacks
         # 【译】把 stream_output_queue 传给 postprocess，用于流式回调
         # 解释：postprocess把本步的流式增量放进stream_output_queue，返回本步结束的序列列表（第3批）
+        #   开延迟输出时fwd_out.is_deferred_out为True，其中的token属于上一步的batch，postprocess用fwd_out.get_idx(seq.id)
+        #   按请求id对号入座；本步刚做完prefill的序列还没有真实token，只先占位（见文件开头【3】）
         finished_seqs = self.scheduler.postprocess(
             seqs,
             fwd_out,
@@ -1207,6 +1292,15 @@ class EngineCore:
 #
 # 关闭也要一致：只有"全局有rank要关闭"且"全局没有未完成请求"时，所有rank才一起退出循环
 # 对比nano-vllm：nano-vllm只有单机TP，没有DP，也就没有这层同步
+#
+# 为什么要DP：TP把一个请求切到更多卡上时，每张卡上的矩阵更窄、每层的all-reduce更多，扩展效率下降；DP让每组卡独立服务
+#   不同的请求，吞吐近似线性增长。MoE模型常用"注意力DP + 专家并行"：注意力部分各rank只算自己的请求，MoE层再把所有rank
+#   的token汇到一起做专家计算——这就是forward内部跨DP集合通信的来源
+# dummy batch的代价：它只有1个token（开MTP时mtp_k+1个），但decode是带宽受限的（见文件开头【2】），1个token的forward
+#   照样要把整份权重读一遍，耗时接近一次小batch的真实decode。空闲rank付出这份代价，换来其他rank不被卡死
+# 锁步的另一面：每一步的耗时由最慢的rank决定。某个rank在做8k token的prefill时，只做decode的rank会在集合通信处等它
+#   几百ms。PrefillDelayer在DP>1时跨rank协调prefill的放行（cost_balance：各rank的prefill代价随同一次all_reduce交换），
+#   就是为了减少这种互相等待
 class DPEngineCoreProc(EngineCore):
     def __init__(self, config: Config, input_address: str, output_address: str):
         # （下面两行被注释掉的是旧代码：dp_group现在在_init_data_parallel里创建）
@@ -1422,6 +1516,9 @@ class DPEngineCoreProc(EngineCore):
 # ---------------------------------------------------------------------------
 # 【译】分离式的prefill/decode engine core
 # 【分支】PD分离（同GPU的RapidServe，由DisaggCoreManager启动），见第9批
+# 原理：prefill计算受限、decode带宽受限（见文件开头【2】），放在同一个step循环里会互相干扰——一次长prefill让所有decode停顿。
+#   RapidServe把两者拆成两个EngineCore进程，在同一组GPU上并发运行：各自用一个按CU屏蔽（CU mask）的stream池，
+#   分到不同的计算单元上；权重和KV cache通过CUDA IPC共用同一份显存（prefill直接写decode要读的KV缓冲区），不用拷贝KV
 
 
 # PrefillEngineCore：只做prefill的engine（DisaggCoreManager的engine 0）

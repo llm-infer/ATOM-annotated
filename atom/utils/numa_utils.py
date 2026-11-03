@@ -39,6 +39,22 @@ logger = logging.getLogger("atom")
 #
 # 例：8卡机器，GPU 0-3挂在节点0、4-7挂在节点1；节点0的cpulist为"0-63,128-191"
 #   → rank 5的worker被绑到节点1的那些核上，内存优先从节点1分配
+#
+# 为什么NUMA位置会影响推理（以双路机器、每路一个NUMA节点为例）：
+#
+#   ┌──────── 插槽0（NUMA node 0）────────┐  插槽间互连  ┌──────── 插槽1（NUMA node 1）────────┐
+#   │ CPU核、本地DRAM                      │ <==========> │ CPU核、本地DRAM                      │
+#   │   └─ PCIe ─ GPU0 GPU1 GPU2 GPU3       │              │   └─ PCIe ─ GPU4 GPU5 GPU6 GPU7       │
+#   └──────────────────────────────────────┘              └──────────────────────────────────────┘
+#
+#   不绑定时，rank 5的worker可能跑在插槽0的核上，pinned内存也可能分配在node 0：
+#   ① H2D拷贝（每步的input_ids、positions、block table等元数据）：GPU5的DMA要穿过插槽间互连去读node 0的内存，
+#     比读本地内存延迟更高、带宽更低，而且和别的rank抢同一条互连
+#   ② kernel launch / CUDA Graph replay：主机侧要写GPU的命令队列和门铃寄存器，CPU与GPU不在同一插槽时每次都多一段跨插槽路径；
+#     decode一步只有10ms量级、又往往是launch-bound，launch延迟的增加和抖动会直接拉长每一步
+#   ③ CPU本身：worker的Python主循环访问的对象、numpy缓冲区落在远端内存时，每次cache miss都更贵；
+#     不固定亲和性时，OS还可能把线程在两个插槽之间迁移，缓存反复变冷
+#   绑定后：worker只在GPU所在插槽的核上运行，内存优先从本地节点分配（加上Linux的first-touch），三条路径都留在插槽内
 
 
 # 解析sysfs的cpulist格式，例如"0-2,8" → {0, 1, 2, 8}

@@ -10,6 +10,8 @@
 #   生成的文本原样放进choices[i].text
 #   流式：stream_completion_response（n=1）、stream_completion_response_fanout（n>1）
 #   非流式：build_completion_response / build_completion_response_multi
+# 原理：completions接口不套chat template，prompt原样交给模型续写——适合base模型，或客户端自己已经拼好模板的场景
+#   （如PD路由器、评测框架）。对chat模型直接发裸文本，等于让它在没有角色标记的格式上生成，质量通常明显变差
 # 流式帧序列：若干 {"choices": [{"text": "...", "finish_reason": null}]}
 #   → 最后一次发送里：最后一段文本帧 + 带finish_reason的空文本帧 + usage帧 + [DONE]
 import logging
@@ -67,6 +69,7 @@ def create_completion_chunk(
                 "index": index,
                 "text": text,
                 "finish_reason": finish_reason,
+                # 恒为None：HTTP接口不支持logprobs（见api_server._build_sampling_params前的说明）
                 "logprobs": None,
             }
         ],

@@ -20,6 +20,20 @@ when one was found, or to ``tokenizer.apply_chat_template`` otherwise.
 # chat template（第一次出现，讲一次）：模型仓库tokenizer配置里的一段Jinja模板，把消息列表变成带特殊token的prompt；
 #   add_generation_prompt=True会在末尾补上assistant回合的开头，让模型接着以assistant身份续写。例（Qwen风格）：
 #   [{"role": "user", "content": "你好"}] → "<|im_start|>user\n你好<|im_end|>\n<|im_start|>assistant\n"
+# 一个带system和tools的例子（Qwen风格，具体文本以模型模板为准）：
+#   [{"role": "system", "content": "你是助手"}, {"role": "user", "content": "北京天气？"}] + tools=[get_weather]
+#   → "<|im_start|>system
+# 你是助手
+#
+# # Tools
+# ...<tools>{get_weather的JSON Schema}</tools>...<|im_end|>
+# "
+#     "<|im_start|>user
+# 北京天气？<|im_end|>
+# <|im_start|>assistant
+# "
+#   模板决定了：system prompt和工具说明放在哪、用什么标记分隔回合、assistant回合怎么开始；模型只在这个格式上被训练过，
+#   换一个模板（哪怕只差一个换行或角色标记）都可能明显降低质量，所以服务端必须用模型自带的模板（或--chat-template显式覆盖）
 # 本文件的函数：
 #   启动时：load_custom_message_encoder（找Python编码器）；chat_template_source / render_probe_prompt /
 #     resolve_reasoning_toggle（向模板"提问"：有哪些标记、怎样关掉推理）——结果由api_server.main存进全局变量

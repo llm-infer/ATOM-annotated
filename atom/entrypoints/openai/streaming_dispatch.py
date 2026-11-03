@@ -135,6 +135,9 @@ _DELTA_REUSE = _DeltaReuse()
 
 
 # 增量反分词器：每个流一个，每次拿到新token，只返回"新增的文本"
+# 原理：为什么流式必须"增量反分词"：客户端要的是文本增量（delta），而引擎每步给的是token id。
+#   最朴素的做法是每步decode全部输出再和上次比，代价随输出长度线性增长（输出1万token时每步都要解码1万个）；
+#   只解码新token又会出错（见下）。这里的窗口法每步只解码最近几个token，开销与输出长度无关
 # 为什么不能直接decode(新token)：一个字符可能跨多个token（例如emoji、部分汉字由多个字节级token组成），单独解码会得到U+FFFD（�）；
 #   而且有的tokenizer的解码结果和前文有关（如前导空格）
 # 做法：维护窗口 tokens[prefix_offset:]：
@@ -499,6 +502,10 @@ def merge_chunk(into: dict, new: dict) -> None:
 #   put_nowait（_deliver调用）：放入chunk；同一个tag已有未读chunk时就合并进去
 #   get（SSE生成器await）：取出一个chunk，并在这里完成反分词，补上"text"
 # 消费者落后的例子：第1步的chunk还没被读走，第2步的chunk到了 → 合并成一个；get()只解码一次，得到两步的全部新增文本
+# 原理：这里的"合并"是一种天然的背压（backpressure）：每帧的固定开销（反分词、JSON编码、一次socket写）
+#   按消费者的节奏发生，而不是按引擎产出token的节奏。例：引擎每10ms一个step，事件循环忙了50ms才轮到这个流 →
+#   这期间5个step的chunk已合并成一个，get()只解码一次、只发一帧（含5个step的全部文本）。
+#   代价是该流这一帧的ITL变成50ms；好处是事件循环越忙，每token的平均开销越低，不会因为积压越来越多帧而雪崩
 # asyncio.Event（第一次出现）：协程间的信号量，set()唤醒所有wait()的协程，clear()复位
 class StreamOutputCollector:
     """Per-request delivery point that merges chunks when the consumer lags.
@@ -668,6 +675,8 @@ def longest_silence_seconds() -> float:
     return now - min(_WAITING_SINCE.values())
 
 
+# 注意测量点：这是"投递到collector"之间的间隔（事件循环上），不含之后的反分词、JSON编码和网络传输；
+#   客户端实测的ITL还会再加上这些，以及前面说的合并效应
 # token间延迟（ITL）计时：_deliver每投递一个带新token的chunk就记录一次与上次投递的间隔
 @dataclass
 class StreamDeliveryTiming:
