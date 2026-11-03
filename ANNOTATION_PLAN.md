@@ -427,3 +427,11 @@ C 级示例：
 - **多模态与前缀缓存**：`multimodal_cache_seed` 参与前缀缓存 hash 链的种子（`block_manager.py`）；`multimodal_runtime.py` 与 `ModelRunner.vision_embeddings` 及 `run_model` 中的 span 路径对应。→ 第 4、5 批
 - **atomesh**：Rust 写的路由网关（同一份构建也是 PyO3 模块 `atomesh_runner`），`USE_ATOMESH_ENTRYPOINTS=1` 时启用；HTTP 由 Rust 处理，只有 chat / completions 进入 Python，没有 `/v1/messages`。→ 第 10 批
 - **TTFT 的口径**：`request_timing.py` 统计的 TTFT 包含预处理时间。→ 第 10 批
+
+### 来自第 3 批
+
+- **基础调度器的 decode 批里 `is_first_decode_without_local_prefill` 恒为 False**：decode 循环在构造 `ScheduledBatch` 之前就把 `seq.is_first_decode` 清掉了（只有 RapidServe 的 `DecodeScheduler._schedule` 用 `_consume_first_decode` 在构造后才清）。读这个字段的注意力代码（如 `aiter_mla.py`）在基础路径上不会触发相应分支。→ 第 6、7、9 批
+- **投机解码一步多 token 时的判停**：stop 字符串从最新 token 往前扫，命中后用 `for…else` 跳过 eos 检查，所以同一步更早出现的 eos 可能留在输出里；eos 与 `stop_token_ids` 取的是最早位置。→ 第 7 批
+- **延迟输出的占位 token 就是 eos id**，下一步原地覆盖，所以"结束"要晚一步才发现；投机解码稳态末尾有 2k+1 个占位（`num_placeholder_tokens`）。→ 第 5、7 批
+- **PrefillDelayer**：DP>1 时每个 rank 总会创建（跨 DP 对齐模式），DP=1 时仅在 PP=1 且 `ATOM_PREFILL_DECODE_INTERVAL>0` 时创建（本地模式）；`_first` 不改变任何决策（与 SGLang 的 `skip_first_delayer` 语义不同）。→ 第 9 批
+- **RapidServe 的 PrefillScheduler / DecodeScheduler** 有若干按代码推断的问题（超长 prompt 永久堵住、abort 对部分队列不生效、不复用前缀缓存、被抢占后不会再 prefill），均以"观察："写在 scheduler.py 中，读第 5、9 批时再核对。

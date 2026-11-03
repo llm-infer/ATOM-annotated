@@ -102,8 +102,8 @@
 
 ### 3 调度器
 
-- [ ] **A** `atom/model_engine/scheduler.py`（5346 行）
-- [ ] **B** `atom/model_engine/prefill_delayer.py`（539 行）
+- [x] **A** `atom/model_engine/scheduler.py`（5346 行）
+- [x] **B** `atom/model_engine/prefill_delayer.py`（539 行）
 
 ## 第 4 批：KV cache 账本与状态缓存（13 个文件，8,552 行）
 
