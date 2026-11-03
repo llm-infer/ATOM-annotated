@@ -557,14 +557,43 @@ class CompilationConfig:
             ]
 
 
-# 【分支】QuantizationConfig：整个模型的量化配置，第6批详解，这里只做B级导读
-# 作用：回答"某一层用什么量化格式"——每个Linear/MoE层构造时调用get_layer_quant_config(层名)，
-#   拿到一个LayerQuantConfig（quant_type、quant_dtype、是否动态量化等），据此选择GEMM kernel
-# 输入：HF config里的quantization_config（checkpoint自带的量化）+ --online_quant_config（加载时再量化）
-# 构造：Config.__post_init__里 QuantizationConfig(hf_config, online_quant_config)
-# 之后：ModelRunner构造模型前调用remap_layer_name，把checkpoint的层名改写成ATOM融合后的层名
-#   （例如q_a_proj、kv_a_proj_with_mqa融合成fused_qkv_a_proj）
-# 一层的解析顺序（get_layer_quant_config）：排除列表 -> 按模式匹配的逐层规格 -> 全局规格
+# 【分支】QuantizationConfig：整个模型的"量化规格表"（B级导读；规格本身LayerQuantConfig、各解析器
+#   在quant_spec.py，各层怎么按规格建参数/选kernel在第6批linear.py、第7批moe.py）
+#
+# 它解决的问题：同一个模型里不同层的量化方式往往不同——例如attention投影是FP8 blockscale，
+#   路由专家是MXFP4，lm_head、router gate、MTP的eh_proj不量化。而每个层在__init__里只知道自己的层名
+#   （prefix，例如"model.layers.3.mlp.experts"），于是需要一个全模型共享的对象来回答：
+#   "名叫X的层，权重在磁盘上是什么格式？加载后要不要转成别的格式？"——这就是本类。
+#   它自己不碰任何张量，只做"层名 -> LayerQuantConfig"的查表。
+#
+# 内部是两张结构相同的表，每张表 = 三件套：
+#   - checkpoint表（global_spec / layer_pattern_specs / exclude_layers）：描述checkpoint里权重"本来"的格式，
+#     来自 hf_config.quantization_config。层按它分配参数（形状、dtype、scale参数），才能把权重原样装进去
+#   - 在线表（online_global_spec / online_layer_pattern_specs / online_exclude_layers）：描述加载完后
+#     "要转成"的格式，来自命令行 --online_quant_config。只有 online_quant=True 时才有意义
+#   三件套的含义：global_spec是默认规格；layer_pattern_specs是按层名模式覆盖默认值的列表；
+#     exclude_layers里的层一律不量化（保持torch_dtype，通常是bf16）
+#
+# 生命周期（谁在什么时候用它）：
+#   1. 构造：Config.__post_init__ 调 QuantizationConfig(hf_config, online_quant_config)，挂在 config.quant_config 上；
+#      插件模式下若checkpoint没给排除项，Config会再用vLLM的 ignored_layers 填 exclude_layers。
+#      个别模型会再包一层或重建（deepseek_v4.py 覆写 get_layer_quant_config、qwen4_exp.py 的子类、
+#      kimi_k3/model.py 重建、sglang插件 runtime/model_arch.py 重建）
+#   2. 改名：ModelRunner.__init__ 在构造模型"之前"调 remap_layer_name，把表里的checkpoint层名改写成
+#      ATOM融合后的层名（gate_proj/up_proj -> gate_up_proj 等）；插件在 plugin/prepare.py、
+#      sglang/runtime/model_arch.py 等处做同样的事。必须在构造前做，因为第3步的查表发生在构造期间
+#   3. 查表：构造模型时，LinearBase（linear.py）、FusedMoE（moe.py）、RMSNorm（layernorm.py）、
+#      激活（activation.py）、共享专家融合判断（topK.py）等各自调 get_layer_quant_config(prefix)，
+#      按返回的规格决定参数的dtype和形状（例如FP4权重打包成 [N, K/2] 的uint8）、scale参数形状，
+#      以及forward里调用哪个AITER GEMM / MoE kernel
+#   4. 在线量化：权重加载完后（或流式加载过程中），loader.py 发现 online_quant=True，就让各层执行
+#      online_quantize_weight（Linear）/ _online_quant（FusedMoE）/ online_quantize_activation（RMSNorm）；
+#      这些方法用 get_layer_quant_config(prefix, use_online_quant=True) 查在线表，把权重重新量化成目标格式
+#   5. 缓存键：compute_hash 被 Config.compute_hash 汇总，量化规格变化会让torch.compile缓存失效
+#
+# 例：DeepSeek-R1 FP8 checkpoint + --online_quant_config '{"global_quant_config": "mxfp4", ...}'
+#   第3步按checkpoint表把专家建成FP8 blockscale参数，加载FP8权重；第4步按在线表把它们转成MXFP4，
+#   之后推理走MXFP4 MoE kernel
 class QuantizationConfig:
     """Model-wide quantization configuration.
 
@@ -581,13 +610,19 @@ class QuantizationConfig:
     #   - global_quant_config 属性 -> LayerQuantConfig
     #   - quant_type、quant_dtype、is_dynamic 三个便捷属性
 
-    # config：HF config；online_quant_config：--online_quant_config解析出的dict
+    # 把两份"原始量化描述"解析成上面说的两张表
+    # config：HF config，量化描述在它的 quantization_config 字段（checkpoint导出工具写进config.json的）
+    # online_quant_config：--online_quant_config 的JSON解析成的dict（EngineArgs -> Config.online_quant_config），
+    #   格式见 arg_utils.py 的说明，例如 {"global_quant_config": "ptpc_fp8", "layer_quant_config": {...}, "exclude_layer": ...}
     def __init__(
         self,
         config: PretrainedConfig = None,
         online_quant_config: dict | None = None,
     ):
-        # 没有HF config（例如某些测试/插件路径）：全部字段设成"不量化"的空值后直接返回
+        # 没有HF config：构造一个"什么都不量化"的空表后直接返回。
+        # 用途：需要自己从零拼一份规格表的场合，例如 deepseek_v41/layers.py 的 native_quant_config
+        #   先 QuantizationConfig() 拿空表，再直接给 global_spec 赋值为V4.1原生的FP8/FP4规格；
+        #   测试里也常这样构造
         if config is None:
             self.torch_dtype = torch.bfloat16
             self.hf_quant_config = None
@@ -604,24 +639,34 @@ class QuantizationConfig:
 
         # Some HF configs set torch_dtype=None; normalize to bf16 default.
         # 【译】有些HF config把torch_dtype设成None；统一成默认的bf16。
+        # torch_dtype：未量化层的参数dtype；被排除的层（_is_excluded）也用它
         self.torch_dtype = getattr(config, "torch_dtype", None) or torch.bfloat16
+        # 原样保留的checkpoint量化描述；之后blockscale_e8m0_scale还会从里面读scale_fmt
         self.hf_quant_config = getattr(config, "quantization_config", None)
 
-        # checkpoint没有量化：全局规格是"不量化、用torch_dtype"
+        # checkpoint没有量化（BF16/FP16模型）：checkpoint表只有一条"不量化、用torch_dtype"的全局规格
         if self.hf_quant_config is None:
             self.global_spec = LayerQuantConfig.no_quant(self.torch_dtype)
             self.layer_pattern_specs = []
             self.exclude_layers = []
             self.quant_method = ""
         else:
-            # 例如"fp8"、"quark"、"compressed-tensors"，决定下面用哪个解析器
+            # 量化工具/格式名，例如"fp8"、"quark"、"modelopt"、"compressed-tensors"。
+            # 用途：(1) 本函数末尾据此选解析器；(2) 下面判断能否叠加在线量化；
+            #   (3) 层和模型据此走工具特有的分支，例如 moe.py 读 quant_method，
+            #   deepseek_v2.py 和 sglang插件对"quark"有特殊的权重处理
             self.quant_method = self.hf_quant_config.get("quant_method", "")
 
         # Online quantization: re-quantize float / FP8 / MXFP4 / MXFP8 / Quark
         # models at load time.
         # 【译】在线量化：在加载时对float / FP8 / MXFP4 / MXFP8 / Quark模型重新量化。
         # 只有quant_method在下面列表里时，--online_quant_config才生效；否则被静默忽略
+        #   （列表外的格式，例如gguf，没有实现从它出发的重新量化）
+        # online_quant：总开关。loader.py 用它判断加载后要不要跑在线量化那一遍；
+        #   quant_spec.will_online_requant / validate_nvfp4_online_target 也先看它
         self.online_quant = False
+        # 原始dict留一份：loader.py 在线量化结束后，把它和各层的量化结果一起写进记录文件
+        #   （_save_online_quant_info），便于事后核对"这次到底按什么配置量化的"
         self.online_quant_config_raw = online_quant_config
         self.online_global_spec: LayerQuantConfig = LayerQuantConfig()
         self.online_layer_pattern_specs: list[tuple[str, LayerQuantConfig]] = []
@@ -642,6 +687,8 @@ class QuantizationConfig:
                     "Be careful about the online quant config setting when launching "
                     "the server."
                 )
+            # 在线表的格式由ATOM自己定义（global_quant_config / layer_quant_config / exclude_layer），
+            #   所以固定用 quant_spec.py 里注册名为"online_quant"的解析器
             online_parser = get_quant_parser("online_quant")
             online_parsed_quant_config = online_parser.parse(online_quant_config)
             self.online_global_spec = online_parsed_quant_config.global_spec
@@ -654,7 +701,9 @@ class QuantizationConfig:
             return
         # Use the parser registry to build a structured ParsedQuantConfig
         # 【译】用解析器注册表构建结构化的 ParsedQuantConfig
-        # 不同量化工具（fp8、quark、modelopt……）的quantization_config格式各不相同，各有一个解析器（quant_spec.py）
+        # 不同量化工具（fp8、quark、modelopt……）的quantization_config格式各不相同，
+        #   quant_spec.py 里每种格式用 @register_quant_parser 注册一个解析器，没注册的走"_generic"通用解析器；
+        #   解析器负责把各家写法统一成同一种三件套
         parser = get_quant_parser(self.quant_method)
         parsed_quant_config = parser.parse(self.hf_quant_config)
         self.global_spec = parsed_quant_config.global_spec
@@ -662,7 +711,12 @@ class QuantizationConfig:
         self.exclude_layers = list(parsed_quant_config.exclude_layers)
         self._validate_nvfp4_online_quant()
 
-    # checkpoint含NVFP4层却没给在线量化配置时，启动即报错（AMD GPU上NVFP4需先在线转成MXFP4）
+    # 启动期的第一道检查：checkpoint含NVFP4层却完全没给在线量化配置时，立即报错
+    # 背景：NVFP4是NVIDIA的FP4格式（16个元素一组、FP8 scale），AITER没有直接算它的kernel，
+    #   ATOM只能在加载时把它转成AMD的MXFP4（32个元素一组、E8M0 scale）再跑
+    # 两道检查的分工：这里只看"有没有在线配置"，在解析阶段就失败，用户不用等模型构建；
+    #   第二道 quant_spec.validate_nvfp4_online_target 由 linear.py / moe.py 在构建每个NVFP4层时调用，
+    #   检查在线配置是否真的给"这一层"指定了MXFP4目标（可能被exclude或配成别的格式）
     def _validate_nvfp4_online_quant(self):
         """Reject NVFP4 checkpoint specs when no online config was given.
 
@@ -686,7 +740,14 @@ class QuantizationConfig:
                 '\'{"global_quant_config": "mxfp4"}\'.'
             )
 
-    # 调用方：linear.py、layernorm.py（FP8 blockscale路径决定scale用E8M0还是FP32）
+    # FP8 blockscale（每128x128权重块 / 每1x128激活块一个scale）的scale用哪种格式存
+    # 谁用：
+    #   - linear.py：FP8 blockscale的LinearBase据此把weight_scale参数建成fp8_e8m0还是fp32，
+    #     并决定激活量化时产出哪种scale
+    #   - layernorm.py：RMSNorm融合"norm + 激活量化"时，产出的激活scale格式必须和后面GEMM期望的一致
+    #   - deepseek_v4.py：分配E8M0 scale时依赖这个判断
+    # 为什么要区分：E8M0 scale更小、某些AITER kernel只接受它；但它只能表示2的幂，
+    #   不是2的幂的FP32 scale装进去会被舍入，等于改了权重，所以默认只对声明了ue8m0的checkpoint开启
     @property
     def blockscale_e8m0_scale(self) -> bool:
         """Whether 128x128 FP8 block scales (weight and activation) are E8M0.
@@ -714,14 +775,26 @@ class QuantizationConfig:
     # -- typed API (preferred) ----------------------------------------------
     # 【译】-- 带类型的API（推荐使用） --
 
+    # checkpoint表的默认规格，即"整个模型主要是什么格式"
+    # 谁用：不关心具体层、只想知道模型整体是否量化的地方，例如 qwen3_5.py 和vLLM/SGLang插件的
+    #   qwen3_5 适配用 global_quant_config.quant_dtype == bf16 判断是不是未量化模型；
+    #   topK.py 在找不到共享专家的逐层规格时也退回到它
     @property
     def global_quant_config(self) -> LayerQuantConfig:
         """Alias for ``global_spec``."""
         # 【译】global_spec 的别名。
         return self.global_spec
 
-    # 核心接口：每个量化层构造时调用，传入自己的完整层名（如"model.layers.3.self_attn.qkv_proj"）
-    # use_online_quant=True时查在线量化的规格；check_children供FusedMoE这种"容器"层使用，见_is_excluded
+    # 核心接口：层名 -> 这一层的LayerQuantConfig
+    # 谁调用：几乎所有带权重的层在 __init__ 里调用一次，传入自己的完整层名（构造时层层传下来的prefix，
+    #   如"model.layers.3.self_attn.qkv_proj"）——LinearBase、FusedMoE、RMSNorm（融合量化）、
+    #   SiluAndMul（融合量化）、topK（判断共享专家能否与路由专家融合）、各模型里的特殊层
+    # 参数：
+    #   use_online_quant=False：查checkpoint表，用于建参数、装权重
+    #   use_online_quant=True：查在线表，用于加载后的重新量化（各层的online_quantize_*方法）
+    #   check_children=True：FusedMoE专用。它的prefix是专家容器（"...mlp.experts"），而排除项常写到
+    #     单个专家（"...mlp.experts.0.gate_up_proj"），需要"子模块被排除也算排除"，见_is_excluded
+    # 返回值被层保存下来（如 self.layer_quant_config），之后forward选kernel都看它
     def get_layer_quant_config(
         self,
         layer_name: str,
@@ -753,12 +826,18 @@ class QuantizationConfig:
 
         # 1. Exclude list
         # 【译】1. 排除列表
+        # 排除优先级最高：即使下面某个模式也能匹配到，被排除的层也不量化
+        #   （例如全局FP8，但 lm_head、router gate 被排除，保持bf16）
         if self._is_excluded(layer_name, exclude_layers, check_children=check_children):
             return LayerQuantConfig(quant_dtype=self.torch_dtype)
 
         # 2. Pattern match
         # 【译】2. 模式匹配
         # 不含*的模式按"层名是模式的子串"判断（注意方向：layer_name in pattern），含*的用fnmatch通配
+        # 按列表顺序取第一个命中的，所以列表里靠前的模式优先；
+        #   这也是 _validate_packed_layer_specs 要拦截"同名模式规格不一致"的原因
+        # 例：在线配置 layer_quant_config={"*expert*": "mxfp4"}，层名"model.layers.3.mlp.experts"
+        #   命中，返回MXFP4规格；"model.layers.3.self_attn.qkv_proj"不命中，落到第3步
         for pattern, spec in layer_pattern_specs:
             if "*" not in pattern:
                 if layer_name in pattern:
@@ -772,6 +851,9 @@ class QuantizationConfig:
 
     # -- convenience properties (delegate to global_spec) ---------------------
     # 【译】-- 便捷属性（委托给 global_spec） --
+    # 下面三个只反映"全局默认规格"，不代表某一层的实际规格；按层判断应调用 get_layer_quant_config。
+    # 它们是早期"整模型只有一种量化格式"时代的接口，保留给只需整体信息的老代码
+    #   is_dynamic：激活scale是推理时现算（动态），还是checkpoint里存好的静态scale
 
     @property
     def quant_type(self) -> "QuantType":
@@ -788,7 +870,10 @@ class QuantizationConfig:
     # -- other methods ------------------------------------------------------
     # 【译】-- 其他方法 --
 
-    # 被Config.compute_hash汇总：量化规格变了，编译出的图（用到的GEMM kernel）就不同
+    # 唯一调用方：Config.compute_hash，汇总后决定torch.compile缓存目录（~/.cache/atom/下）
+    # 为什么量化要进hash：量化规格决定每层调用哪个GEMM/MoE op、参数dtype和形状，图结构随之不同；
+    #   同一个模型换一种 --online_quant_config 启动，如果命中旧缓存就会跑错图
+    # 注意只把两张表的三件套放进去：torch_dtype、quant_method 已经体现在规格里了
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -816,6 +901,8 @@ class QuantizationConfig:
         hash_value = hashlib.sha256(str(factors).encode()).hexdigest()
         return hash_value
 
+    # 返回quant_method。对齐vLLM QuantizationConfig.get_name()的接口，让从vLLM移植来的模型代码
+    #   能原样写 quant_config.get_name() == "quark"（如 sglang插件的 deepseek_mla_forward.py、llama.py 判断gguf）
     def get_name(self):
         """Returns the quantization method name."""
         # 【译】返回量化方法的名字。
@@ -825,6 +912,8 @@ class QuantizationConfig:
     # 【译】-- 内部辅助函数 --
 
     # layer_name是否在排除列表里（排除 = 不量化，保持torch_dtype）
+    # 调用方：get_layer_quant_config 第1步；_validate_packed_layer_specs
+    # exclude_layers默认是checkpoint表的排除列表，查在线表时由调用方传入online_exclude_layers
     def _is_excluded(
         self,
         layer_name: str,
@@ -852,6 +941,11 @@ class QuantizationConfig:
                 return True
         return False
 
+    # 单条排除项的匹配规则。之所以支持这么多写法，是因为各量化工具导出的排除项写法各不相同：
+    #   有的写完整层名（"model.layers.0.mlp.gate"），有的写模块前缀（"lm_head"），
+    #   有的写通配（"*.eh_proj"），compressed-tensors还会写正则（"re:.*mlp.gate$"）
+    # check_contains：反方向的子串匹配（层名包含在排除项里，忽略大小写）。
+    #   本类自己不传True；vLLM插件 kimi_k25.py 直接调用这个静态方法时用它
     @staticmethod
     def _matches_exclude(
         layer_name: str, ignore_str: str, check_contains: bool = False
@@ -884,7 +978,14 @@ class QuantizationConfig:
                 return True
         return False
 
-    # 插件路径用（vLLM model_wrapper）：按模型声明的映射，把排除项里的HF层名片段替换成ATOM的模块路径
+    # 把排除项里的HF层名片段按字符串替换成ATOM的模块路径（只改排除列表，不改逐层规格）
+    # 为什么需要：有些模型的ATOM模块树和HF不同（例如多模态模型把语言模型挂在另一个路径下），
+    #   checkpoint写的排除项用HF路径，不替换就匹配不到，本该保持bf16的层会被当成量化层去装权重
+    # 例：Kimi-K2.5 / MiniMax-M3 的VL checkpoint按纯文本方式加载时，映射为
+    #   {"language_model.model.": "model.", "language_model.lm_head": "lm_head"}，
+    #   排除项"language_model.lm_head" -> "lm_head"，才能命中ATOM里的lm_head层
+    # 谁调用：remap_layer_name 的最后一步（模型类声明了 quant_exclude_name_mapping 时）；
+    #   vLLM插件 model_wrapper.py 在插件模式下也直接调用
     def apply_exclude_name_mapping(self, mapping: dict[str, str]):
         if not mapping or not self.exclude_layers:
             return
@@ -896,7 +997,11 @@ class QuantizationConfig:
         # dict.fromkeys(列表)：利用dict保持插入顺序且key唯一，实现"保序去重"
         self.exclude_layers = list(dict.fromkeys(new_excludes))
 
-    # 插件路径用：追加模型默认要排除的层（已在列表里的不重复添加）
+    # 追加"这个模型无论checkpoint怎么写都不该量化"的层（已在列表里的不重复添加）
+    # 为什么需要：有的checkpoint漏写了排除项，但ATOM的实现要求某些层保持bf16，
+    #   例如MTP层的eh_proj（拼接embedding与hidden后的投影）
+    # 谁调用：deepseek_mtp.py、mimo_v2_mtp.py 追加 "*.eh_proj"；
+    #   vLLM插件 model_wrapper.py、SGLang插件 prepare.py / runtime/model_arch.py 追加模型类声明的默认排除项
     def apply_default_exclude_layers(self, excludes: list[str]):
         if not excludes:
             return
@@ -904,11 +1009,19 @@ class QuantizationConfig:
             if exclude not in self.exclude_layers:
                 self.exclude_layers.append(exclude)
 
-    # 把量化配置里的层名从"checkpoint的命名"改写成"ATOM融合后的命名"
+    # 把量化表里的层名从"checkpoint的命名"改写成"ATOM融合后的命名"
     # 背景：ATOM会把多个投影融合成一个参数（gate_proj+up_proj -> gate_up_proj），
-    #   而checkpoint的quantization_config按融合前的名字写排除项/逐层规格，不改写就匹配不上
-    # 调用方：ModelRunner构造模型之前（model_runner.py），以及各插件的准备代码
-    # packed_modules_mapping：模型类声明的融合映射，例如 {"gate_proj": ("gate_up_proj", 0), ...}
+    #   而checkpoint的quantization_config按融合前的名字写排除项/逐层规格。不改写的话，
+    #   融合层用自己的名字（gate_up_proj）去查表永远查不到，会错误地落到全局规格
+    # 例：排除项"model.layers.0.mlp.gate_proj" -> "model.layers.0.mlp.gate_up_proj"
+    # 调用方：ModelRunner.__init__ 在构造模型之前（model_runner.py，必须在查表之前完成），
+    #   以及插件的准备代码（plugin/prepare.py、sglang/runtime/model_arch.py、sglang各模型适配等）
+    # 参数：
+    #   packed_modules_mapping：模型类的类属性，声明融合关系，
+    #     值为 (融合名, 分片序号) 表示"分量名 -> 融合名"；值为列表表示"融合名 -> 拆成各分量名"
+    #   weights_mapper：插件模式下vLLM的 WeightsMapper（有 _map_name 方法），先把排除项按它的规则改名
+    #   quant_exclude_name_mapping：模型类的类属性，见 apply_exclude_name_mapping
+    # 副作用：把最终用的映射存到 self.packed_modules_mapping，SGLang插件的qwen3_5适配会改写它
     def remap_layer_name(
         self,
         hf_config: PretrainedConfig,
@@ -924,6 +1037,8 @@ class QuantizationConfig:
         # for special models
         # 【译】针对特殊模型
         # DeepSeek系MLA模型：有q_lora_rank时，q_a_proj和kv_a_proj_with_mqa融合成fused_qkv_a_proj（第7批）
+        # 这些模型的映射写死在这里、覆盖模型类传进来的映射，因为是否融合q_a_proj取决于hf_config
+        #   （V2-Lite这类没有q_lora_rank的模型没有q_a_proj），类属性表达不了这种条件
         if model_type in ("deepseek_mtp", "deepseek_v3", "kimi_k2", "glm_moe_dsa"):
             if hasattr(hf_config, "q_lora_rank") and hf_config.q_lora_rank is not None:
                 self.packed_modules_mapping = {
@@ -941,6 +1056,10 @@ class QuantizationConfig:
             hf_config, "mlp_only_layers", []
         ):
             self.packed_modules_mapping["gate_up_proj"] = ["gate_proj", "up_proj"]
+        # 解释：上面这个是反方向的映射（融合名 -> 分量名），把表里写作 gate_up_proj 的条目拆成
+        #   gate_proj、up_proj 两条。Qwen3MoeForCausalLM.__init__ 里有同样一句（"Only perform the following
+        #   mapping when Qwen3MoeMLP exists"，即有 mlp_only_layers 这种dense MLP层时）；
+        #   这里要提前补上，因为remap发生在模型构造之前，那时模型类的__init__还没执行
 
         if weights_mapper:
             self.exclude_layers = [
@@ -973,6 +1092,8 @@ class QuantizationConfig:
                         return [name.replace(packed_key, packed_remap_part, 1)]
             return [name]
 
+        # 对checkpoint表的逐层规格和排除项做同样的改名；排除项改名后去重
+        #   （gate_proj、up_proj都被排除时，会得到两条相同的gate_up_proj）
         new_pattern_specs = []
         for pattern, spec in self.layer_pattern_specs:
             for remapped in _remap_layer_name(pattern):
@@ -992,6 +1113,7 @@ class QuantizationConfig:
         if self.quant_method == "modelopt":
             self._validate_packed_layer_specs()
 
+        # 在线表用户可能也按HF名字写（例如 layer_quant_config 的key写 "*gate_proj*"），同样改名
         if self.online_quant:
             new_online_pattern_specs = []
             for pattern, spec in self.online_layer_pattern_specs:
@@ -1012,7 +1134,12 @@ class QuantizationConfig:
         if quant_exclude_name_mapping:
             self.apply_exclude_name_mapping(quant_exclude_name_mapping)
 
-    # 只对ModelOpt量化的checkpoint调用：检查"融合进同一个ATOM参数的几个投影"量化规格是否一致
+    # 只由 remap_layer_name 在 quant_method=="modelopt" 时调用：
+    #   检查"融合进同一个ATOM参数的几个投影"量化规格是否一致，不一致就在启动时报错
+    # 为什么只查ModelOpt：它按每个源投影逐条写规格（q/k/v各一条），最容易出现兄弟投影格式不同
+    #   （例如q_proj是NVFP4、k_proj是FP8）；而ATOM一个融合参数只能有一种格式
+    # 不查的后果：remap后出现两条同名但规格不同的模式，get_layer_quant_config取第一条，
+    #   另一种格式的权重被硬装进去，不报错但结果是错的
     def _validate_packed_layer_specs(self):
         """Reject fused parameters whose source projections disagree.
 
@@ -1059,7 +1186,11 @@ class QuantizationConfig:
 
 
 # 【分支】GLM-5.3-Flash（glm5_next）的KV block大小，见第8批
-# 调用方：Config.__post_init__，检测到Glm5Next架构且index_kpool>1时，用它覆盖kv_cache_block_size
+# 作用：GLM-5.3的稀疏索引器不是每个token存一个索引key，而是每 index_kpool 个token池化成一个key（k-pool），
+#   索引key和主KV共用同一套分页（同一个block_table）。索引打分kernel deepgemm_fp8_paged_mqa_logits
+#   要求每个block的索引行数是16（MQA_LOGITS_PRESHUFFLE_ROWS）的倍数，所以block里的token数必须放大
+# 调用方：只有 Config.__post_init__：检测到Glm5Next架构且index_kpool>1时，用返回值覆盖 kv_cache_block_size
+#   （用户的 --block-size 被改写），之后 BlockManager、slot_mapping、注意力builder 都按这个block大小工作
 # 例：index_kpool=4，MQA_LOGITS_PRESHUFFLE_ROWS=16 -> block_size=64，每个block正好16行索引
 def glm5_kpool_block_size(index_kpool: int) -> int:
     """Tokens per KV block that lets GLM-5.3's pooled index cache be exact.
@@ -1079,7 +1210,11 @@ def glm5_kpool_block_size(index_kpool: int) -> int:
     return index_kpool * MQA_LOGITS_PRESHUFFLE_ROWS
 
 
-# 【分支】GLM-5.3-Flash还不支持的并行方式（PCP/DCP/TBO），Config.__post_init__遇到就报错，见第8、9批
+# 【分支】GLM-5.3-Flash还不支持的并行方式（PCP/DCP/TBO），见第8、9批
+# 作用：列出当前配置里开启了、但GLM-5.3还没适配的并行方式。这三种方式都会把一条序列的token/KV
+#   或一个batch切到不同rank / micro-batch上处理，而上面说的k-pool池化索引状态还没有按这种切分维护，
+#   硬跑会得到错误的索引结果而不是报错
+# 调用方：只有 Config.__post_init__：返回非空就抛 ValueError，在启动时拒绝，而不是跑出错误答案
 def _glm5_next_unsupported_features(config: "Config") -> list[str]:
     """Return parallel modes that do not yet preserve GLM-5.3 k-pool state."""
     # 【译】返回尚不能正确保持GLM-5.3 k-pool状态的并行模式。
@@ -1096,9 +1231,15 @@ def _glm5_next_unsupported_features(config: "Config") -> list[str]:
 # ---------------- 以下几张表供get_hf_config使用：决定一个model_type用哪种方式加载HF config ----------------
 # 背景：transformers靠config.json里的model_type找到对应的Config类；有些新模型transformers不认识，
 #   或者ATOM想复用另一个模型的Config类，就需要这几张表来"改道"
+# 这几张表都是模块私有的，只有本文件的 get_hf_config 读；支持一个新模型时，如果它的config.json
+#   transformers加载不了，通常就是往这里加一行（见 /add-model）
 
 # model_type -> 实际用来解析它的transformers config类型
 # 例：DeepSeek-V3.2、V4、GLM-5、Kimi-K2都借用deepseek_v3的Config类（结构相近，额外字段在get_hf_config里补回）
+# 用在get_hf_config的路径2（多模态模型的text_config，如Kimi-K2.5的text_config是kimi_k2）和路径4
+# 副作用：借用后 hf_config.model_type 变成被借用者（"deepseek_v3"），所以下游判断具体模型时
+#   要看 architectures（见 Config.__post_init__ 对V4的检测），而 QuantizationConfig.remap_layer_name
+#   用 model_type 判断"DeepSeek系"恰好能把这几个借用者都覆盖进来
 _CONFIG_REGISTRY: dict[str, str] = {
     "deepseek_v32": "deepseek_v3",
     # 【译】（行尾注释及其续行）V4复用V3的schema；V4特有的字段（compress_ratios、num_hash_layers、
@@ -1119,9 +1260,14 @@ _CONFIG_REGISTRY: dict[str, str] = {
 # 【译】只作为投机解码草稿checkpoint存在的model_type。transformers没有对应的config类，
 #   所以 AutoConfig.from_pretrained 会抛异常；改为把它们加载成一个裸的 PretrainedConfig（见 get_hf_config）。
 # frozenset：不可变的集合，适合做模块级常量（不会被意外修改）
+# k3_dspark：Kimi-K3的DSpark草稿模型。它的config由 SpeculativeConfig.__post_init__ 通过 get_hf_config 读取，
+#   之后 _normalize_draft_dspark_config 补齐字段，草稿模型类直接getattr读取
 _PLAIN_CONFIG_MODEL_TYPES: frozenset[str] = frozenset({"k3_dspark"})
 
 # 多模态模型：ATOM（目前只跑文本部分）取出config.json里的text_config子配置当作hf_config
+# 为什么：引擎里的通用代码（KV cache大小计算、ModelRunner、调度器）都直接读 hf_config.num_hidden_layers、
+#   num_key_value_heads 等文本模型字段；VL模型的根config里这些字段在text_config下面，不抽出来就读不到
+# 不在表里的多模态模型（如MiniMax-M3 VL）保留根config，由各自的归一化函数把text_config字段补到根上
 _MULTIMODAL_MODEL_TYPES: dict[str, str] = {
     # Maps multimodal model_type -> key in config_dict for the text sub-config
     # 【译】多模态model_type -> 文本子配置在config_dict中的key
@@ -1147,6 +1293,8 @@ _PLAIN_TEXT_CONFIG_MODEL_TYPES: frozenset[str] = frozenset(
 # multimodal models fully supported by plugin mode
 # 【译】插件模式完整支持的多模态模型
 # vLLM插件模式下，这几个模型不抽取text_config（vLLM自己处理多模态），见get_hf_config开头
+# 原因：插件模式下视觉编码器、图像预处理都由vLLM负责，ATOM的插件模型类（plugin/vllm/models/qwen3_5.py、
+#   kimi_k3.py 等）需要完整的多模态config；ATOM原生模式不跑视觉部分，所以才需要抽文本子配置
 _PLUGIN_SUPPORTED_MULTIMODAL_MODELS: set[str] = {
     "kimi_k25",
     "kimi_k3",
@@ -1156,8 +1304,13 @@ _PLUGIN_SUPPORTED_MULTIMODAL_MODELS: set[str] = {
 
 
 # 读取模型目录（或HF仓库名）下的config.json，返回transformers的PretrainedConfig对象
-# 调用方：Config.__post_init__（hf_config）、SpeculativeConfig.__post_init__（草稿模型的config）、
+# 调用方：Config.__post_init__（结果存为 Config.hf_config，几乎所有组件都从这里读模型结构）、
+#   SpeculativeConfig.__post_init__（草稿模型的config，存为 draft_model_hf_config）、
 #   vLLM插件的deepseek_v41_bridge
+# 返回值的约定：无论走哪条路径，返回的都是"文本模型"的config，并且
+#   - architectures 保持checkpoint原名（ModelRunner按 architectures[0] 在 support_model_arch_dict 选模型类）
+#   - quantization_config 在返回对象上（QuantizationConfig 从这里读）
+#   - 多模态模型额外带 _multimodal_config（完整config，Config.__post_init__ 取出放到 Config.multimodal_config）
 # 对比nano-vllm：nano-vllm只有一行AutoConfig.from_pretrained(model)；ATOM要处理transformers不认识的模型、
 #   多模态模型只取文本部分、借用别的模型的Config类等情况，分5条路径：
 #   config_dict = 读出原始的config.json字典，按model_type分流：
@@ -1328,7 +1481,9 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
 
 
 # 读取模型目录下的generation_config.json（模型作者推荐的生成参数，ATOM主要用其中的eos_token_id）
-# 调用方：Config.__post_init__，用它填stop_token_ids；文件不存在时返回None
+# 调用方：Config.__post_init__，结果存为 Config.generation_config，并用其中的eos_token_id填stop_token_ids；
+#   LLMEngine 再从 stop_token_ids 里去掉 tokenizer 的 eos，调度器据此判断序列是否结束（第2、3批）
+# 文件不存在时返回None（不是所有模型都有这个文件），此时只靠tokenizer的eos停止
 # 对比nano-vllm：nano-vllm不读generation_config，eos只取tokenizer.eos_token_id
 #   有些模型的generation_config.json里eos_token_id是一个列表（多个结束符），而tokenizer只给出其中一个
 def get_generation_config(model: str) -> GenerationConfig:
@@ -1344,9 +1499,13 @@ def get_generation_config(model: str) -> GenerationConfig:
 # ---------------- 【分支】MiniMax-M3的config归一化，见第8批 ----------------
 # 三个函数的关系：Config.__post_init__ -> _normalize_minimax_m3_text_config
 #   -> _is_minimax_m3_config（判断是不是M3）+ _normalize_minimax_m3_mlp_layer_types（统一MoE层布局字段）
+# 为什么要归一化：MiniMax-M3有纯文本和VL两种导出，各家量化工具导出的config.json写法也不统一
+#   （层布局字段名不同、字段放在根上还是text_config里不同）。minimax_m3/model.py 只认一种写法，
+#   所以在Config构造时一次性改写hf_config，让模型代码不必处理每种变体
 
 
 # 根config或其text_config的architectures / model_type里含"minimax_m3"或"minimaxm3"（不区分大小写）就算M3
+# 两处都查、两种拼写都认，是因为VL导出的根model_type和文本子配置不同、各导出工具的类名拼写也不同
 def _is_minimax_m3_config(hf_config: PretrainedConfig) -> bool:
     text_config = getattr(hf_config, "text_config", None)
     for candidate in (hf_config, text_config):
@@ -1368,6 +1527,8 @@ def _is_minimax_m3_config(hf_config: PretrainedConfig) -> bool:
 _MINIMAX_M3_MLP_LAYER_TYPES = {"dense": 0, "sparse": 1}
 
 
+# 把"每层是dense MLP还是MoE"统一写成 moe_layer_freq（直接改config对象，无返回值）
+# 谁读结果：minimax_m3/model.py 按 moe_layer_freq[layer_id] != 0 决定这一层建 MoE 还是 dense MLP
 # 例：mlp_layer_types=["dense", "sparse", "sparse"] -> moe_layer_freq=[0, 1, 1]
 #   两个字段都有时必须一致，否则报错；长度必须等于num_hidden_layers
 def _normalize_minimax_m3_mlp_layer_types(config: PretrainedConfig) -> None:
@@ -1413,8 +1574,10 @@ def _normalize_minimax_m3_mlp_layer_types(config: PretrainedConfig) -> None:
         )
 
 
-# MiniMax-M3（含VL多模态版本）的config归一化；不是M3时直接返回
-# 调用方：Config.__post_init__（在应用hf_overrides之后）
+# MiniMax-M3（含VL多模态版本）的config归一化；不是M3时直接返回（所以可以对所有模型无条件调用）
+# 调用方：Config.__post_init__（在应用hf_overrides之后，所以 --hf-overrides 写在根上的字段也会被搬进text_config）
+# 最后一步"text_config字段补到根上"的原因：M3 VL不在_MULTIMODAL_MODEL_TYPES里，hf_config是VL根config，
+#   而引擎通用代码（KV大小计算、ModelRunner等）直接读 hf_config.num_hidden_layers 等字段
 # 做的事：根上的层布局字段覆盖到text_config -> 统一MoE层布局
 #   -> 补swiglu_beta默认值 -> 根上的索引器字段覆盖到text_config -> text_config的字段补到根上（根上没有的才补）
 def _normalize_minimax_m3_text_config(hf_config: PretrainedConfig) -> None:
@@ -1471,6 +1634,13 @@ def _normalize_minimax_m3_text_config(hf_config: PretrainedConfig) -> None:
 # 字段里的"global rank"指全集群的DP编号，"local"指本机内的编号
 # 注意：TP/PP/DCP的大小在Config上，这里主要是DP（下面的decode_context_parallel_size字段没有ATOM代码读取）
 # 对比nano-vllm：nano-vllm只有单机TP，没有这个类
+# 主要读者（按字段分组）：
+#   拓扑（size / size_local / rank / rank_local）：CoreManager决定在本机spawn几个EngineCore、各自的rank；
+#     DPEngineCoreProc 据此选GPU；moe.py 把 size_local 作为MoRI的 gpu_per_node / local_ep_size
+#   ZMQ地址（control_address、pp_*）：CoreManager生成后写进每个rank的Config副本，
+#     EngineCore / pp_engine_core.py 在子进程里按地址连接
+#   端口（master_ip / master_port / base_port）：master_port给DP之间的gloo组，
+#     base_port给ModelRunner的torch.distributed集合点（TCPStore）
 @dataclass
 class ParallelConfig:
     # DP的总rank数（全集群），对应-dp
@@ -1547,6 +1717,9 @@ class ParallelConfig:
     data_parallel_master_ip: str = "127.0.0.1"
 
     # @property：把方法伪装成属性，调用时写pc.is_multinode_dp，不加括号
+    # 谁用：CoreManager（engine_core_mgr.py）。多机时 (1) 本机spawn的EngineCore的全局rank要从
+    #   data_parallel_rank 起算而不是从0；(2) 必须显式给 --data-parallel-base-port，且只有全局rank 0
+    #   那台机器起TCPStore，其余机器作为客户端去连
     # 例：单机-dp 4：local=4、size=4、rank=0 -> False
     #   2x4多机：第一台local=4 < size=8 -> True；第二台rank=4 > 0 -> True
     @property
@@ -1592,6 +1765,9 @@ class ParallelConfig:
         return answer
 
     # 建立DP EngineCore之间的gloo（CPU）进程组：所有DP rank连到master_ip:master_port
+    # 为什么DP rank之间还要通信：forward里有跨DP rank的集合通信（各rank token数的all_reduce、
+    #   MoE在dp×tp张卡上的all-to-all等），要求所有DP rank每步都一起跑forward（没请求的rank跑dummy batch陪跑），
+    #   所以各rank每步要先同步"是否大家都空闲了"，见has_unfinished_dp；这个同步走CPU上的gloo，不占GPU
     # 调用方：DPEngineCoreProc._init_data_parallel（engine_core.py，第2批），
     #   之后DP rank之间用它做CPU上的all_reduce（例如同步"还有没有rank在跑"）
     # "stateless"：不使用torch.distributed的全局默认进程组，避免和ModelRunner里的NCCL进程组冲突
@@ -1636,8 +1812,9 @@ class ParallelConfig:
         aggregated_has_unfinished = bool(tensor.item())
         return aggregated_has_unfinished
 
-    # 被Config.compute_hash汇总（同CompilationConfig.compute_hash）
+    # 被Config.compute_hash汇总（同CompilationConfig.compute_hash），决定torch.compile缓存目录
     # 注意：把data_parallel_rank、master_port也算了进去，所以不同DP rank的编译缓存目录不同
+    #   （也就是说，各DP rank各自编译一份，不共享缓存；改端口也会导致重新编译）
     def compute_hash(self):
         """
         Provide a hash that uniquely identifies all the configs
@@ -1724,7 +1901,10 @@ _DSPARK_DEFAULT_MAX_BLOCK = 16
 _DSPARK_DEFAULT_ROLLING_WINDOW = 128
 
 
-# 串行草稿（MTP/EAGLE3）一次最多能起草几个token；调用方：Config.__post_init__
+# 串行草稿（MTP/EAGLE3）一次最多能起草几个token
+# 调用方：Config.__post_init__，用户的 --num-speculative-tokens 超过返回值就报错。
+#   "串行"指草稿器每起草一个token就要再跑一次草稿层（第k个token依赖第k-1个），层数/训练长度有限，
+#   超过训练时的步数接受率会急剧下降，所以需要上限
 def _resolve_sequential_drafter_max_spec(
     speculative_config: "SpeculativeConfig",
 ) -> int:
@@ -1743,6 +1923,12 @@ def _resolve_sequential_drafter_max_spec(
 
 # 调用方：SpeculativeConfig.hf_config_override（草稿模型的architectures[0]以DSparkModel结尾时）
 # 输出：在hf_config上写入dspark_target_layer_ids、dspark_noise_token_id、dspark_markov_rank、dspark_with_draft
+# 作用：把独立DSpark草稿checkpoint的字段名翻译成内嵌DSpark用的 dspark_* 名字，这样下游只有一套读取代码：
+#   - dspark_target_layer_ids：目标模型ModelRunner要在这些层抽出hidden states（aux hidden）喂给草稿
+#   - dspark_noise_token_id：DSparkProposer用它填充待起草的block（草稿一次并行生成整个block）
+#   - dspark_markov_rank：dspark_markov_sample.py 的采样参数
+#   - dspark_with_draft：SpeculativeConfig.use_dspark_with_draft() 读它，drafter.py、dspark_proposer.py、
+#     deepseek_v4_replay.py 据此走"有独立草稿权重"的分支
 def _normalize_draft_dspark_config(hf_config: PretrainedConfig) -> None:
     """Map a standalone DSpark draft config onto ATOM's canonical names.
 
@@ -1818,6 +2004,11 @@ def _normalize_draft_dspark_config(hf_config: PretrainedConfig) -> None:
 #   路由专家数：有n_routed_experts用它，否则用num_experts（Qwen系的叫法），统一写成n_routed_experts
 #   共享专家数：config里有n_shared_experts就保留；没有时扫描checkpoint，数出共享专家个数（>0才写）
 # 写入text_config（有的话）和根config两处，后续代码读哪一个都一致
+# 为什么需要：不同家族给同一个量起不同名字（DeepSeek叫n_routed_experts，Qwen/Mixtral叫num_experts）。
+#   权重加载（loading_core.py / weight_names.py 把共享专家重命名成 experts.{n_routed_experts}.* 以融合进
+#   FusedMoE，weight_dispatch.py 按专家数分发）只读 n_routed_experts / n_shared_experts 这一套名字
+# 共享专家数扫描checkpoint：有些config（尤其MTP草稿）没写n_shared_experts，但checkpoint里有共享专家权重，
+#   不补上的话这些权重会找不到落脚的参数
 # hf_config.update(dict)：PretrainedConfig的方法，把dict里的键值逐个设为属性
 def _normalize_moe_config_fields(
     hf_config: PretrainedConfig,
@@ -1862,6 +2053,12 @@ def _normalize_moe_config_fields(
 #   2. 读草稿模型的HF config（多模态时取text_config）
 #   3. hf_config_override：把草稿config改写成ATOM草稿模型类认识的样子（改model_type/architectures等）
 # Config.__post_init__随后再校验num_speculative_tokens不超过草稿模型支持的上限
+# 谁读它（config.speculative_config）：
+#   - spec_decode/factory.py：use_dspark() 决定建 DSparkProposer 还是 EagleProposer（MTP、EAGLE3都走后者）
+#   - ModelRunner：按 draft_model_hf_config.architectures 建草稿模型；把 synthetic_acceptance_rates 传给拒绝采样器
+#   - 调度器 / BlockManager / 各注意力backend：按 num_speculative_tokens 给每条序列预留 k 个草稿位置的KV slot、
+#     决定decode每步每条序列的query长度（1 + k）、CUDA Graph捕获的形状
+#   - eagle_proposer.py、vLLM插件 model_wrapper.py：读 method、use_aux_hidden_state、eagle3_aux_layer_ids
 @dataclass
 class SpeculativeConfig:
     # 投机解码方法："mtp"、"eagle3"、"dspark"
@@ -1908,6 +2105,10 @@ class SpeculativeConfig:
     synthetic_acceptance_rates: list[float] | None = None
 
     # ClassVar：类变量，不是dataclass字段（不进入__init__），所有实例共享
+    # 为什么要改model_type：MTP的草稿config就是目标模型的config.json，model_type和目标一样；
+    #   改成 *_mtp 后，下面 _MTP_CONFIG 才能给它换上草稿模型类的architectures。
+    #   注意改写后的副作用：草稿层代码里再按model_type判断模型家族时看到的是"deepseek_mtp"，
+    #   例如 deepseek_v2.py、sparse_indexer_fp4.py 为此改用GLM专有字段来识别GLM-5的MTP
     # model_type → mtp_model_type mapping
     # 【译】model_type → mtp_model_type 的映射
     # 例：目标模型是deepseek_v3，草稿config的model_type被改成deepseek_mtp，再按下表找到MTP模型类
@@ -1940,6 +2141,8 @@ class SpeculativeConfig:
         "qwen4_exp_mtp": ("mtp_num_hidden_layers", "Qwen4ExpMTPModel"),
     }
 
+    # 谁用：spec_decode/factory.py 据此选 DSparkProposer；scheduler.py 据此判断草稿器是否需要
+    #   prefill chunk的下一个token（DSpark从aux hidden states起草，不需要；EAGLE/MTP需要）
     def use_dspark(self) -> bool:
         """DSpark semi-autoregressive block drafter (either flavor).
 
@@ -1975,6 +2178,8 @@ class SpeculativeConfig:
             or bool(getattr(cfg, "dspark_with_draft", False))
         )
 
+    # 谁用：drafter.py、dspark_proposer.py、deepseek_v4_replay.py——独立草稿有自己的权重和KV，
+    #   而内嵌DSpark的草稿层挂在目标模型里，两者加载权重、分配草稿KV的方式不同
     def use_dspark_with_draft(self) -> bool:
         """True when DSpark was given a separate draft model (--draft-model).
 
@@ -1994,6 +2199,8 @@ class SpeculativeConfig:
         return bool(getattr(cfg, "dspark_with_draft", False))
 
     # 校验两个"强制接受"开关并换算成逐位置接受率；两个都没设时什么也不做
+    # 结果 synthetic_acceptance_rates 由 ModelRunner 传给 rejection_sampler：采样器不再比较草稿和目标，
+    #   而是按这组概率伪造"接受了几个"。只用于压测吞吐（输出文本无意义），对应 --spec-decode-acceptance-*
     # 例：k=3、synthetic_acceptance_rate=0.5 -> length=2.5 -> 交给acceptance_length_to_rates生成逐位置接受率
     def _resolve_synthetic_acceptance(self) -> None:
         """Validate the forced-acceptance knobs and resolve to per-position rates.
@@ -2098,7 +2305,9 @@ class SpeculativeConfig:
 
     # 原地改写草稿模型的HF config，让ModelRunner能按architectures[0]找到正确的草稿模型类
     # 分支顺序：独立DSpark -> EAGLE3改架构名 -> 内嵌DSpark（V4/V4.1）-> 串行MTP改写 -> MiMo-V2 MTP
-    # @staticmethod：插件代码也直接调用SpeculativeConfig.hf_config_override(cfg)，不需要实例
+    #   内嵌DSpark必须排在MTP前面：它的model_type也是deepseek_v4，先走MTP分支就会被错当成串行MTP
+    # @staticmethod：SGLang插件的 deepseek_nextn_wrapper.py / deepseek_v4_nextn_wrapper.py / qwen4_exp_nextn_wrapper.py
+    #   也直接调用SpeculativeConfig.hf_config_override(cfg)改写SGLang给的草稿config，不需要实例
     @staticmethod
     def hf_config_override(
         hf_config: PretrainedConfig, model_path: str | None = None
@@ -2193,7 +2402,9 @@ class SpeculativeConfig:
 # 【分支】KVEventsConfig：KV cache事件发布（block被存入/淘汰时对外广播），见第4批 distributed/kv_events.py
 # 用途：让外部订阅者（例如KV感知的请求路由器）知道每个实例缓存了哪些block；消息格式与vLLM的kv_events兼容
 # 来源：Config.kv_events_config的default_factory是from_env，即只由ATOM_KV_EVENTS_*环境变量配置，没有命令行参数
-# 读取方：BlockManager、Scheduler（第3、4批）
+# 读取方：BlockManager 看 enable 决定是否在分配/释放block时记录事件（不开启时连事件列表都不建，零开销）；
+#   Scheduler 用其余字段通过 distributed/kv_events.py 的 make_publisher 建发布器，每步把事件批量发出去（第3、4批）
+# 典型场景：多实例部署时，前面的路由器订阅各实例的事件，把共享前缀的请求发到已经缓存了该前缀的实例上
 @dataclass
 class KVEventsConfig:
     """Configuration for KV cache event publishing."""
@@ -2255,6 +2466,17 @@ class KVEventsConfig:
 # 【分支】DSparkConfig：DSpark投机解码的运行时开关，挂在Config.dspark上，见第7批
 # 来源：--dspark-config的JSON字典，经from_dict构造（arg_utils.py的_get_engine_kwargs）；默认全部关闭
 # 各key的含义见arg_utils.py中--dspark-config的help（以及下面docstring的Fields）
+# 为什么单独成一个类：这些开关横跨ModelRunner、DSpark调度/验证、V4注意力好几个模块，
+#   以前散落在环境变量里；收成一个dataclass后，随Config一起pickle到子进程，各处读到的值保证一致
+# 谁读哪个字段：
+#   confidence_schedule  dspark_proposer.py：是否用置信度头为每个请求动态决定验证长度
+#   ragged               model_runner.py、dspark_scheduler.py：每条序列验证长度不同、不补齐到同一长度
+#   ragged_graph_sizes   model_runner.py：ragged路径要捕获哪些查询长度的CUDA Graph
+#   q_buckets            model_runner.py、dspark_scheduler.py：旧的"整批统一长度"验证路径的Graph桶
+#   disable_sps_calib    model_runner.py：预热时是否跳过自动校准（测量不同验证长度下的每步耗时，
+#                        供置信度调度权衡"多验证几个token"和"每步变慢"）
+#   calibration_profile  spec_decode/calibration.py：读离线测好的校准文件，并校验它与当前模型/TP/GPU/版本匹配
+#   deepseek_v41/config.py 也会读其中几项，决定V4.1 DSpark的配置
 @dataclass
 class DSparkConfig:
     """Runtime configuration for DSpark speculative verification.
@@ -2346,6 +2568,14 @@ class DSparkConfig:
 # 背景：MoE里有的专家很"热"，EP下放热点专家的GPU成为瓶颈；EPLB统计各专家负载，定期复制/迁移热点专家
 # 开关是Config.eplb_enable（--eplb-enable），这里只是参数；来源是--eplb-config的JSON（from_dict）
 # 各字段含义见arg_utils.py中--eplb-config的help，这里不重复
+# 谁读：model_ops/eplb.py（负载统计窗口load_window_size、重平衡周期rebalance_interval、
+#   每次重平衡分批迁移多少层、P2P搬权重的分块大小、冗余专家的放置策略）；
+#   moe.py 按 num_redundant_experts 给每个rank多分配冗余专家的权重槽位（第7批）
+# 字段分三组理解：
+#   何时统计/何时重平衡：load_window_size、rebalance_interval、rebalance_min_balancedness、rebalance_balancedness_agg
+#     （均衡度已经够好就跳过本次重平衡，避免无谓地搬权重）
+#   冗余预算与放置：num_redundant_experts、placement_policy
+#   搬运开销控制：rebalance_layers_per_chunk、p2p_batch_chunk_size（分批搬，避免一次性占满显存/带宽卡住推理）
 @dataclass
 class EPLBConfig:
     """EPLB sub-config (vLLM-style: enable + config object)."""
@@ -2433,6 +2663,15 @@ DCP_COMM_BACKENDS = ("ag_rs", "a2a")
 
 # DCPConfig：挂在Config.dcp_config上；来源是--dcp-config的JSON（from_dict）
 # 前4个字段的含义见arg_utils.py中--dcp-config的help，这里不重复
+# 谁读：
+#   interleave_size              deepseek_v2.py（KV按多少个token为一组轮流分给各DCP rank）、
+#                                PD分离的mooncake_connector.py（传KV时要按同样的交错方式对齐）
+#   enable_query_replication     attention_mla.py：是否开QREP（见下面几个门控函数），省掉decode时AllGather Q
+#   enable_project_before_merge  attention_mla.py：合并各rank的部分注意力输出之前先乘W_V，每个头交换的数据
+#                                从kv_lora_rank（512）维缩到v_head_dim（128）维，通信量变成约1/4；fp4 BMM时自动关闭
+#   comm_backend                 attention_mla.py、dcp_ops.py：合并部分注意力输出用哪种集合通信
+#   indexer_dcp_only             distributed/indexer_cp.py：MiniMax-M3只对索引器做上下文并行
+# 只有 decode_context_parallel_size > 1（或indexer_dcp_only）时这些字段才有意义
 @dataclass
 class DCPConfig:
     """DCP (Decode Context Parallel) sub-config: interleave granularity, query
@@ -2498,10 +2737,15 @@ class DCPConfig:
 #     ├─ q_proj_is_qrep_widened
 #     └─ q_proj_has_row_sliceable_scale
 #   qrep_for_step                 attention_mla.py：每次forward判断本步是否走QREP
-#   indexer_cp_unsupported_reason Config.__post_init__：MiniMax-M3索引器CP能不能开
+#   indexer_cp_unsupported_reason Config.__post_init__：MiniMax-M3索引器CP能不能开（不能就把indexer_dcp_only清成False，
+#                                 之后 distributed/indexer_cp.py 在运行时只需读这个开关）
+# 为什么放在config.py而不是attention_mla.py：attention_mla.py会import triton/aiter，而这些判断要能在
+#   没有GPU库的CPU单测里测；Config.__post_init__ 也要用到其中两个
 
 
 # 返回不能开QREP的原因字符串；能开时返回None
+# 调用方：Config.__post_init__，返回非None时把 dcp_config.enable_query_replication 关掉并打日志说明原因，
+#   这样后面的逐层判断和启动日志都和实际行为一致
 def qrep_unsupported_reason(dcp_size: int, mxfp4_bmm: bool) -> str | None:
     """Why DCP query replication cannot run here, or None if it can.
 
@@ -2524,6 +2768,7 @@ def qrep_unsupported_reason(dcp_size: int, mxfp4_bmm: bool) -> str | None:
     return None
 
 
+# 调用方：qrep_enabled_for_layer（即 attention_mla.py 的MLA层在 __init__/加载后做逐层判断时）
 def q_proj_is_qrep_widened(q_proj, qrep_num_heads: int, qk_head_dim: int) -> bool:
     """Whether `q_proj` was actually built with `qrep_tp_override`.
 
@@ -2577,6 +2822,8 @@ _ROW_SLICEABLE_QUANT_TYPE_NAMES = frozenset(
 )
 
 
+# 调用方：qrep_enabled_for_layer。逐层拦截"q_proj的量化格式不支持按行切scale"的情况
+#   （QREP下prefill要从加宽的q_proj里切出本rank那几行，scale也得能跟着切）
 def q_proj_has_row_sliceable_scale(q_proj) -> bool:
     """Whether `_local_q_proj`'s row view can safely narrow `q_proj`'s scale.
 
@@ -2608,6 +2855,8 @@ def q_proj_has_row_sliceable_scale(q_proj) -> bool:
     return name is None or name in _ROW_SLICEABLE_QUANT_TYPE_NAMES
 
 
+# 调用方：attention_mla.py 的MLA注意力层，结果存为 self.qrep_enabled，之后每步交给 qrep_for_step
+# wants_qrep：全局开关（dcp_config.enable_query_replication 经 qrep_unsupported_reason 过滤后的结果）
 def qrep_enabled_for_layer(
     wants_qrep: bool, q_proj, qrep_num_heads: int, qk_head_dim: int
 ) -> bool:
@@ -2628,6 +2877,7 @@ def qrep_enabled_for_layer(
     )
 
 
+# 调用方：attention_mla.py 每次forward；决定本步是本地算全部q头，还是走AllGather Q
 def qrep_for_step(
     qrep_enabled: bool, use_seg_mla: bool, is_prefill: bool, prefill_qrep: bool
 ) -> bool:
@@ -2650,6 +2900,8 @@ def qrep_for_step(
     return qrep_enabled and not use_seg_mla and (not is_prefill or prefill_qrep)
 
 
+# 调用方：Config.__post_init__（dcp_config.indexer_dcp_only=True 时）；返回非None就把开关清掉并打日志
+# 参数都是从Config / hf_config里取出来的标量，而不是整个Config，正是为了能在单测里直接构造
 def indexer_cp_unsupported_reason(
     arches,
     tp_size: int,
@@ -2991,11 +3243,16 @@ class Config:
     # CoreManager是否用asyncio.Queue异步输出结果（第2批）；atom/里没有地方把它设成True，插件显式传False
     asyncio_mode: bool = False
     # 在计算图中插入graph_marker节点，方便profile定位
+    # 读取方：ModelRunner.__init__ 据此打开graph_marker（set_graph_marker_enabled），各注意力/V4 kernel包装
+    #   在trace里打上名字，抓到的profiler trace里能按层、按算子分段
     mark_trace: bool = False
     # 用假权重代替读取checkpoint（empty/zero/xavier），只测性能时用
+    # 读取方：model_loader/loader.py 跳过读文件、按方式填充参数；moe.py 等处在dummy模式下跳过依赖真实权重的检查
     load_dummy: str | None = None
     # 【分支】专家并行；用均匀的假路由测负载完全均衡时的性能上限，见第7批
+    # enable_expert_parallel 读取方：moe.py（专家按EP切分而不是每个专家按TP切）、ModelRunner、LLMEngine、插件注册
     enable_expert_parallel: bool = False
+    # fake_eplb 读取方：moe.py / comm_fused_moe.py（用均匀假路由）、CoreManager、simulated_tp.py（见tp_world_size）
     fake_eplb: bool = False
     # Width the MoE shards experts for when DP-attention simulates a deployment
     # wider than the box (set by CoreManager); 0 = not simulating.
@@ -3003,10 +3260,14 @@ class Config:
     # sizes the process group and the token collectives.
     # 【译】DP-attention模拟一个比本机更宽的部署时，MoE按这个宽度切分专家（由CoreManager设置）；0 = 不模拟。
     #   parallel_config.data_parallel_size 仍是真实的rank数，因为它决定进程组和token集合通信的大小。
+    # 读取方：只有 moe.py（专家切分宽度）；写入方：CoreManager（engine_core_mgr.py）
     dp_logical_size: int = 0
     # TP进程组的集合地址：ModelRunner设置MASTER_ADDR=master_addr
     master_addr: str = "127.0.0.1"
     # 【分支】DP attention：注意力按DP切分、MoE在DP rank间协同，见第7、9批
+    # 用途：MLA这类KV头很少的模型，注意力做TP会让每张卡重复存同一份KV；改成每张卡独立处理不同请求（DP），
+    #   MoE仍在全部卡上协同。读取方：CoreManager（把TP改写成DP）、LLMEngine、ModelRunner、
+    #   moe.py / topK.py / fused_moe（MoE前后要在DP rank间gather/scatter token）
     enable_dp_attention: bool = False
     # DP request-routing strategy used by CoreManager to pick an engine rank:
     # "round_robin" | "least_requests" (default) | "least_tokens". Only has an
@@ -3030,11 +3291,14 @@ class Config:
     #   使用按DP划分的MoE布局，保持False。它由前端在 atom/plugin/config.py 中设置，而不是在调用处用 is_vllm() 查询。
     moe_ep_flatten_tp_across_dp: bool = False
     # 模型权重的数据类型：__post_init__取hf_config.dtype，没有则bf16
+    # 读取方：未量化层的参数dtype、激活dtype（linear.py、moe.py、各注意力backend分配buffer时）
     torch_dtype: torch.dtype = field(init=False)
     # 【分支】投机解码子配置，不开启时为None，见第7批
     speculative_config: SpeculativeConfig | None = None
     # 【分支】KV传输（PD分离/offload）配置，见第9批
     #   命令行传进来的是JSON字符串，__post_init__解析成dict（LLMEngine构造完Config后又会从kwargs重新解析一次）
+    # 读取方：kv_transfer/disaggregation/factory.py 据此选connector（mooncake / moriio / multi），
+    #   各connector读其中的角色（producer/consumer）、地址等；部分注意力backend据此决定KV布局是否要兼容传输
     kv_transfer_config: dict = field(default_factory=dict)
     # 【分支】KV事件发布，只由环境变量配置（见上面的KVEventsConfig）
     kv_events_config: KVEventsConfig = field(default_factory=KVEventsConfig.from_env)
@@ -3050,6 +3314,7 @@ class Config:
     enable_tbo: bool = False
     enable_tbo_decode: bool = False
     # MoRI all-to-all是否用低延迟模式（--all2all-backend low-latency时为True）
+    # 读取方：moe.py 创建MoRI dispatch/combine时选择模式（低延迟模式适合decode的小batch）
     enable_low_latency: bool = False
     # Routed MoE transport selection. ``auto`` preserves the historical
     # behavior (MoRI when importable, otherwise gather/scatter). ``rccl`` uses
@@ -3059,34 +3324,43 @@ class Config:
     # 【译】路由MoE的传输方式选择。auto 保持历史行为（能导入MoRI就用MoRI，否则用gather/scatter）。
     #   rccl 对uniform decode使用一种可录制进graph的预路由集合通信，对DP/EP组匹配的情况使用变长的
     #   gather/scatter，对其他prefill/混合拓扑使用动态路由的all-to-all。
+    # 读取方：moe.py（建哪种prepare/finalize传输）、topK.py（RCCL路径下共享专家能否融合）；
+    #   __post_init__第1步会规范化并校验它
     moe_all2all_backend: str = "auto"
     # Post-routing routed-MoE implementation. This is deliberately separate
     # from all2all backend/mode: Mega owns dispatch, both GEMMs, and combine.
     # 【译】路由之后的路由MoE实现。它有意与all2all的后端/模式分开：Mega自己负责dispatch、两次GEMM和combine。
+    # 读取方：moe.py、fused_moe/comm_fused_moe.py；"mega"时用一个融合kernel包办dispatch→GEMM→combine
     moe_backend: str = "standard"
     # 每个GPU工作进程要实例化的runner类的完整路径（EngineCore交给AsyncIOProcManager按名字导入）
     #   默认ModelRunner；RapidServe时__post_init__换成RapidServeModelRunner；RL rollout换成RLHFModelRunner
     runner_qualname: str = "atom.model_engine.model_runner.ModelRunner"
     # EPLB master switch + sub-config
     # 【译】EPLB总开关 + 子配置
+    # eplb_enable 读取方：moe.py（开EP时才生效：为冗余专家多分配槽位，并挂上负载统计）、deepseek_v41/config.py
     eplb_enable: bool = False
     eplb_config: EPLBConfig = field(default_factory=EPLBConfig)
 
     # only use for plugin mode
     # 【译】只在插件模式下使用
     # 【分支】插件模式：vLLM/SGLang等框架的配置被包装在这里，见第10批
+    # 原生模式下为None；插件模式下由 plugin/config.py 生成，Config.__post_init__ 从中取vLLM的 ignored_layers 等
     plugin_config: PluginConfig | None = None
     # only for quark_online_quantization
     # 【译】只用于quark在线量化
     # 解释：现在它是通用的--online_quant_config（ptpc_fp8/mxfp4），传给QuantizationConfig
     online_quant_config: dict | None = None
     # 加载HF config后用这个dict覆盖其字段（--hf-overrides），在__post_init__里应用
+    # 用途：不改checkpoint就试验模型结构参数（例如打开MiniMax-M3的 use_index_cache）；
+    #   KV offload的 mooncake_store/keys.py 也把它编进缓存key，因为它可能改变KV的形状或含义
     hf_overrides: dict[str, Any] | None = None
 
     # Intra-GPU prefill/decode disaggregation
     # 【译】单GPU内的prefill/decode分离
     # 【分支】RapidServe：同一张卡上起prefill、decode两个进程，用不同的stream（可选按CU划分），
     #   下面的地址都由CoreManager（DisaggCoreManager）填写，见第5、9批
+    # 读取方：EngineCore（建PUSH/PULL socket）、ModelRunner / RapidServeModelRunner（共享权重和KV的IPC握手）、
+    #   调度器（disagg_cu_shm_name：交换两边batch大小以动态分配CU）
     enable_rapidserve: bool = False
     # ZMQ IPC address: decode PUSH → prefill PULL (BlockAssignment messages)
     # 【译】ZMQ IPC地址：decode PUSH → prefill PULL（BlockAssignment消息）
@@ -3450,6 +3724,8 @@ class Config:
         ):
             self.stop_token_ids = [eos_ids] if isinstance(eos_ids, int) else eos_ids
         # 构造量化配置（第6批）；此时层名还是checkpoint的命名，ModelRunner建模型前会调用remap_layer_name改写
+        # 必须在第5步之后：多模态模型的 quantization_config 是get_hf_config从根config搬进文本config的，
+        #   --hf-overrides 也可能改写它；完整的生命周期见 QuantizationConfig 类上方的说明
         self.quant_config = QuantizationConfig(
             self.hf_config,
             self.online_quant_config,
