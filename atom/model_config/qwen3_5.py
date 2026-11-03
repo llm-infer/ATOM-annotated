@@ -29,7 +29,8 @@
 #   model_type="qwen3_5"时抽出config.json里的text_config，交给transformers的AutoConfig.for_model构造（见本批config.py）
 #   所以这里的类主要充当类型标注和"有哪些字段"的说明
 # 对比nano-vllm：nano-vllm只支持Qwen3，直接用AutoConfig；ATOM要支持transformers未必内置的新模型，才有model_config/这个目录
-# 【分支】Qwen3.5模型实现与GDN线性注意力见第8批
+# 【分支】Qwen3.5模型实现与GDN线性注意力见第8批（"第N批"指仓库根目录ANNOTATION_PLAN.md里的阅读批次）
+# 下面的科普①②被qwen3_5_moe.py、kimi_k25.py和model_engine/sequence.py按编号引用
 #
 # =====================================================================================
 # 【科普】读这个文件需要的概念（GQA、GDN线性注意力、混合层、MoE、部分RoPE已在 qwen3_next.py 文件头讲过，先读那里）
@@ -41,10 +42,18 @@
 #     本质就是你熟悉的Transformer编码器，双向注意力）-> 相邻2x2个patch合并成1个（spatial_merge_size=2，
 #     减少4倍token数）-> 投影到语言模型的hidden维度 -> 替换掉prompt里的图片占位token。
 #   例：一张448x448的图 -> 28x28=784个patch -> 合并后196个"视觉token"，在prompt里占196个位置。
+#     图片 448x448 ─切16x16─> 784个patch ─ViT─> 784个向量 ─2x2合并─> 196个向量 ─投影─> 196个hidden向量
+#                                                                                         │
+#     prompt：    [文][文] <vision_start> <image> x 196 <vision_end> [文] ...                │
+#     embedding： 文本位置照常查词表；196个<image>位置的embedding换成上面这196个向量 <───────┘
+#     替换之后，视觉token和文本token一样进语言模型：一样做注意力、一样占KV cache
 #   视频再多一个时间维：每2帧一组（temporal_patch_size=2）切成3D的patch。
 #   本文件里：Qwen3_5VisionConfig描述视觉编码器，Qwen3_5TextConfig描述语言模型，Qwen3_5Config把两者包起来，
 #     再加上占位token的id（image_token_id等）。
-#   ATOM原生模式目前只跑文本部分（get_hf_config只取text_config），视觉部分由vLLM插件模式处理（第10批）。
+#   ATOM原生模式也跑视觉部分：get_hf_config把text_config当作hf_config，另把完整config存进Config.multimodal_config；
+#     ModelRunner按架构名Qwen3_5ForConditionalGeneration加载models/qwen3_5.py的Qwen3_5MultimodalModel
+#     （视觉编码器在models/qwen3_5_vl.py，用法见recipes/Qwen3.5_multimodel.md）。
+#     vLLM插件模式则不抽text_config，多模态交给vLLM处理（第10批）。
 #
 # ② M-RoPE（多模态RoPE，rope_parameters里的 mrope_section / mrope_interleaved）
 #   普通RoPE里每个token只有一个位置编号（第几个token）。图片是二维的，视频是三维的，
@@ -52,6 +61,17 @@
 #   M-RoPE把每个token的位置拆成三个编号 (t, h, w)：时间、行、列。文本token三个编号相同（退化成普通RoPE），
 #     图片token的h、w取它在图上的行列。RoPE的旋转维度也按 mrope_section 分成三段，
 #     分别用t、h、w的位置去旋转；mrope_interleaved表示三段在维度上是交错排布还是连续排布。
+#   例（为了好读，假设图片合并后只有2x2=4个视觉token；排法与HF transformers的Qwen3-VL get_rope_index相同，
+#     ATOM经models/qwen3_5.py的build_qwen3_5_mrope_input_positions调用aiter的MRotaryEmbedding.get_input_positions计算）：
+#       token：    文A      文B      <vs>     图(0,0)  图(0,1)  图(1,0)  图(1,1)  <ve>     文C
+#       普通RoPE： 0        1        2        3        4        5        6        7        8
+#       M-RoPE：   (0,0,0)  (1,1,1)  (2,2,2)  (3,3,3)  (3,3,4)  (3,4,3)  (3,4,4)  (5,5,5)  (6,6,6)
+#     - 文本token三个编号相同；图片token的t取起点3，h=3+行号、w=3+列号
+#     - 图片之后的文本从"已用的最大编号+1"=5接着排，所以9个token只用到0~6这7个编号
+#   mrope_position_delta = 最大编号 + 1 − token数 = 7 − 9 = −2：之后生成的都是文本token，位置 = 线性位置 + delta，
+#     第1个生成token的线性位置是9 -> M-RoPE位置7，正好接在6后面（Sequence.mrope_position_delta；
+#     decode时在model_ops/attentions/backends.py里加上）
+#   一张448x448的图是14x14=196个视觉token，却只占14个编号，所以每张这样的图让delta减少196−14=182——delta通常是负数
 #   ATOM读取方：ModelRunner看rope_parameters里有没有mrope_section决定是否按M-RoPE准备位置（每个token 3个位置号），
 #     triton_mrope.py、triton_fused_qkv_norm_rope_cache.py 按 mrope_section 分段旋转（第6批）。
 #

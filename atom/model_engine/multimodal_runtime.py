@@ -15,7 +15,8 @@ prefill acknowledges the worker's lease. Decode carries no image payload.
 # 前置知识：图片怎样变成一串视觉向量、再覆盖prompt里占位token的词嵌入（占位token、视觉编码器、为什么一张图占几百个token的KV），
 #   见examples/multimodal_inference.py文件头的【科普】；这里只讲span路径多出来的问题
 # 【科普】chunked prefill下的视觉向量：编码一次、缓存起来、按chunk散射
-#   chunked prefill：一个长prompt的prefill不在一个step里算完，而是每个step只算一段（chunk），几个step接力完成（第3批调度器）。
+#   chunked prefill：一个长prompt的prefill不在一个step里算完，而是每个step只算一段（chunk），几个step接力完成
+#     （入门科普见sequence.py的is_partial_prefill处；切分逻辑在scheduler.py，第3批）。
 #   一张图的占位段可能正好被切开，例如位置2~7是一张图的6个占位token（span=(2, 6)），每个chunk 4个token：
 #       prompt位置：   0    1  │  2    3    4    5    6    7  │  8 …
 #                     文本 文本 │ [IMG][IMG][IMG][IMG][IMG][IMG]│ 文本

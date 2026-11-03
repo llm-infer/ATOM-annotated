@@ -1457,7 +1457,11 @@ _CONFIG_REGISTRY: dict[str, str] = {
 #   之后 _normalize_draft_dspark_config 补齐字段，草稿模型类直接getattr读取
 _PLAIN_CONFIG_MODEL_TYPES: frozenset[str] = frozenset({"k3_dspark"})
 
-# 多模态模型：ATOM（目前只跑文本部分）取出config.json里的text_config子配置当作hf_config
+# 多模态模型：取出config.json里的text_config子配置当作hf_config，完整config另存到 hf_config._multimodal_config
+#   （Config.__post_init__再放到 Config.multimodal_config），供有视觉塔的模型构建视觉编码器
+#   原生模式下真正跑视觉部分的：Qwen3.5（models/qwen3_5.py 构建 qwen3_5_vl.Qwen3VisionTransformer）、
+#   Kimi-K3（models/kimi_k3/model.py 调 kimi_k3_vl.build_vision_modules）；Mistral3、Kimi-K2.5、GLM-5.3
+#   在原生模式下只跑文本（视觉塔是占位层或加载时跳过）
 # 为什么：引擎里的通用代码（KV cache大小计算、ModelRunner、调度器）都直接读 hf_config.num_hidden_layers、
 #   num_key_value_heads 等文本模型字段；VL模型的根config里这些字段在text_config下面，不抽出来就读不到
 # 不在表里的多模态模型（如MiniMax-M3 VL）保留根config，由各自的归一化函数把text_config字段补到根上
@@ -1487,7 +1491,8 @@ _PLAIN_TEXT_CONFIG_MODEL_TYPES: frozenset[str] = frozenset(
 # 【译】插件模式完整支持的多模态模型
 # vLLM插件模式下，这几个模型不抽取text_config（vLLM自己处理多模态），见get_hf_config开头
 # 原因：插件模式下视觉编码器、图像预处理都由vLLM负责，ATOM的插件模型类（plugin/vllm/models/qwen3_5.py、
-#   kimi_k3.py 等）需要完整的多模态config；ATOM原生模式不跑视觉部分，所以才需要抽文本子配置
+#   kimi_k3.py 等）需要完整的多模态config作为hf_config；原生模式则以文本config为hf_config，
+#   视觉部分另从 _multimodal_config 读（见上面 _MULTIMODAL_MODEL_TYPES 的说明）
 _PLUGIN_SUPPORTED_MULTIMODAL_MODELS: set[str] = {
     "kimi_k25",
     "kimi_k3",

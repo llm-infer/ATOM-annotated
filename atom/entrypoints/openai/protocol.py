@@ -305,6 +305,7 @@ class ChatMessage(BaseModel):
 
 
 # ---- 请求参数速查：默认值 / 去向 / 适用场景（chat与completions共有的字段两者含义相同）----
+#   temperature / top_k / top_p怎样作用在模型输出的logits上（带数字例子），见atom/sampling_params.py文件头
 #   参数                    默认      去向                                  适用场景 / 注意
 #   ──────────────────────  ────────  ────────────────────────────────────  ──────────────────────────────────────────────
 #   temperature             1.0       SamplingParams.temperature            0 → 贪心（采样器把≤SAMPLER_EPS的行改成argmax）：

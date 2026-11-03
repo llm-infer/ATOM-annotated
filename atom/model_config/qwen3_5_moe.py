@@ -23,11 +23,12 @@
 #   共有字段（layer_types、linear_*、RoPE、v4覆盖问题等）的解释见qwen3_5.py，这里只注释差异
 # 调用方：models/qwen3_5.py用Qwen3_5MoeTextConfig做类型标注并再导出Qwen3_5MoeConfig；
 #   与dense版一样，仓库里没有地方直接实例化这些类，运行时的hf_config来自config.get_hf_config
-# 【分支】MoE层（FusedMoE、专家并行）见第7批；Qwen3.5模型实现见第8批
+# 【分支】MoE层（FusedMoE、专家并行=把不同专家放到不同GPU上）见第7批；Qwen3.5模型实现见第8批
+#   （"第N批"指仓库根目录ANNOTATION_PLAN.md里的阅读批次）
 #
 # 【科普】MoE（混合专家）一句话：把每层的一个大FFN换成很多小FFN（专家），每个token由路由器挑top-k个来算，
 #   参数总量大但每个token的计算量小。详细说明见 qwen3_next.py 文件头科普⑤；
-#   多模态、M-RoPE见 qwen3_5.py 文件头；GDN线性注意力见 qwen3_next.py 文件头科普②。
+#   多模态、M-RoPE见 qwen3_5.py 文件头科普①②；GDN线性注意力见 qwen3_next.py 文件头科普②（混合层排布见③）。
 # 和dense版的对比（默认值）：
 #   dense：hidden 4096、32层，每层一个 4096 -> 12288 -> 4096 的FFN
 #   MoE：  hidden 2048、40层，每层256个 2048 -> 512 -> 2048 的小专家（每个token用8个）+ 1个共享专家

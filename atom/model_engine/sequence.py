@@ -249,7 +249,8 @@ def new_block_table(block_ids=()) -> BlockTable:
 #   ③ 于是命中会被"状态门控"截短：KV命中到N，状态却只能从N之下最近的checkpoint接上（BlockManager._gated_hit）
 #        例：上一轮prompt 20000个token，checkpoint在8192、16384（末尾锚点在20000附近）；新请求与它共享前19000个token
 #            -> KV最多命中约19000（按block向下取整），但状态只有16384处的快照 -> num_cached_tokens=16384，从16384重算
-#   ④ 有界重放（只用于DeepSeek-V4，且要设ATOM_DSV4_STATE_REPLAY）：V4的状态是"局部"的——第l层位置H的窗口
+#   ④ 有界重放（这里讲DeepSeek-V4的版本，要设ATOM_DSV4_STATE_REPLAY；DeepSeek-V4.1另有默认开启的SWA有界重放，
+#      按sliding_window行重算，见config.py的min_final_prefill_rows和recipes/DeepSeek-V4.1-Flash.md）：V4的状态是"局部"的——第l层位置H的窗口
 #      只依赖第l-1层最近W个位置，所以不必找checkpoint：从H往前退 Config.state_replay_tokens 个token重算一遍，
 #      所有层的状态就被精确重建；退回的那段KV本来就在cache里，只读不写
 #        state_replay_tokens = W + (L-1)·(W-1)，L=层数（MTP/DSpark草稿层也算），见model_ops/attentions/deepseek_v4_replay.py
@@ -420,7 +421,7 @@ def resumes_offload_prefill(seq) -> bool:
 # 图示：一次联合加载里几个token位置的先后关系（由BlockManager._joint_kv_boundary算出，从左到右递增）
 #   0 ──────── HBM命中 ──────── claim_tokens ──────── boundary_tokens ──── kv_tokens ──── kv_prefix_tokens
 #   │ KV在HBM，状态也能接上 │ KV还在HBM，状态接不上 │ KV要从LMCache取 │ 多取到chunk尾 │ LMCache还有，用不上
-#   ·"HBM命中"即准入后的num_cached_tokens；两条腿都报告完成前它一直停在这里，之后才抬到boundary_tokens
+#   · "HBM命中"即准入后的num_cached_tokens；两条腿都报告完成前它一直停在这里，之后才抬到boundary_tokens
 #   · 状态腿取回的是boundary_tokens处的checkpoint（boundary_hash）
 #   · kv_only_tokens 是另一回事：只给DeepSeek-V4有界重放用（见Replay类上方科普④）
 @dataclass
@@ -522,7 +523,7 @@ class OffloadJointRecord:
 #   ★ 采样参数与停止条件、logprobs、流式回调、output_tokens、num_placeholder_tokens
 #     之后：投机token、统计时间戳、PD参数、n>1扇出、DP路由
 #   方法：num_tokens的setter（顺带算num_blocks）、state_slot、block(i)、append_token、__getstate__（跨进程pickle）
-# 下面的两个例子和一张总表只跟踪★计数字段
+# 下面的例子和字段演化总表只跟踪★计数字段
 #
 # 主干计数字段的变化示例（block_size=16，prompt长40，前缀缓存命中1个block，每步token预算16）：
 #   创建：              num_tokens=40，num_prompt_tokens=40，num_cached_tokens=0，block_table=[]
@@ -573,8 +574,8 @@ class OffloadJointRecord:
 #     第5b步位置15的KV是被拒绝草稿c的，所以block 3不登记
 #   - 5b与5a是同一时刻的两种走法；*开MTP时token_ids还带k个占位，may_append按含占位的长度和draft_lookahead
 #     提前补块，补块的时机会比5a早
-#   - 只有填满的block才登记hash：位置8~9不满一块，block 2要等decode把位置10、11的KV也算好（第4步）才登记，
-#     这样下一轮对话"上轮prompt+上轮回答"也能命中它；第2步采样出的t0在位置10，它的KV到第3步才算
+#   - block 2（位置8~11）在第4步登记后，下一轮对话"上轮prompt+上轮回答"也能命中它；
+#     第2步采样出的t0在位置10，它的KV到第3步decode才算
 #   - 6'只释放block：token_ids里的真实token和num_prompt_tokens(=10)都保留。之后重新准入：把10+已生成的token
 #     整体当prompt重算，前面登记过hash的block若还没被驱逐就能命中
 #   - 同一prompt的第二个请求在第2步之后到来：block 0、1的hash命中 -> 准入时num_cached_tokens=8，只需算位置8~9
@@ -641,6 +642,10 @@ class Sequence:
         #   decode每步只产出1个token，GPU大部分时间在等显存读权重。投机解码先让一个便宜的"草稿模型"
         #   （MTP是挂在主模型后面的小预测头）一口气猜k个token，再让主模型一次forward同时验证这k个：
         #   从左往右逐个比对，第一个猜错的位置用主模型自己的结果替换，后面的丢弃；全对还能多得1个。
+        #   图示（k=3，t是当前最后一个真实token）：
+        #     草稿模型（便宜，串行猜3个）：      t -> a -> b -> c
+        #     主模型（一次forward算4个位置）：  输入 [t, a, b, c] -> 每个位置预测"下一个"：[a', b', c', e']
+        #     从左往右比：a'=a ✓  b'=b ✓  c'=d≠c ✗ -> 收下 a、b、d；c和e'丢弃（全对时e'就是多得的那1个）
         #   例：k=3，草稿猜[a,b,c]，主模型认可a、b，c处主模型给出d -> 本步新增3个token[a,b,d]
         #     -> num_bonus_tokens=2（被接受的草稿数），num_rejected=1（=k-接受数），num_tokens += 3
         #     全部接受时新增k+1=4个token，num_rejected=0；一个都不接受时也至少新增1个（主模型自己的那个）
@@ -666,7 +671,9 @@ class Sequence:
         #         2. 状态会被原地覆盖，前缀缓存想复用"前N个token之后的状态"，就必须在N处另存一份快照（checkpoint），
         #            这就是下面一串checkpoint_*字段存在的原因（图解见Replay类上方"科普：状态checkpoint与有界重放"）；
         #         3. 投机解码猜错要回滚，所以每个草稿位置多留一个回滚槽位（state_slots[1:]）：
-        #            k=3时 state_slots = [s0, r1, r2, r3]，s0是已提交状态，r1~r3分别存"接受1/2/3个草稿后"的状态
+        #            k=3时 state_slots = [s0, r1, r2, r3]，s0是已提交状态；验证的k+1个位置算完后的状态各写进一个槽位
+        #            （gdn_attn.py的spec_state_indices形状是[bs, k+1]），再按接受了几个草稿（num_accepted_tokens）挑出
+        #            正确的那份作为下一步的起点
         #   混合模型（如Qwen3-Next：部分层GDN、部分层全注意力）两种缓存同时存在：KV走block_table，状态走state_slots
         #   哪些模型打开它：InputOutputProcessor._per_req_cache_model_types（llm_engine.py），
         #     deepseek_v4已在其中，上面英文里的"future DeepseekV4"已过时
@@ -674,7 +681,8 @@ class Sequence:
         # 科普：多模态输入
         #   图片先被视觉编码器变成一串向量，prompt里为每张图预留一段占位token（几百到上千个），
         #   prefill时把这些位置的词嵌入替换成视觉向量，之后与普通文本token一样参与注意力和KV cache。
-        #   详见atom/model_engine/multimodal_runtime.py开头的说明
+        #   图解与数字例子（一张448x448的图变成196个视觉token）见model_config/qwen3_5.py科普①；
+        #   引擎侧怎么缓存视觉编码结果见atom/model_engine/multimodal_runtime.py开头的说明
         # 【分支】多模态（图像等）输入，见第2批2b
         self.multimodal_data = multimodal_data
         # 视觉编码结果是否已在ModelRunner侧缓存好：首次prefill成功后由调度器置True，
@@ -694,6 +702,7 @@ class Sequence:
         # mrope_positions：prompt部分每个token的三维位置，由InputOutputProcessor.preprocess_fanout调用get_mrope_input_positions算好
         # mrope_position_delta：prompt之后的位置偏移。图片的占位token在M-RoPE下占用的位置编号通常少于token个数，
         #   所以生成token的位置 = 线性位置 + delta（见atom/model_ops/attentions/backends.py里的start + delta）
+        #   M-RoPE是什么、delta为什么通常是负数，图解与数字例子见model_config/qwen3_5.py科普②
         self.mrope_positions = mrope_positions
         self.mrope_position_delta = mrope_position_delta
         # 当前总token数（prompt + 已生成）
@@ -714,14 +723,16 @@ class Sequence:
         self.prefill_gpu_complete = False
         # 【分支】投机解码：上一步被拒绝的草稿token数，见第7批
         self.num_rejected = 0
-        # 已算好KV并写入KV cache的token数（同nano-vllm）
-        # 来源：前缀缓存命中的部分 + 本序列各step计算过的部分
+        # prefill进度：已算好KV的前缀token数。名字沿用nano-vllm，但含义更窄：nano-vllm在decode时也每步+1，
+        #   ATOM只在prefill阶段增长、decode不再更新（见下方"补充"）
+        # 来源：前缀缓存命中的部分 + 本序列各prefill chunk计算过的部分
         # 一般在Scheduler.postprocess里累加；流水线并行时在调度时就累加（第9批）
         # 用途：调度器用num_tokens - num_cached_tokens算"还有多少token要prefill"，并据此切chunk
         # 归零的地方：BlockManager.deallocate（结束/抢占），以及若干放弃已认领前缀的路径
         # 注意它不是"前缀缓存命中数"：命中数单独记在prefix_cache_hit_tokens里（见下方）
         # 补充（核对scheduler.py）：decode步不累加它，只有prefill chunk（postprocess / PP的_advance_prefill_on_schedule）
-        #   以及准入、加载路径会写它，所以prefill结束后它就停在prompt长度上，见类开头的字段演化总表
+        #   以及准入、加载路径会写它，所以prefill结束后它就停住：通常是prompt长度，被抢占后重算的序列则是重新准入时的全部token数，
+        #   见类开头的字段演化总表
         self.num_cached_tokens = 0
         # The prefill forward scheduled last, where it backed off below the
         # point it resumed at (`BlockManager.replay_start`); None when it did
@@ -980,6 +991,9 @@ class Sequence:
         # 【译】DSpark第2阶段：调度器根据上一个decode step的 propose() 选定的验证长度。None表示还没有安排
         #   -> 验证全部 mtp_k 个。下一个decode step把这条序列的验证长度定为 dspark_next_ell+1。
         # 【分支】DSpark投机解码，见第7批
+        # DSpark是什么：一种"块"草稿器——不像MTP那样串行猜k个，而是一次并行forward猜出一整块草稿，
+        #   再由一个置信度头预测"其中前几个值得验证"，于是每条请求可以验证不同的长度（recipes/DSpark.md）
+        #   ell就是这个"值得验证的草稿数"：下一步这条序列验证ell+1个位置
         self.dspark_next_ell: int | None = None
 
         # statistics fields
@@ -1020,7 +1034,7 @@ class Sequence:
         # sequences with identical logits would emit identical tokens.
         # 【译】SamplingParams.n > 1 时的扇出记录。为True时，采样器必须为这条序列生成新的、逐行独立的随机噪声，
         #   而不是复用缓存的共享指数分布张量，否则logits相同的兄弟序列会输出相同的token。
-        # 解释：LLMEngine.preprocess_fanout对n>1的每个兄弟都传needs_independent_noise=(n > 1)；
+        # 解释：InputOutputProcessor.preprocess_fanout（llm_engine.py）对n>1的每个兄弟都传needs_independent_noise=(n > 1)；
         #   只有不做top-k/top-p过滤的采样路径会读它（Sampler._temperature_sample），过滤路径本来就逐行抽随机数
         # n>1的适用场景：best-of-n / 多样本投票（如数学题多采几条取多数）、RL rollout一个prompt要多条回答
         # 好处：prompt只分词一次，n条兄弟序列共享prompt；代价：显存和算力约为n倍，温度为0时n条结果完全相同，没有意义
@@ -1041,6 +1055,8 @@ class Sequence:
         # token-load-aware DPA router.  These are routing metadata only; they
         # are deliberately kept out of the model-facing request payload.
         # 【译】可选的客户端会话血缘，供 CoreManager 中感知缓存、感知token负载的DPA路由器使用。
+        # 解释：DPA = DP attention（--enable-dp-attention），多个DP rank各有一个EngineCore、各管各的请求和KV cache；
+        #   路由器按会话id把同一会话粘在同一个rank上，见engine_core_mgr.py的_select_dp_rank_for_seq_locked
         #   它们只是路由元数据；有意不放进面向模型的请求负载中。
         self.dp_session_id = dp_session_id
         self.dp_parent_session_id = dp_parent_session_id

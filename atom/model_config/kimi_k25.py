@@ -19,7 +19,7 @@ A video-chunk is the smallest independently processable unit of video.
 #   再按它构造视觉塔（MoonViT3dPretrainedModel）和文本模型
 # 原生ATOM路径不用这个类：config.get_hf_config对model_type="kimi_k25"只抽出text_config，
 #   按text_config的model_type经_CONFIG_REGISTRY映射（如kimi_k2 -> deepseek_v3）后解析，见本批config.py
-# 【分支】vLLM插件见第10批；DeepSeek-V3结构（MLA、MoE）见第7批
+# 【分支】vLLM插件见第10批；DeepSeek-V3结构（MLA、MoE）见第7批（"第N批"指仓库根目录ANNOTATION_PLAN.md里的阅读批次）
 #
 # =====================================================================================
 # 【科普】文本部分：DeepSeek-V3结构（text_config是DeepseekV3Config）
@@ -35,20 +35,30 @@ A video-chunk is the smallest independently processable unit of video.
 #     - 不带位置的部分（qk_nope_head_dim=128）：从c还原
 #     - 带位置的部分（qk_rope_head_dim=64）：所有头共享一份，单独算、单独缓存
 #   于是每个token每层只缓存 512 + 64 = 576 个数，约为MHA的1/71。
-#   decode时还有个技巧（"权重吸收"）：把K的上投影矩阵合并进Q、把V的上投影合并进输出投影，
+#   图示（某一层、一个token要往KV cache里存什么；数字是DeepseekV3Config的默认值）：
+#     MHA： h ──W_K──> K：128头 × 192维  ┐
+#           h ──W_V──> V：128头 × 128维  ┘ 全存：128 × (192+128) = 40960 个数
+#     GQA： 同样的K、V，只是头数变少（对比用的假设：8个kv头 -> 8 × 320 = 2560 个数），每个头仍是完整的K、V
+#     MLA： h ──kv_a_proj_with_mqa──> [ c（512维） ; k_rope（64维，所有头共用一份，带RoPE） ]   只存这576个数
+#           算注意力时：c ──kv_b_proj（W_UK）──> 128个头各自的k_nope（128维），k = [k_nope ; k_rope]
+#                       c ──kv_b_proj（W_UV）──> 128个头各自的v（128维）
+#   GQA是"少存几个头"，MLA是"存一个压缩后的向量、用时再展开"，所以能比GQA省得更多
+#   decode时还有个技巧（"权重吸收"）：q·k_nope = q·(W_UK c) = (W_UKᵀ q)·c，即把K的上投影矩阵合并进Q、把V的上投影合并进输出投影，
 #     注意力直接在512维的c上算，不必真的把每个头的K、V还原出来。ATOM的实现见第7批 attention_mla.py。
 #   Q也做了类似的压缩（q_lora_rank），主要为了省参数和计算，与KV cache无关。
 #
 # ② MoE（混合专家）——目的：参数多、算得少
-#   每层的FFN换成很多个小FFN（专家）+ 一个路由器：路由器给每个token对所有专家打分，只挑分数最高的
-#     几个（DeepSeek-V3是256个专家里挑8个）来算，结果按分数加权求和；另外还有1个所有token都要过的共享专家。
-#     开头几层仍是普通的dense FFN（first_k_dense_replace）。Kimi-K2沿用这个结构，只是专家更多（384个）。
+#   通用原理和图示见 qwen3_next.py 文件头科普⑤（路由专家 + 共享专家）。DeepSeek-V3的数字（DeepseekV3Config默认值）：
+#     256个路由专家里每个token挑8个，另有1个共享专家；开头 first_k_dense_replace=3 层仍是普通的dense FFN。
+#     Kimi-K2沿用这个结构，只是专家更多（384个）。
 #   ATOM的实现见第7批 moe.py、topK.py。
 #
 # 顺带一提（本文件用不到，但DeepSeek家族常见）：
 #   DSA（DeepSeek Sparse Attention，V3.2 / GLM-5 用）在MLA之上再加一个轻量的"索引器"（indexer）：
 #     每个query先用很便宜的打分从全部历史token里挑出top-k个（例如2048个），真正的注意力只和这k个token算。
-#     这样超长上下文时注意力的计算量不再随长度增长。Kimi-K2 / K2.5没有DSA。见第7批 model_ops/indexer。
+#     这样超长上下文时注意力的计算量不再随长度增长。Kimi-K2 / K2.5没有DSA。
+#     从MHA/GQA出发的图解见 config.py 里 glm5_kpool_block_size 上方的【科普】①②；
+#     代码见第7批 models/deepseek_v2.py 的 Indexer 类（V3.2 / GLM-5 共用这个文件）。
 #
 # =====================================================================================
 # 【科普】视觉部分：MoonViT + 投影器（vision_config）

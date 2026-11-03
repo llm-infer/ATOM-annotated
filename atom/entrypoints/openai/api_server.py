@@ -92,15 +92,18 @@ Usage:
 #   而是一帧一帧地写，每帧形如 "data: {json}\n\n"；OpenAI的流式协议以 "data: [DONE]\n\n" 结尾。
 #   FastAPI的StreamingResponse包装一个异步生成器：生成器每yield一个字符串，就往socket写一次
 #   （具名帧"event: ...\ndata: ..."，以及为什么用SSE而不是WebSocket，见sse.py）
-# 下文常用的引擎侧术语（详细讲解在括号里的批次）：
+# 下文常用的引擎侧术语（一句话定义；带图的入门科普在括号里指向的位置）：
 #   prefill / decode：prefill是一次前向处理整段prompt、写入KV cache并采样出第1个token；decode是之后每步只喂上一个token、
-#     生成下一个。KV cache按固定大小的block分给各序列（科普见examples/simple_inference.py，第4批）
-#   投机解码（MTP等）：先由便宜的草稿头猜出后面几个token，主模型一次前向同时验证，猜对几个就一个step输出几个（第7批）
+#     生成下一个（为什么一个计算受限、一个访存受限：model_engine/engine_core.py文件开头【2】）。
+#     KV cache按固定大小的block分给各序列（examples/simple_inference.py的"科普·KV cache"，第4批）
+#   投机解码（MTP等）：先由便宜的草稿头猜出后面几个token，主模型一次前向同时验证，猜对几个就一个step输出几个
+#     （model_engine/arg_utils.py的"【科普】投机解码"，第7批）
 #   Sequence：引擎里"一条生成序列"的对象，带prompt token、采样参数、已生成的token和KV block表（第1批sequence.py）
 #   ZMQ：本进程与EngineCore进程之间收发请求、输出和控制命令（utility command）用的消息库（第2批engine_core_mgr.py）
 #   DP（数据并行）：起多个EngineCore副本，每个是一个DP rank，各有自己的调度器和KV cache；CoreManager把每个请求分给某个rank，
 #     并在本进程里为每个rank起一个输出线程（EngineCoreOutputThread-DP{rank}）
-#   PD分离：prefill和decode放在不同节点上跑，prefill节点算完的KV传给decode节点，由PD路由器转发请求（第9批）
+#   PD分离：prefill和decode放在不同节点上跑，prefill节点算完的KV传给decode节点，由PD路由器转发请求
+#     （model_engine/arg_utils.py的"【科普】PD分离"，第9批）
 #   atomesh：atom/mesh下的Rust路由网关（多worker负载均衡、PD路由），见entrypoints/atomesh/server.py文件头
 #
 # ---- 原理：一个"OpenAI兼容服务器"到底要做什么 ----
@@ -118,7 +121,8 @@ Usage:
 #     流式0.3s就开始显示，之后每20ms左右来一段。用户感知的快慢主要看TTFT和ITL（相邻两次输出的间隔，即逐段测得的TPOT；
 #     投机解码时一个step可能一次吐出多个token，ITL会"一阵一阵"的）
 # 为什么用一个事件循环而不是每请求一个线程：一个请求绝大部分时间在等GPU，HTTP这边只做"等待 + 转发"，
-#   一个线程挂几千个协程就够了；真正的批处理（continuous batching：每个step都有序列加入或离开batch）在EngineCore进程的Scheduler里
+#   一个线程挂几千个协程就够了；真正的批处理（continuous batching：每个step都有序列加入或离开batch，
+#   见model_engine/engine_core.py文件开头【1】）在EngineCore进程的Scheduler里
 # 为什么客户端断开要立刻abort：KV cache是推理服务最稀缺的资源，它决定了能同时跑多少条序列。
 #   例：一条序列已有4000个token的KV，max_tokens还剩6000；客户端走了却不abort，它会继续占着KV block和batch里的一个位置
 #   再decode 6000步——这期间等待中的请求因KV不够而进不来，TTFT被拉长。abort后调度器在下一个step结束它并释放block
@@ -780,6 +784,7 @@ _GC_WATCH_INTERVAL_SECONDS = 60.0
 #   第一次提交之前不启动线程，也从不关闭：解释器退出时会join它；而按应用生命周期关闭的话，
 #   一旦应用在进程内重启，这个接口就失效了。
 # 解释："默认线程池跑prompt预处理"指下文的loop.run_in_executor(None, do_preprocess)，None即事件循环的默认线程池
+#   "第2代"：CPython的循环垃圾回收器把对象按存活时间分成第0、1、2代，越老的代越少被扫描；gc.freeze把对象移出这三代（见lifespan）
 _gc_census_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gc-census")
 
 

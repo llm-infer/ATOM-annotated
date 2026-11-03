@@ -8,6 +8,7 @@ from typing import Optional, Union
 # 对比nano-vllm：nano-vllm只有temperature、max_tokens、ignore_eos三个字段
 #   ATOM多了top_k/top_p、stop_strings、n（一个prompt采样多条）、logprobs
 # "引擎级"配置（显存比例、batch上限、并行度等）在config.py的Config里，见本批config.py
+#   （"第N批 / 本批"指仓库根目录ANNOTATION_PLAN.md里的阅读批次，本文件属于第1批）
 # 注意：ATOM没有repetition_penalty / presence_penalty / frequency_penalty（"惩罚已出现过的token"一类参数）；
 #   OpenAI协议里的presence_penalty、frequency_penalty只是被接受，不会传进这里（见api_server.py的_build_sampling_params）
 #
@@ -16,10 +17,9 @@ from typing import Optional, Union
 #   2. 除以temperature后softmax得到概率；T=1时约为[0.61, 0.22, 0.14, 0.03]
 #   3. top_k / top_p把概率低的尾部候选砍掉，剩下的重新归一化
 #   4. 从剩下的分布里随机抽一个
-#   ATOM的抽样写法：argmax(p / E)，E是逐token的Exp(1)随机噪声，效果等价于"按概率p抽样"
-#     （见atom/model_ops/sampler.py；n>1的兄弟序列需要各自独立的E，见Sequence.needs_independent_noise）
-#   更正/补充：argmax(p / E)只是"不做top-k/top-p过滤"那条路径；batch里有人开了过滤时，走的是aiter的
-#     采样算子或torch.multinomial（见下面流程图）
+#   ATOM怎么抽：整个batch都不做top-k/top-p过滤时，用 argmax(p / E)（E是词表上每个token一个的Exp(1)随机噪声，
+#     效果等价于"按概率p抽样"，见atom/model_ops/sampler.py的_temperature_sample；n>1的兄弟序列需要各自独立的E，
+#     见Sequence.needs_independent_noise）；batch里有人开了过滤时，改走aiter的采样算子或torch.multinomial（见下面流程图）
 #
 # 采样流程图（ModelRunner.prepare_sample + Sampler.forward，已核对代码）：
 #
@@ -79,7 +79,8 @@ from typing import Optional, Union
 
 
 # 请求级采样参数，每个请求一份
-# 流向：LLMEngine.add_request / API server构造 -> InputOutputProcessor.preprocess拷贝到Sequence的字段上
+# 流向：LLMEngine.add_request / API server构造 -> InputOutputProcessor.preprocess（经preprocess_fanout）创建Sequence，
+#     Sequence.__init__把各参数拷到自己的字段上
 #   -> ScheduledBatch构造时（scheduler.py）把batch里各序列的temperature/top_k/top_p收集成numpy数组
 #   -> ModelRunner.prepare_sample把这些数组拷进GPU缓冲区（顺带钳制温度、判断是否全贪心/是否需要top-k、top-p）
 #   -> Sampler在GPU上批量采样

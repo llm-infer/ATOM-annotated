@@ -23,7 +23,8 @@ when one was found, or to ``tokenizer.apply_chat_template`` otherwise.
 #   ② 特殊token：词表里专门留给"结构"的条目。以Qwen3.5为例（id取自tests/test_state_checkpoint.py里按Qwen3.5写的常量）：
 #     <|im_start|>（回合开始）= 151644，<|im_end|>（回合结束）= 151645，<think> = 151667。
 #     它们在文本里写成一串字符，但tokenize时整体识别成一个id，而不会被拆成"<"、"|"、"im"……
-#   ③ chat template：模型仓库tokenizer配置里的一段Jinja模板，规定消息列表怎样拼成带特殊token的prompt：
+#   ③ chat template：模型仓库tokenizer配置里的一段Jinja模板（Python的文本模板语言，带循环和条件），规定消息列表怎样拼成
+#     带特殊token的prompt：
 #
 #       messages = [{"role": "user", "content": "你好"}]
 #            │ apply_chat_template（add_generation_prompt=True：末尾补上assistant回合的开头，意思是"轮到你说了"）
@@ -41,12 +42,15 @@ when one was found, or to ``tokenizer.apply_chat_template`` otherwise.
 #     带system和tools时，模板还决定system prompt和工具说明放在哪（Qwen风格：都放进system段；具体文本以模型模板为准）：
 #       "<|im_start|>system\n你是助手\n\n# Tools\n…<tools>{get_weather的JSON Schema}</tools>…<|im_end|>\n"
 #       "<|im_start|>user\n北京天气？<|im_end|>\n<|im_start|>assistant\n"
-#   ④ 为什么必须用模型自己的模板：模型在SFT/RLHF阶段见过的每条对话都是用这个模板拼的，角色标记、system prompt的位置、
+#     少数模型（如DeepSeek-V4、Kimi-K3）不用Jinja，而是在模型目录的encoding/下附带一个Python编码器，作用相同（下面的
+#     load_custom_message_encoder负责找到它）
+#   ④ 为什么必须用模型自己的模板：模型在SFT/RLHF阶段（指令微调和人类反馈强化学习，把基座模型训成对话模型的阶段）
+#     见过的每条对话都是用这个模板拼的，角色标记、system prompt的位置、
 #     工具描述的写法、回合结束符都是它"学会"的格式（哪怕只差一个换行或角色标记都可能明显降低质量）。模板不匹配的典型后果：
 #     模型认不出角色边界，把自己当user接着写；输出的回合结束符不在stop_token_ids里，停不下来，一直写到max_tokens；
 #     system prompt或工具描述放错位置，指令遵循和工具调用质量明显下降。所以服务端用模型自带的模板（或--chat-template显式覆盖）
 #   ⑤ 渲染结果里的特殊token是以文本形式出现的，preprocess里tokenizer.encode会把它们识别回特殊token id；
-#     encode默认add_special_tokens=True，若模板文本本身已以BOS开头、tokenizer又自动加BOS，就会出现两个BOS
+#     encode默认add_special_tokens=True，若模板文本本身已以BOS（序列开头的特殊token）开头、tokenizer又自动加BOS，就会出现两个BOS
 # 本文件的函数：
 #   启动时：load_custom_message_encoder（找Python编码器）；chat_template_source / render_probe_prompt /
 #     resolve_reasoning_toggle（向模板"提问"：有哪些标记、怎样关掉推理）——结果由api_server.main存进全局变量

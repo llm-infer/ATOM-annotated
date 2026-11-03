@@ -5,7 +5,8 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 
-# 流式输出的一个增量：每生成一批token，引擎就调用一次Sequence.stream_callback(RequestOutput)
+# 流式输出的一个增量：每生成一批token，前端进程就用一个RequestOutput调用一次该序列的流式回调
+#   （回调创建时挂在Sequence.stream_callback上，发往EngineCore之前被摘下，见下方第2条）
 # 主要给在线服务（api_server）用：拿到增量token后detokenize，作为SSE chunk推给客户端
 # 离线generate()不走流式回调，而是等序列结束后统一返回
 # 谁创建、谁调用（已核对代码）：
@@ -13,8 +14,7 @@ from typing import Any, Dict, List, Optional
 #      放进stream_output_queue，经ZMQ送回前端进程
 #   2. 回调函数本身不能跨进程pickle：CoreManager.add_request在发出序列前把seq.stream_callback
 #      挪进自己的_seq_id_to_callback字典并把seq上的置为None（engine_core_mgr.py），收到RequestOutput后按request_id查表调用
-#   3. 被调度器直接拒绝、从没运行的序列，由CoreManager自己构造一个output_tokens=[]、finished=True的终止RequestOutput
-#      （engine_core_mgr.py里"returned without running"那段），保证客户端不会一直等
+#   3. 不经postprocess就结束的序列，由CoreManager._deliver_terminal_output补一个终止RequestOutput（见下方"要点"第4条）
 # 例：prompt后依次生成"Hello"" world""!"三个token（非投机、非延迟输出），回调大致收到三次：
 #   ([id_Hello], finished=False) -> ([id_world], False) -> ([id_!], True, finish_reason="eos"或"max_tokens")
 #   投机解码一步可能接受多个token，这时一次回调的output_tokens会有多个元素
@@ -54,9 +54,9 @@ from typing import Any, Dict, List, Optional
 #   - RequestOutput只是"增量"：output_tokens是本步新增的token id，文本由前端事件循环增量反分词得到
 #   - 中间chunk的prefill步没有RequestOutput（postprocess对is_partial_prefill的序列直接continue）；
 #     投机解码一步接受3个token时output_tokens就是3个id
-#   - 从没运行就结束的请求（unschedulable、在waiting里被abort、PD接收KV失败，见sequence.py状态图⑨⑩）
-#     不会有STREAM，它们经take_rejected作为结束的seq回到前端，CoreManager在收到时
-#     由_deliver_terminal_output补一个output_tokens=[]、finished=True的RequestOutput
+#   - 不经postprocess就结束的请求（unschedulable、在waiting里被abort、PD接收KV失败，见sequence.py状态表⑧⑨⑩）
+#     不会有终止的STREAM，它们经take_rejected作为结束的seq回到前端，CoreManager在收到时
+#     由_deliver_terminal_output补一个output_tokens=[]、finished=True的RequestOutput，保证客户端不会一直等
 #   - n>1：每个兄弟序列各一个回调（_send_stream_chunk_tagged），按sibling_index打标签后汇入同一个collector
 @dataclass
 class RequestOutput:
@@ -76,6 +76,7 @@ class RequestOutput:
     #   CoreManager为未运行就返回的序列兜底填"rejected"（leave_reason为空时），因为空原因在OpenAI协议里表示"仍在生成"
     finish_reason: Optional[str] = None
     # 【分支】PD分离：prefill节点返回给路由层的KV传输信息，decode节点据此拉取KV，见第9批
+    #   （PD分离是什么见sequence.py的SequenceStatus；"第N批"指ANNOTATION_PLAN.md里的阅读批次）
     kv_transfer_params_output: Optional[Dict[str, Any]] = None
     # 前缀缓存命中的token数，用于在usage里统计cached tokens
     # 注意：它取自seq.prefix_cache_hit_tokens（Scheduler.postprocess构造时传入），而不是seq.num_cached_tokens；

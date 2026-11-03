@@ -27,7 +27,8 @@
 # 运行时的hf_config：config.get_hf_config里_CONFIG_REGISTRY把"qwen3_next"映射到transformers自带的同名配置类，
 #   仓库里没有地方直接实例化本类；这里的类主要说明有哪些字段、默认值是什么
 # 对比nano-vllm：nano-vllm的Qwen3只有全注意力和dense FFN；这里的linear_*、MoE字段都是它没有的
-# 【分支】GDN线性注意力和Qwen3-Next模型实现见第8批；MoE见第7批
+# 【分支】GDN线性注意力和Qwen3-Next模型实现见第8批；MoE见第7批（"第N批"指仓库根目录ANNOTATION_PLAN.md里的阅读批次）
+# 下面的科普①~⑥被qwen3_5.py、qwen3_5_moe.py、kimi_k25.py和model_engine/sequence.py按编号引用，改编号时要一起改
 #
 # =====================================================================================
 # 【科普】读懂这个配置需要的几个概念（假设你只熟悉标准Transformer + MHA）
@@ -47,6 +48,11 @@
 #     每来一个token只需 S += v_t k_tᵀ，再算 o_t = S q_t。于是：
 #       - 不需要KV cache，每层每条序列只存一个固定大小的S（不管上下文多长）
 #       - decode每步的计算量是常数，像RNN一样"循环"更新
+#     图示（某一层、某一条序列，decode第L+1个token时）：
+#       MHA/GQA：KV cache  [k0,v0][k1,v1][k2,v2] ... [k_{L-1},v_{L-1}]   <- L份，越来越长
+#                新token的q要和这L个k逐个点积，再对L个v加权求和           <- 每步的读取量随L增长
+#       线性注意力：状态 S（每个v头一个 [v_dim x k_dim] 矩阵，与L无关）
+#                S <- S + v_new k_newᵀ（原地更新一次）；o = S · q_new       <- 每步只读写这一个S
 #   代价：S的容量有限，信息会被"压缩"，精确回忆远处细节的能力不如softmax注意力。
 #   GDN是线性注意力的改进版，更新规则（gated delta rule）大致是：
 #       S_t = α_t · S_{t-1} · (I − β_t k_t k_tᵀ) + β_t · v_t k_tᵀ
@@ -67,6 +73,8 @@
 #
 # ③ 混合架构（字段 layer_types）
 #   纯线性注意力回忆能力弱，纯全注意力长上下文太贵，于是交替排布：每4层里3层GDN + 1层全注意力。
+#     层号：  0  1  2  3  4  5  6  7  ...  44 45 46 47      （默认48层）
+#     类型：  G  G  G  F  G  G  G  F  ...   G  G  G  F      G=GDN（固定大小的状态），F=全注意力（分页KV）
 #   全注意力层照常有KV cache（走第4批的block manager），GDN层只有固定大小的状态（走第4批的状态缓存）。
 #   因此同一个模型里有两种"缓存"，这正是ATOM调度、KV管理比nano-vllm复杂的原因之一。
 #
@@ -79,6 +87,13 @@
 #     router给每个token对每个专家打分 -> 取分数最高的k个（top-k，这里k=10）-> 只算这k个专家 ->
 #     按分数加权求和。总参数很大（512个专家），但每个token只用到一小部分，所以"参数多、算得少"。
 #     "80B-A3B"就是总参数80B、每个token激活约3B。
+#     图示（默认配置，一个token经过一层MoE）：
+#       hidden(2048) ──router──> 512个专家各一个分数 ──取前10个──> 10个权重（norm_topk_prob时归一化到和为1）
+#          │
+#          ├──> 选中的10个路由专家（各是 2048->512->2048 的小FFN）──按权重加权求和──┐
+#          │                                                                     ├──> 相加 = 这一层MoE的输出
+#          └──> 共享专家（2048->512->2048，每个token都过）× sigmoid(shared_expert_gate) ┘
+#       512个路由专家只算了10个（约2%），这就是"参数多、算得少"
 #   共享专家（shared expert）：一个所有token都必经的FFN，学通用知识，路由专家学专门知识，两者输出相加。
 #     Qwen3-Next的共享专家输出还会乘一个sigmoid门（shared_expert_gate）。
 #   norm_topk_prob=True：选出的k个专家的权重重新归一化，使它们加起来等于1。

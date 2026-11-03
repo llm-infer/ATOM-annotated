@@ -109,6 +109,7 @@
 #     （如Qwen3.5的生成提示以"<think>\n"结尾，而历史回合里不再写它），命中只到第一处不同之前（见tests/test_state_checkpoint.py）
 #   cached_tokens因此总是block大小的整数倍。chat（流式和非流式）、/v1/responses报告它，/v1/messages叫cache_read_input_tokens，
 #     /v1/completions的usage里没有这个字段
+#   引擎侧的开关是--enable-prefix-caching（默认开，见model_engine/arg_utils.py的enable_prefix_caching）
 #
 # ---- 适用场景：stream与非stream ----
 #   stream=true：聊天界面、Agent逐步显示；用户感知的是TTFT而不是总时延。代价：每帧一次JSON编码 + 一次socket写，
