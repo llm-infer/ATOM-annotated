@@ -46,6 +46,9 @@ class FlexibleArgumentParser(argparse.ArgumentParser):
     #   只变换参数*名*（开头``--``之后的部分），参数*值*不受影响——所以对JSON值的参数也安全，
     #   例如``--online_quant_config '{"use_index_cache": true}'``。短参数（``-tp``）和位置参数保持不变，
     #   ``dest``仍由第一个（原始）选项字符串推导，因此已有调用方不受影响。
+    # 观察：docstring里的例子 '{"use_index_cache": true}' 其实是--hf-overrides的内容（见arg_utils.py中--hf-overrides的help），
+    #   不是在线量化配置的字段（--online_quant_config要求至少给global_quant_config / layer_quant_config / exclude_layer之一）；
+    #   它在这里只用来说明"JSON值原样传下去"
     # 覆盖父类的add_argument：输入是调用方给的选项名（可能有多个，如"-tp", "--tensor-parallel-size"），
     #   在交给argparse之前，把每个长选项的另一种拼写追加进去；kwargs原样透传
     def add_argument(self, *names, **kwargs):

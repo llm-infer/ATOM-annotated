@@ -385,6 +385,7 @@ C 级示例：
 - **`num_cached_tokens`** 在 prefill 结束后停在 prompt 长度，decode 时不再增长（与 nano-vllm 不同）；`RequestOutput.num_cached_tokens` 取自 `prefix_cache_hit_tokens`。
 - **采样**：只有不做 top-k / top-p 过滤时才用 argmax(p/E)；开过滤时走 aiter 采样算子或 `torch.multinomial`。ATOM 没有 repetition / presence / frequency penalty。
 - **默认值**：HTTP 请求 `max_tokens` 默认 chat/completions 8192、messages/responses 4096；`index_cache_dtype` 默认 V4 为 fp4（gfx942、插件或有 KV 传输时 fp8）、V4.1 为 fp8、其余跟随 kv_cache_dtype。
+- **MLA + DSA 模型（V3.2、GLM-5 等）的索引缓存只按 fp8 或 fp4 分配**：`aiter_mla.py` 的 `_declare_kv_pool` 写死 `index_dtype=fp8`，fp4 另由 `_indexer_fp4` 控制；`--index_cache_dtype bf16` 时实际仍按 fp8 分配。
 - **工具调用解析器**只有 qwen、kimi、kimi_k3、glm、dsml、dsml_v41、minimax，没有 Hermes。
 - **MI300X 规格**（估算用）：HBM ≈ 5.3 TB/s，FP8 稠密 ≈ 2600 TFLOPS，BF16 稠密 ≈ 1300 TFLOPS。
 - 不存在的路径：`model_ops/indexer`（DSA 索引器在 `deepseek_v2.Indexer` 和 `model_ops/sparse_indexer_*.py`；GLM-5.3 的在 `model_ops/glm5_next/`）。
