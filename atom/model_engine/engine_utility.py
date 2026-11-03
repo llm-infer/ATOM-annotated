@@ -36,7 +36,7 @@ logger = logging.getLogger("atom")
 #   get_cache_statistics                    前缀缓存统计
 #   start_profile / stop_profile            torch profiler（性能剖析）
 #   abort_request                           中止请求（不回复）
-#   configure_hidden_states                 TorchSpec的隐藏状态提取
+#   configure_hidden_states                 TorchSpec（训练投机解码草稿模型的外部框架）用：让runner导出指定层的隐藏状态
 #   collective_rpc                          集合RPC（collective RPC）：在每个TP rank上调用一个白名单方法
 #   【分支】RL rollout，见第10批：
 #   release_memory / resume_memory / clear_kv_cache           显存释放、恢复，清空KV cache
@@ -44,12 +44,18 @@ logger = logging.getLogger("atom")
 #   discard_failed_weight_sync / finish_weight_sync / get_weight_sync_status  权重同步的放弃、提交、状态查询
 #
 # 权重同步的"围栏（fence）"协议：
-#   收到任何 update_weights*：置fenced → busy_loop不再调度（EngineCore._is_idle_rl_weights_offloaded）
+#   收到任何 update_weights*：置fenced → busy_loop不再调度（EngineCore._is_idle_rl_weights_offloaded；
+#     DP>1时经DPEngineCoreProc._sync_dp_state让所有DP rank一起停）
 #   一次同步可以分成多个bucket（同一个sync_id，最后一个is_last=True）；任一步失败就记下原因，之后的bucket和FINISH都被拒绝
 #   CoreManager确认所有DP engine都成功后发 finish_weight_sync → 解除围栏、恢复服务；失败时发 discard 清理各rank的暂存
 # 为什么要围栏而不是"边服务边更新"：一次forward要读遍所有层的权重，若更新只写了一半，这一步就是"前几层新、后几层旧"的
 #   混合模型，logits没有意义；而且RL需要知道每条rollout是哪个版本的策略生成的。DP>1时还要求所有engine一起切换，
 #   否则同一时刻不同rank上跑的是不同版本——所以本地成功也只能先停着，等CoreManager确认全体成功后统一放行
+#   图解（从单卡forward出发：一次forward = 依次读第0层到第79层的权重）：
+#     例：80层、70GB权重按调用方给的参数顺序（通常就是逐层）分33个bucket原地写入；若第16个bucket写完时放行一步forward：
+#       层：    0 ──────────── 约39 │ 约40 ──────────── 79
+#       权重：  新版本（已写入）      │ 旧版本（还没写到）         ← 这一步的logits来自一个谁也没训练过的"拼接模型"
+#     围栏 = 从第1个bucket开始到FINISH为止，busy_loop不调度任何forward；排队中的请求原样等着，不会丢
 # 对比nano-vllm：nano-vllm没有这一层（没有统计接口、profile、权重热更新）
 #
 # 一次分bucket的权重同步（atom/rollout/weight_sync.py的load_weights_via_shm，DP=2为例）：

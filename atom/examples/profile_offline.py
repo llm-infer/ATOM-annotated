@@ -3,7 +3,9 @@
 
 # 【导读】离线profiling示例：建引擎、预热一次，然后在torch profiler包裹下跑一批请求，导出kernel trace
 # 用法：python -m atom.examples.profile_offline --model <model> --bs 8 --input-length 128 --output-length 32 [--random-input]
-# 调用方：开发者手动运行；结构与simple_inference.py（本批）相同，只多了start_profile / stop_profile两步
+# 调用方：开发者手动运行；结构与simple_inference.py（本批）相同。后者也调用start_profile / stop_profile，但没给
+#   --torch-profiler-dir时什么也不采集；这里的区别是：默认把--torch-profiler-dir设为./profiler_traces、先预热一次、
+#   用ignore_eos固定输出长度、把同一个prompt复制--bs份提交，并且不套chat template
 # 与主干的关系：LLMEngine.start_profile经CoreManager向每个EngineCore广播"start_profile"工具命令，
 #   最终由每个ModelRunner.start_profiler打开torch.profiler，trace按rank写到--torch-profiler-dir/<rank名>/下（见第2批、第5批）
 # 科普·profiler trace：torch.profiler在start/stop之间记录每个CPU算子和GPU kernel的起止时间（ModelRunner里开启CPU+CUDA两类活动），

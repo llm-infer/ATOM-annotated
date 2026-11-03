@@ -49,7 +49,28 @@ from atom.utils import (
 #   ① 启动EngineCore子进程（每个DP rank一个；PP时每个stage一个），建立与它们之间的ZMQ socket
 #   ② add_request：把LLMEngine / API server交来的Sequence用pickle打包，发给某个DP rank（DP>1时做负载均衡）
 #   ③ 每个DP rank一个后台输出线程：收EngineCore推回的结果，调用流式回调，或把已结束的序列放进outputs_queue
-#   ④ 控制通道：工具RPC（utility command）、集合RPC（collective RPC）、RL权重同步、abort、关闭
+#   ④ 控制通道：工具RPC（utility command：按名字让EngineCore执行一条命令，如统计、profile、abort，由engine_utility.py的
+#     EngineUtilityHandler执行）、集合RPC（collective RPC：在每个TP worker上调用一个方法）、RL权重同步、abort、关闭
+#
+# 本文件的组织（约3000行；按名字查找，行号会随修改漂移）：
+#   ① 文件开头的总览：架构位置 → 进程与socket拓扑图 → 为什么分进程 / 为什么ROUTER-DEALER / 背压 → 三种部署形态表
+#   ② 模块级常量与小函数：权重同步常量、DP_LB_STRATEGIES、多机端口规划（InternodeDPSocketPlan / build_internode_dp_socket_plan）、
+#     iter_dp_rank_assignments（本节点起哪些engine）、_resolve_dp_engine_count（--fake-eplb）、_add_frame（打包ADD帧）
+#   ③ class CoreManager，按功能分组：
+#     启动        类上方的启动时序图、_init_shared_state、_start_distributed_store、__init__（10步）、_wait_for_all_ready_signals
+#     收结果      _create_output_thread（每rank一个输出线程）、asyncio版get_output_async
+#     关闭        close（上方有一个DP rank的关闭链路图）、_shutdown_engine_core_rank
+#     发请求      _send_request / _send_control、add_request（上方有DP路由流程图）、_dispatch_to_dp_ranks
+#     DP负载均衡  _select_dp_rank_locked（函数体开头有策略速查表）、会话亲和、_charge_seq_load_locked / _release_seq_load /
+#                 _mark_seq_prefill_complete、reset_dp_router
+#     控制面      send_utility_command、abort_request（上方有abort链路图）、collective_rpc、【分支】RL权重同步（weight_sync_session等）
+#     离线取结果  get_output / is_rest / is_alive / finished_procs
+#   ④ launch_engine_core：为一个engine创建Process对象并分配地址
+#   ⑤ class DisaggCoreManager：【分支】RapidServe（同机PD分离）
+# 建议阅读顺序：拓扑图 → 启动时序图 → __init__ → add_request上方的DP路由流程图 → _dispatch_to_dp_ranks → _create_output_thread
+#   → close；负载均衡策略、权重同步、多机DP、DisaggCoreManager按需再读
+# 前置概念：TP/DP/PP见第1批arg_utils.py"并行"一段；DP-attention、MLA的共享latent KV、EP与all-to-all的图解见
+#   CoreManager.__init__第2步的【科普】；TCPStore与NCCL world见_start_distributed_store的【科普】
 #
 # 在整体架构中的位置（第2批的主线）：
 #   openai_server.py（在线）/ simple_inference.py（离线）
@@ -72,11 +93,11 @@ from atom.utils import (
 #                                          METRICS/UTILITY_RESPONSE（类型码见engine_core_protocol.py）
 #   每个rank一个输出线程在PULL上收                              busy_loop主线程：Scheduler + AsyncIOProcManager
 #                                                                 │ 下发：共享内存广播队列MessageQueue（所有TP worker读同一份）
-#                                                                 │ 回复：每个worker一条ZMQ PUSH(connect) ─► PULL(bind)
+#                                                                 │ 回复：ZMQ PUSH(connect) ─► PULL(bind)，forward主输出只有TP0这一条
 #                                                                 ├─ ModelRunner进程 TP0（GPU 2r）
 #                                                                 └─ ModelRunner进程 TP1（GPU 2r+1）
-#   更准确地说（见async_proc.py）：forward的主输出只有TP0发回（manager的process_output_sockets只收rank 0）；
-#     "每个worker各一条PUSH"的是KV聚合输出和集合RPC回复通道，用来区分"所有rank都完成"和"rank 0完成"
+#   回复通道细节（见async_proc.py）：forward的主输出只有TP0发回（manager的process_output_sockets只收rank 0）；
+#     另有KV聚合输出和集合RPC回复两类通道是"每个worker各一条PUSH"，用来区分"所有rank都完成"和"rank 0完成"
 #
 #   为什么请求和控制分两个socket：input_sockets只有add_request一个线程写，可以不加锁；控制消息会从多个线程发出，
 #     放在另一个socket上加锁串行化（详见_send_request的docstring）
@@ -84,20 +105,18 @@ from atom.utils import (
 #
 # 对比nano-vllm：nano-vllm没有独立的引擎进程，也就没有这一层——LLMEngine.step()在主进程里直接调用
 #   scheduler.schedule()、model_runner.call("run")、scheduler.postprocess()，进程间只靠共享内存+Event给其他TP rank发指令。
-#   ATOM把调度和执行搬进了EngineCore子进程，主进程只负责HTTP、tokenize和收发消息：
-#   好处是主进程里的Python开销不会和调度循环抢同一个解释器（GIL），还能起多个EngineCore做DP；
-#   代价是每个请求、每个结果都要pickle后经ZMQ走一趟
+#   ATOM把调度和执行搬进了EngineCore子进程，主进程只负责HTTP、tokenize和收发消息，还能起多个EngineCore做DP；
+#   代价是每个请求、每个结果都要pickle后经ZMQ走一趟（为什么这个代价可以接受，见engine_core_protocol.py）
 #
-# ── 为什么前端和调度循环之间要隔一层，而且EngineCore是独立进程 ──
-#   decode的一个step在GPU上通常只有十几到几十毫秒；step与step之间的CPU工作（调度、准备输入、后处理）哪怕多拖几毫秒，
-#   GPU就空等几毫秒——这段空等按比例直接吃掉吞吐。而前端进程里还有HTTP/JSON解析、tokenize、detokenize、SSE推流，
-#   都是纯Python、随并发数线性增长的开销（例：1000个并发流式请求、每个约30 token/s，前端每秒要处理约3万次detokenize+推送）。
-#   它们和调度循环如果共用一个解释器，就会抢同一把GIL。所以：
+# ── 为什么EngineCore是独立进程 ──
+#   主说明（GIL是什么、为什么用多进程和spawn）见llm_engine.py文件开头"为什么tokenize / detokenize放在前端进程"，这里只补一个量级：
+#   前端的HTTP/JSON解析、tokenize、detokenize、SSE推流随并发数线性增长（例：1000个并发流式请求、每个约30 token/s，
+#   前端每秒要处理约3万次detokenize+推送），和调度循环共用一个解释器时，这些CPU时间会直接变成GPU在两步之间的空等。所以分工是：
 #     ① 调度 + 执行放进EngineCore子进程，独占自己的GIL，busy_loop可以紧凑地连续喂GPU
 #     ② CoreManager留在前端进程，只做"轻"的事：摘回调、pickle、选DP rank、发ZMQ，以及在输出线程里调回调
 #   （vLLM V1的EngineCoreClient / EngineCoreProc也是同样的拆法）
 #
-# ── 为什么请求方向用ROUTER/DEALER，结果方向用PUSH/PULL ──
+# ── 为什么请求方向用ROUTER/DEALER，结果方向用PUSH/PULL（各socket类型的速览见__init__第8步） ──
 #   这里每个engine都有自己独立的一套socket，"发给哪个rank"靠选哪个socket就决定了，并不依赖ROUTER的多路寻址。
 #   ROUTER/DEALER在这里带来的主要是启动握手：ROUTER只能给已知identity的对端发消息（发往未知identity的消息会被ZMQ默默丢弃），
 #   所以__init__先阻塞收对端DEALER的一个空帧——收到就同时拿到了identity、也确认了对端输入线程已经连上，
@@ -111,8 +130,9 @@ from atom.utils import (
 #     Scheduler按KV block余量、max_num_seqs、max_num_batched_tokens决定每步接纳多少，其余继续等
 #     -> 外部表现是TTFT（首token延迟）随排队长度线性变长，而不是报错。
 #     例：每个rank每秒能完成约10个prefill，1秒内涌进100个请求、DP=2 -> 最后到的请求大约要排5秒才出第一个token。
-#   前端唯一的硬拒绝是api_server的_validate_pool_capacity：prompt比max_pool_tokens（所有rank中最小的KV池容量）还长，
-#     路由到哪都永远放不下，直接报错而不进队列。并发数限流、排队超时之类需要在API server之外（网关/客户端）做。
+#   前端只拒绝"本身就跑不了"的请求，从不按负载拒绝：api_server的_validate_sequence_context_length检查prompt + max_tokens
+#     不超过max_model_len，其中的_validate_pool_capacity检查prompt不超过max_pool_tokens（所有rank中最小的KV池容量）——
+#     路由到哪都永远放不下，就直接报错而不进队列。并发数限流、排队超时之类需要在API server之外（网关/客户端）做。
 #
 # ── 适用场景：单engine vs 普通DP vs DP-attention（CoreManager看到的engine数由此决定） ──
 #   ┌────────────────┬───────────────────────────┬──────────────────────────────────┬──────────────────────────────┐
@@ -130,7 +150,10 @@ from atom.utils import (
 #   │ --enable-dp-   │ 全部M×N张卡                │ 不再在TP rank间重复（见__init__）  │ PCP同时开（见llm_engine.py）    │
 #   │ attention      │                           │                                  │                              │
 #   └────────────────┴───────────────────────────┴──────────────────────────────────┴──────────────────────────────┘
-#   路由器只在engine数>1时工作；三种负载均衡策略的选择见_select_dp_rank_locked上方的速查表
+#   表中术语：MLA / latent KV / EP / all-to-all的图解见CoreManager.__init__第2步的【科普】；
+#     锁步 = DP>1时（DPEngineCoreProc）每个rank的busy_loop每一步都先和其他rank做一次all_reduce同步状态（_sync_dp_state），
+#     没活的rank跑dummy batch陪跑，所以一步的耗时由最忙的rank决定（详见_select_dp_rank_locked函数体开头）
+#   路由器只在engine数>1时工作；三种负载均衡策略的选择见_select_dp_rank_locked函数体开头的"策略速查"表
 logger = logging.getLogger("atom")
 # 权重同步最后那条FINISH命令的等待上限（秒），见_broadcast_and_wait末尾；【分支】RL权重热更新，见第10批
 _WEIGHT_SYNC_FINISH_TIMEOUT_S = 30.0
@@ -184,7 +207,7 @@ class InternodeDPSocketPlan:
     control_port: int
 
 
-# 由DP master端口确定性地推出每个engine的TCP端口（B级：多机DP）
+# 【分支】多机DP：由DP master端口确定性地推出每个engine的TCP端口
 #   输入：engine_count（全局engine数）、master_port；输出：按rank排列的InternodeDPSocketPlan列表
 #   调用方：CoreManager.__init__（仅is_multinode_dp时）；协调节点和工作节点各算一遍，结果一致
 def build_internode_dp_socket_plan(
@@ -264,6 +287,7 @@ def iter_dp_rank_assignments(config) -> list[tuple[int, int]]:
 
 
 # 【分支】--fake-eplb（在少量GPU上模拟大规模部署，只用于测性能）：dp-attention下决定实际启动几个EngineCore；见第7批EPLB
+#   （EPLB = EP下的专家负载均衡，见utils/envs.py"科普·EPLB"）
 #   正常情况直接返回logical（每张卡一个）；调用方：CoreManager.__init__
 def _resolve_dp_engine_count(config: Config, logical: int) -> int:
     """How many DP-attention EngineCores to launch for a `logical`-wide run.
@@ -570,6 +594,20 @@ class CoreManager:
     ) -> None:
         """Bind the actual rendezvous server before publishing its port to workers."""
         # 【译】先绑定真正的集合点服务器，再把它的端口公布给worker。
+        # 【科普】TCPStore与"NCCL world"——从单卡出发：
+        #   单卡跑模型不需要任何通信。TP=2时每层末尾两张卡要all-reduce，用的是RCCL（AMD版的NCCL，GPU之间的集合通信库）。
+        #   建通信器之前，每个进程（rank）只知道自己，得先有一个"集合点"让大家互相找到——TCPStore就是这个集合点：
+        #   一个监听某个TCP端口的小键值服务（例：10.0.0.1:29600），PyTorch的init_process_group在里面交换建链信息：
+        #
+        #       CoreManager进程：TCPStore ◄──┬── ModelRunner rank 0：生成RCCL通信器的唯一id，写进store
+        #                                    ├── rank 1：连上store，读到同一个id
+        #                                    ├── rank 2：……
+        #                                    └── rank 7：……   所有rank拿到同一个id后，RCCL在GPU之间直接建链；
+        #                                                      之后all-reduce / all-to-all的数据走GPU互联，不再经过store
+        #
+        #   world = 参加同一次init_process_group的全部rank，world_size是它们的个数（例：-dp 2 -tp 4 --enable-dp-attention → 8）；
+        #   TP组、EP组等通信子组再从这个world里划分（aiter的init_dist_env）。DP rank之间同步状态（锁步）用的是另起的
+        #   gloo组（gloo = PyTorch基于CPU/TCP的集合通信后端，见ParallelConfig.stateless_init_dp_group），不走这个store
         # 为什么集合点由CoreManager来开，而不是交给某个ModelRunner：
         #   ① NCCL的world跨越所有EngineCore：ModelRunner._setup_device_and_distributed里 world_size = dp × pp × stage_span，
         #      global_rank = (dp_rank × pp + pp_rank) × stage_span + rank。例：-dp 2 -tp 4 --enable-dp-attention改写后是dp 8、tp 1，
@@ -630,17 +668,52 @@ class CoreManager:
         # --enable-dp-attention：注意力按DP切（每张卡各算各的请求，注意力部分不做TP），MoE层仍按 dp×tp 张卡切分（第7批）
         #   所以每张卡都是一个独立的EngineCore（各自有调度器），配置随之改写：
         #   例：单机 -tp 4 -dp 2 -> 8个engine；data_parallel_size 2 -> 8，data_parallel_size_local -> 8，tensor_parallel_size 4 -> 1
-        # 为什么MLA模型（DeepSeek-V2/V3/R1、Kimi-K2等）偏好"注意力用DP、MoE用EP"：
-        #   普通MHA/GQA做TP时按KV头切分：例如Llama-3-70B有8个KV头，TP8时每卡只存1个头，整机KV cache没有重复。
-        #   MLA缓存的是所有注意力头共享的一个低秩latent向量（DeepSeek-V3：kv_lora_rank 512 + rope 64 = 576维/token/层），
-        #   相当于"只有1个KV头"，无法按头切——TP8时8张卡各存一份完全相同的latent KV，KV显存的有效利用率只有1/8。
+        # =====================================================================================
+        # 【科普】DP-attention是什么、为什么MLA + MoE模型要用它——从MHA / GQA + TP出发，五步讲清楚
+        #   （DP、DP-attention、MLA的共享latent KV、EP与all-to-all、锁步：本文件、llm_engine.py、ipc_utils.py都只在这里展开，
+        #    其余位置只引用；utils/envs.py里的"科普·MLA""科普·DP与DP attention""科普·EP与all2all"是一句话版本）
+        # =====================================================================================
+        # ① 出发点：一张卡跑一个MHA/GQA模型，每层 = 注意力（q/k/v/o投影 + KV cache）+ FFN。
+        #   一张卡放不下就用TP（张量并行）：每层按注意力头切到N张卡上，层末all-reduce把各卡的部分结果加起来。
+        #   GQA的KV cache也按KV头切，没有重复。例：Llama-3-70B有8个KV头，-tp 8时每卡只存1个KV头：
+        #
+        #       请求A、B、C ──> 8张卡算的是同一批请求，但每卡只算/只存自己那份头
+        #       GPU0: KV头0(A,B,C)   GPU1: KV头1(A,B,C)   ...   GPU7: KV头7(A,B,C)    ← 8份互不相同，合起来才是完整KV
+        #
+        # ② DP（数据并行）：把整个模型（连同它的TP组）复制M份，每份是一个EngineCore，各自接不同的请求。
+        #   例：8张卡 -tp 4 -dp 2 = 2份副本，CoreManager把请求A发给副本0、请求B发给副本1（怎么选见_select_dp_rank_locked）。
+        #   代价是权重占M份显存，所以只适合"一份模型放得进N张卡"的情况
+        #
+        # ③ MLA让TP切不动KV：MLA（DeepSeek-V2/V3/R1、Kimi-K2等的注意力）把每个token的K/V先压成一个所有头共享的低维latent向量，
+        #   KV cache只存它（DeepSeek-V3：kv_lora_rank 512 + rope 64 = 576维/token/层），算注意力时再展开（或把展开矩阵"吸收"进q）。
+        #   对TP来说这相当于"只有1个KV头"：每张卡算自己的q头时都要完整的latent，于是TP8的8张卡各存一份一模一样的latent KV：
+        #
+        #       TP8 + MLA:  GPU0: latent(A,B,C)   GPU1: latent(A,B,C)   ...   GPU7: latent(A,B,C)   ← 8份完全相同
+        #
         #   例：DeepSeek-V3 61层，bf16下每token的KV = 576 × 2B × 61 ≈ 70KB；假设每卡留60GB给KV：
-        #     TP8：每卡约能放85万token，但8张卡放的是同一批请求 -> 整机也只有约85万token的上下文容量
-        #     dp-attention（DP8）：每卡放不同的请求 -> 整机约680万token，可容纳的并发约×8
-        #   而注意力部分的权重（MLA各投影矩阵，V3全部61层加起来约11B，不到总参数的2%）每卡复制一份代价不大；
-        #   真正大的是MoE专家（数百GB），按EP分散在全部dp×tp张卡上（每卡只放1/N的专家），每层MoE前后用all-to-all
-        #   把token送到专家所在的卡、再收回来。代价：每层all-to-all要所有rank一起参加，DP rank必须锁步，
-        #   路由不均就会让轻载rank空等（见_select_dp_rank_locked上方的说明）
+        #     TP8：每卡约能放85万token，但8张卡放的是同一批请求 -> 整机也只有约85万token的上下文容量，KV显存的有效利用率只有1/8
+        #
+        # ④ DP-attention：只把注意力这一半改成DP——每张卡只算、只存自己那批请求的注意力，不做TP：
+        #
+        #       GPU0: 注意力(A) latent(A)   GPU1: 注意力(B) latent(B)   ...   GPU7: 注意力(H) latent(H)
+        #
+        #   整机约能放 85万 × 8 ≈ 680万token，可容纳的并发约×8。注意力部分的权重（MLA各投影矩阵，V3全部61层加起来约11B，
+        #   不到总参数的2%）每卡复制一份代价不大
+        #
+        # ⑤ MoE层用EP（专家并行），代价是所有rank锁步：MoE把FFN换成很多个"专家"FFN，每个token只选其中k个
+        #   （例：每层256个路由专家、每token选8个；DeepSeek-V3/R1的256个见model_ops/eplb.py的注释）。专家才是参数的大头（数百GB），
+        #   每卡复制不起，于是把专家分散到全部dp×tp张卡上（EP：8卡时每卡32个专家），每层MoE前后各做一次all-to-all：
+        #   先把每个token发到它选中的专家所在的卡（dispatch），算完再发回原卡加权求和（combine）：
+        #
+        #       GPU0上的token a 选了专家{3, 77, 200, ...} ──dispatch──> GPU0（专家0~31）、GPU2（64~95）、GPU6（192~223）……
+        #       各卡算完落在自己专家上的token              ──combine───> 结果回到GPU0，按路由权重加起来 = a的MoE输出
+        #
+        #   all-to-all要所有rank同时参加：某张卡这一步没有请求，也得跑一个dummy batch陪着进all-to-all，否则别人永远等不到它。
+        #   所以DP rank锁步，一步的耗时由最忙的那张卡决定，路由不均就会让轻载rank空等
+        #   （见_select_dp_rank_locked函数体开头"为什么DP路由要这么讲究"）
+        #   注：MoE层实际按dp×tp张卡切（model_ops/moe.py的flatten_tp_across_dp）；开--enable-expert-parallel时按专家切，即上面的EP，
+        #     不开时专家权重按TP方式切。高并发部署通常两者一起开（见第1批arg_utils.py"并行"一段的调优建议）
+        # =====================================================================================
         if config.enable_dp_attention:
             assert pp_size == 1, "Pipeline parallel + DP-attention is not supported yet"
             # One engine per assignment this node owns; on a single node that is
@@ -797,7 +870,8 @@ class CoreManager:
                 #   见 set_device_control_env_var 的docstring。
                 # 解释：例 -dp 2 -tp 4：DP rank 1的4个ModelRunner分别用cuda:4~7，所有进程都能看到全部8张卡
                 # 为什么"先创建全部Process -> 一起start -> 最后统一等READY"，而不是起一个、等一个：
-                #   每个EngineCore初始化时有两处要等齐其他DP rank：_init_data_parallel建gloo组、ModelRunner里init_process_group建NCCL world。
+                #   每个EngineCore初始化时有两处要等齐其他DP rank：_init_data_parallel建gloo组、ModelRunner里init_process_group建NCCL world
+                #   （两者见_start_distributed_store的【科普】）。
                 #   若串行地"start EC0 -> 等EC0 READY -> start EC1"，EC0会永远卡在等EC1入组 -> 死锁。
                 #   时间线（-dp 2）：
                 #     t0  start EC0、EC1（几乎同时）
@@ -1814,7 +1888,7 @@ class CoreManager:
         #
         #   父级血缘不影响放置。每个子关联id都是自己独立的粘性会话，防止兄弟子agent全都挤到根会话所在的rank上。
         #   没有会话的请求保留正常的负载均衡。
-        # 为什么会话一旦定了rank就不能再挪：前缀缓存（第4批）是每个DP rank本地的。例：一个agent会话已进行20轮，上下文累积到30k token，
+        # 为什么会话一旦定了rank就不能再挪：前缀缓存（第4批；是什么见utils/envs.py"科普·前缀缓存"）是每个DP rank本地的。例：一个agent会话已进行20轮，上下文累积到30k token，
         #   第21轮只新增500 token。留在原rank：命中30k前缀，只需prefill 500 token；挪到一个"更闲"的rank：那里没有这段缓存，
         #   要重新prefill 30500 token——为了均衡负载反而多做约60倍的计算。所以只在会话第一次出现时看负载，之后严格粘住
         if explicit_rank is not None:
@@ -2269,6 +2343,16 @@ class CoreManager:
 
     # 【分支】RL权重热更新（weight sync），见第10批。下面这组方法实现"分桶更新权重"的协议：
     #   一次同步 = 若干个update_weights*分桶 + 最后一个分桶之后的FINISH；任何一个engine失败 -> 向所有engine发DISCARD
+    #   背景：RL训练里，训练进程每更新一轮参数，就要把新权重推给正在生成rollout的推理引擎（不重启进程）。权重太大一次发不完，
+    #   于是切成若干"桶"（bucket）依次发；发送期间engine处于"隔离"（fence）状态、不执行任何请求，免得用半新半旧的权重生成：
+    #
+    #       trainer ── update_weights_ipc(桶1) ──► 所有engine：收到更新命令即fence（busy_loop跳过执行）
+    #               ── update_weights_ipc(桶2) ──►   ……
+    #               ── update_weights_ipc(桶N, is_last=True) ──► 全部成功：CoreManager自动补发FINISH → 解除fence，恢复服务
+    #                                                          任一engine失败/超时：向所有engine发DISCARD → 保持fence，丢弃这次同步
+    #
+    #   例：-dp 2时rank 1在桶3上报错，而rank 0已经收下桶1~3 → 两个rank都收到DISCARD，都不会拿这次的半成品权重去服务
+    #   （单条update_weights本身就是一次完整同步；is_last缺省为True，见engine_utility.completes_weight_sync）
     # 本方法：权重同步专属的命令（含FINISH/DISCARD）只能由内部持有_weight_sync_dispatch_token的路径发送
     def _refuse_unowned_weight_sync_cmd(self, cmd: str, dispatch_token) -> None:
         if (
@@ -2682,10 +2766,30 @@ def launch_engine_core(
 #   与跨节点PD分离（--kv-transfer-config）不同，这里是同一台机器、同一组GPU上的两个EngineCore进程，通过CUDA IPC
 #   共享权重和KV cache。LLMEngine在config.enable_rapidserve时构造它而不是CoreManager
 #   engine下标：0 = PrefillEngineCore，1 = DecodeEngineCore
-#   为什么要在同一组GPU上把prefill和decode拆成两个进程：prefill是计算密集（大矩阵乘，吃满CU），decode是访存密集
-#     （每步读一遍权重和KV，只算很少的token）。混在一个batch里时，一个长prompt的prefill会让同batch所有decode请求这一步变慢
-#     （TPOT尖刺）。拆成两个进程并发跑，decode可以持续出token；受约束模式（disagg_constrained）下还通过共享内存里的CU比例
-#     划分计算单元，避免prefill把CU占满。权重和KV cache经CUDA IPC共享，不需要两倍显存
+# 【科普】为什么要把prefill和decode拆开——从"一个EngineCore跑一个Transformer"出发（入门版；完整的通道/握手图见本段末尾的指引）：
+#   ① 一个请求 = 1次prefill（整段prompt一起算，计算密集）+ 很多次decode（每步1个token，访存密集）。单个EngineCore里，
+#     基础调度器一步要么全是prefill、要么全是decode（见engine_core.py文件开头【2】），长prompt的prefill会把decode整体卡住一步：
+#
+#         step 1   decode批                          ~10ms
+#         step 2   decode批                          ~10ms
+#         step 3   prefill批（一个8k token的prompt）  70B模型上约0.9s（估算见【2】） ← 正在decode的请求这一步拿不到token：TPOT尖刺
+#         step 4   decode批                          ~10ms
+#
+#   ② 跨机PD分离（--kv-transfer-config，第1批arg_utils.py的【科普】PD分离）：一组GPU只做prefill、另一组只做decode，
+#     prefill算完的KV经RDMA网络（显存到显存直接走网卡）传给decode那组。代价：要两组卡，每个请求的KV都真的过一遍网络
+#   ③ RapidServe（本类）：不加卡，在同一组GPU上起两个EngineCore进程并发跑，decode不再被prefill打断：
+#
+#         DisaggCoreManager.add_request(seqs) ──同一批seq扇出──┬──────────────────────────┐
+#                                                               ▼                          ▼
+#                                       PrefillEngineCore（engine 0）           DecodeEngineCore（engine 1）
+#                                       max_tokens改成1，只算prompt             分配KV block、逐token decode、产出全部结果
+#                                       写KV ───── 同一个KV池、同一份权重（CUDA IPC，见ipc_utils.py的【科普】）───── 读KV
+#
+#     例：decode给某请求分到第17、18号block，经d2p通道（BlockAssignment）告诉prefill；prefill把prompt的KV直接写进这两个block，
+#     发回PrefillDone；decode拿同样的block号接着decode——"传KV"退化成传几个block编号，权重和KV都不需要两倍显存。
+#     代价：两个进程的kernel争同一组GPU的算力和显存带宽；受约束模式（disagg_constrained）下用共享内存里的CU比例给两边划分
+#     计算单元（CU = Compute Unit，AMD GPU的计算单元，相当于NVIDIA的SM），避免prefill把CU占满。
+#     两个engine之间的通道、启动握手、请求时间线的完整图见engine_core.py"【分支】PD分离（同GPU的RapidServe"一段
 class DisaggCoreManager(CoreManager):
     """CoreManager for intra-GPU prefill/decode disaggregation.
 
@@ -2857,6 +2961,8 @@ class DisaggCoreManager(CoreManager):
             # recv() — they rendezvous naturally without any sequential ordering.
             # 【译】同时启动两个进程。prefill bind启动用的PUSH socket，并阻塞在send()上，直到decode connect并调用recv()——
             #   它们自然地会合，不需要任何先后顺序。
+            # 解释：严格说是依次start的——_connect_proc(prefill)先start prefill并阻塞收它的两个握手空帧，之后才start decode；
+            #   握手帧在加载模型之前就发出（EngineCore.__init__开头启动输入线程），所以两者的启动只差毫秒级
             _connect_proc(
                 prefill_proc,
                 prefill_input_addr,

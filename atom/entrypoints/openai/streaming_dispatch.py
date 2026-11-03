@@ -135,11 +135,17 @@ _DELTA_REUSE = _DeltaReuse()
 
 
 # 增量反分词器：每个流一个，每次拿到新token，只返回"新增的文本"
+# 【科普】反分词（detokenize）与两个偏移量 —— 从"模型每步吐出一个token id"讲起
+#   模型每个decode step输出一个（投机解码时可能是几个）token id。tokenizer的词表把每个id对应到一段字节，
+#   decode就是"按id查出字节、按顺序拼起来、再按UTF-8变成字符串"。字节级BPE的词表里，一个token不一定是完整的字符：
+#       token：  T0          T1              T2              T3
+#       字节：   E4 BD A0    F0 9F           98 80           21
+#       文本：   "你"        （😀的前2个字节） （😀的后2个字节） "!"        ← 😀（U+1F600）的UTF-8是F0 9F 98 80
+#   单独decode([T1])只能得到U+FFFD（�），所以"每来一个token就把它单独decode出来发给客户端"行不通，要用下面的窗口法
 # 原理：为什么流式必须"增量反分词"：客户端要的是文本增量（delta），而引擎每步给的是token id。
 #   最朴素的做法是每步decode全部输出再和上次比，代价随输出长度线性增长（输出1万token时每步都要解码1万个）；
-#   只解码新token又会出错（见下）。这里的窗口法每步只解码最近几个token，开销与输出长度无关
-# 为什么不能直接decode(新token)：一个字符可能跨多个token（例如emoji、部分汉字由多个字节级token组成），单独解码会得到U+FFFD（�）；
-#   而且有的tokenizer的解码结果和前文有关（如前导空格）
+#   只解码新token又会出错（上面的T1）。这里的窗口法每步只解码最近几个token，开销与输出长度无关
+# 为什么不能直接decode(新token)：除了上面"半个字符"的问题，有的tokenizer的解码结果还和前文有关（如前导空格）
 # 做法：维护窗口 tokens[prefix_offset:]：
 #   prefix_text = decode(tokens[prefix_offset:read_offset])   （上次已输出部分对应的文本）
 #   new_text    = decode(tokens[prefix_offset:])              （加上新token之后的文本）
@@ -147,8 +153,7 @@ _DELTA_REUSE = _DeltaReuse()
 # 例：某个字被切成两个字节级token a、b
 #   update([a])：prefix_text=""，new_text="�" → 不完整，返回""，窗口不动
 #   update([b])：prefix_text=""，new_text="字" → 返回"字"；窗口前移：prefix_offset=0（旧read_offset），read_offset=2
-# 完整的状态演示：输出"你😀!"，😀（U+1F600）的UTF-8是4个字节 F0 9F 98 80，假设字节级BPE把它切成两个token：
-#   T0="你"（E4 BD A0，一个token）  T1=字节F0 9F  T2=字节98 80  T3="!"；每次update一个token（复用关闭时的两次decode）
+# 完整的状态演示：沿用上面【科普】里的T0~T3，输出"你😀!"；每次update一个token（复用关闭时的两次decode）
 #   调用            tokens          prefix_text=decode(              new_text=decode(          返回     之后的(prefix, read)
 #                                   tokens[prefix:read])             tokens[prefix:])
 #   ─────────────   ─────────────   ──────────────────────────────   ───────────────────────   ──────   ───────────────────
@@ -162,7 +167,8 @@ _DELTA_REUSE = _DeltaReuse()
 #   ① 窗口[prefix_offset:]最多只覆盖"上一段已输出 + 本次新增"，所以每步的decode开销与总输出长度无关
 #   ② delta按Python字符串长度切（码点数）：len("😀")=1，与它占几个字节、几个token无关
 #   ③ 第2行若消费者落后，T1、T2会在collector里先合并（merge_chunk），一次update([T1, T2])直接得到"😀"，中间那次扣住根本不会发生
-#   ④ 增量复用开启时，prefix_text直接取last_delta（第3、4行分别是"你"、"😀"，正好等于真实decode的结果），省掉第一次decode
+#   ④ 增量复用开启时，prefix_text直接取last_delta（update([T2])、update([T3])两行分别是"你"、"😀"，正好等于真实decode的结果），
+#     省掉第一次decode
 @dataclass
 class IncrementalStreamDetokenizer:
     """Decode token deltas without emitting incomplete UTF-8 characters."""

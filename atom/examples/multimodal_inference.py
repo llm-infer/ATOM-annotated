@@ -12,11 +12,28 @@
 # 与主干的关系：结构与simple_inference.py（本批）相同，区别只是输入多了图片、调用generate_multimodal
 # 【分支】多模态输入的处理（media加载、各模型的input builder）见第2批 multimodal/*
 #
-# 科普·多模态输入：模型本身仍是"吃token序列"的Transformer。一张图片先被processor切成小patch、
-#   归一化成张量pixel_values；prompt里每张图对应一段图片占位token（数量由图片大小决定）。
-#   forward时视觉编码器（如models/qwen3_5_vl.py的Qwen3VisionTransformer）把pixel_values编码成向量，
-#   再把这些向量填到占位token的embedding位置上（qwen3_5.py的merge_multimodal_embeddings），后面就和纯文本一样
-#   image_grid_thw：每张图在(时间t、高h、宽w)三个方向各有多少个patch，用来算占位token数和位置编码（M-RoPE）
+# 【科普】图片占位token与视觉编码器 —— 从"语言模型第一层吃的是词嵌入向量"讲起
+#   ① 纯文本时，每个token id先查词嵌入表变成一个hidden_size维的向量，这串向量再进第一层Transformer。
+#     图片没有token id，但只要能变成"一串hidden_size维的向量"，就能和词嵌入排进同一条序列
+#   ② 所以prompt里先为每张图留一段占位token（同一个特殊token重复N次；Qwen3.5里是image_token_id，默认248056），
+#     forward时把这些位置的词嵌入换成视觉编码器的输出，之后的层（attention、KV cache）把它们当普通token处理：
+#
+#       token：  …user\n  [IMG] [IMG] … [IMG]（共196个）  描述这张图 …
+#       嵌入：   词嵌入    视觉向量0 …… 视觉向量195        词嵌入 …
+#                          ▲
+#       图片448×448 ─切成16×16像素的patch→ 28×28=784个patch ─ViT（双向注意力的Transformer编码器）
+#                   ─相邻2×2个合并、投影到hidden_size→ 196个视觉向量
+#
+#     processor（及模型的输入构建函数）负责前半段：把图片切patch、归一化成张量pixel_values，并把prompt里的占位token
+#     展开成对应个数（ATOM要求每个视觉向量对应一个占位token，见multimodal/processing.py）；
+#     image_grid_thw记录每张图在(时间t、高h、宽w)三个方向各有多少个patch，用来算占位token数和M-RoPE位置
+#     （M-RoPE：图片token的位置用(t, h, w)三个编号而不是一维序号，见model_config/qwen3_5.py文件头【科普】②；
+#      patch大小与2×2合并的出处也在那里的①）
+#   ③ 在ModelRunner里：视觉编码器是models/qwen3_5_vl.py的Qwen3VisionTransformer；替换嵌入在qwen3_5.py的
+#     merge_multimodal_embeddings（把input_ids == image_token_id的位置覆盖成视觉向量）。
+#     占位token同样占KV cache：上面这张图在prompt里占196个位置，也占196个token的KV
+#   DeepSeek-V4.1走另一条"span路径"（视觉向量缓存在ModelRunner里，按chunked prefill的chunk分批填入），
+#     见model_engine/multimodal_runtime.py文件头
 # 用户看到的输出：输入token数、pixel_values形状、image_grid_thw，然后是生成文本和延迟/TTFT/TPOT统计
 import argparse
 import json

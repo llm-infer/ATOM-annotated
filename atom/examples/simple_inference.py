@@ -130,7 +130,8 @@ def main():
         temperature=args.temperature, max_tokens=args.max_tokens
     )
 
-    # 把用户问题包装成模型的对话格式（例如加上<|im_start|>user ... <|im_end|>）
+    # 把用户问题包装成模型的对话格式（例如加上<|im_start|>user ... <|im_end|>；这些特殊token和chat template的科普
+    #   见entrypoints/openai/chat_encoders.py文件头）
     # 大多数模型用tokenizer自带的Jinja chat_template；少数模型在模型目录的encoding/encoding_*.py里
     #   提供自定义的消息编码器，load_custom_message_encoder找到它就优先使用，找不到返回None
     custom_encoder = load_custom_message_encoder(args.model)
@@ -157,7 +158,7 @@ def main():
     llm.start_profile()
     # 提交所有prompt并阻塞等待全部完成
     # 返回值是一个列表，与prompts一一对应（n=1时），每项是一个dict：
-    #   text（生成的文本）、token_ids、logprobs、latency、finish_reason、
+    #   text（生成的文本）、token_ids、logprobs（本例没设SamplingParams.logprobs，所以为None）、latency、finish_reason、
     #   num_tokens_input、num_tokens_output、ttft（首token延迟）、tpot（每个输出token的耗时）
     outputs = llm.generate(prompts, sampling_params)
     llm.stop_profile()

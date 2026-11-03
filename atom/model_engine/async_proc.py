@@ -41,6 +41,10 @@ import zmq.asyncio
 
 # MessageQueue：aiter里的共享内存广播队列（移植自vLLM的shm_broadcast，源码不在本仓库）
 #   一个写者、多个读者；消息先pickle，再写进共享内存环形缓冲区的一块，每个读者各自读到同一条消息
+#   示意（按vLLM原版shm_broadcast的设计；块数等细节以aiter移植版源码为准；TP=2即两个读者）：
+#     环：  [块0][块1][块2] ... [块9]          写者按0,1,2…顺序写，写满一圈回到块0
+#     每块：数据 | "已写"标志 | 读者0"已读" | 读者1"已读"
+#     读者r轮询"块k已写、且自己还没读" → 读出 → 置自己的"已读"；写者要覆盖块k，必须等所有读者都已读
 from aiter.dist.shm_broadcast import MessageQueue
 
 from atom.kv_transfer.disaggregation import KVConnectorOutput, KVOutputAggregator
@@ -82,6 +86,16 @@ logger = logging.getLogger("atom")
 #   AsyncIOProcManager  运行在EngineCore进程里：spawn这些子进程、广播指令（call_func）、收集结果
 #   调用方：EngineCore.__init__ 创建 AsyncIOProcManager(finalizer, tp_world_size x PCP大小, runner类名, config)
 #     （PP的每个stage是一个独立的EngineCore，各自有自己的manager，所以进程数不乘PP）
+#
+# 读法（本文件约1500行）：先看下面的进程/通道图、一次forward的时序、"四种调用方式对照"表；
+#   代码按 AsyncIOProc.__init__ → AsyncIOProc.busy_loop（worker侧：取指令、执行、回传）→ AsyncIOProcManager.__init__
+#   → call_func → monitor_procs（manager侧：下发、收结果、发现worker死亡）的顺序读。
+#   _PendingKvAggregation / call_func_with_aggregation（KV传输，第9批）和collective_rpc一族（RL rollout，第10批）
+#   是【分支】，第一遍可以跳过
+# 术语：TP rank = 张量并行组里的第几张卡；PCP = prefill上下文并行（-pcp，它的rank也是这里的worker）；
+#   SPMD、延迟输出、为什么一张卡一个进程：见engine_core.py文件开头【3】【4】；"第N批"的含义也见engine_core.py文件开头的术语速查；
+#   custom all-reduce：aiter实现的同机all-reduce，各GPU用IPC把彼此的一块显存映射进来直接读写、不走RCCL——
+#   worker意外变成孤儿时占住的"IPC资源"就是它（见下面AsyncIOProc.__init__开头）
 #
 # 进程与通道（TP=2为例）：
 #
@@ -133,7 +147,7 @@ logger = logging.getLogger("atom")
 #     - forward指令里最大的block table只发增量（block_table_codec.py），nano-vllm每步重发整张表
 #
 # 设计原理：
-#   SPMD：TP的每个rank必须以相同的顺序执行相同的方法、输入形状一致，否则模型内部的all-reduce会配不上对而永久挂起。
+#   SPMD（TP的每个rank以同样顺序执行同样的方法、输入形状一致，否则all-reduce永久挂起；图解见engine_core.py文件开头【4】）：
 #     MessageQueue是"一个写者、多个读者"的FIFO：EngineCore写一次，每个rank按同样的顺序读到同样的指令序列，天然满足这一点；
 #     同一个batch也只pickle一次，而不是给每个rank各pickle、各发一遍
 #   为什么用共享内存而不是socket下发：decode一步只有10ms量级，指令下发就在关键路径上。共享内存只需一次pickle和一次写入，
@@ -170,11 +184,9 @@ logger = logging.getLogger("atom")
 #   要点：两个rank各自launch，但GPU上的all-reduce把它们对齐；只要CPU侧每步的"出队+launch"比GPU一步短，GPU就不会空等
 #
 # 共享内存广播 vs 每个rank一条ZMQ socket：
-#   好处：① 一次pickle、一次写入，N个rank都能读到（ZMQ要发N份，或者至少N次内核收发）；
-#     ② 天然全序：所有rank按同一顺序拿到同样的指令（SPMD的前提，见下面"设计原理"）；
-#     ③ 读者轮询共享内存里的标志位即可取到，不经内核、不需要被唤醒，decode这种10ms量级的step上省下的是关键路径上的时间
+#   好处见上面"设计原理"：一次pickle、一次写入N个rank都能读到（ZMQ要发N份）；天然全序（SPMD的前提）；读者轮询标志位、不经内核
 #   代价：① 读者忙轮询（按vLLM原版的实现：自旋并让出CPU），每个worker进程即使空闲也会占着CPU时间；
-#     ② 每条消息受max_chunk_bytes（这里16MiB）约束，环形缓冲区的块数也是固定的（vLLM原版默认10块，aiter移植版以其源码为准），
+#     ② 每块的大小固定为max_chunk_bytes（这里16MiB；更大的消息怎么走见__init__里构造MessageQueue处），环形缓冲区的块数也是固定的（vLLM原版默认10块，aiter移植版以其源码为准），
 #       写者在所有读者读完最旧那块之前不能覆盖它，所以一个卡住的rank会让enqueue也停下来；
 #     ③ 只能在同一台机器内使用：跨节点的reader要另走socket（这里n_local_reader=proc_num，所有worker都在本机）；
 #     ④ 回程仍然要ZMQ：共享内存只解决"一写多读"的下发，结果回传是"多写一读"，用PUSH/PULL更简单
@@ -227,7 +239,7 @@ class _PendingKvAggregation:
 #   直到收到exit才返回。所以这个构造函数的执行时间就是整个进程的生命周期（同nano-vllm的target=ModelRunner）
 #
 # 构造过程（__init__）：
-#   1. 进程级准备：父进程死亡时自动退出、进程标题、GC阈值、NUMA绑核
+#   1. 进程级准备：父进程死亡时自动退出、进程标题、GC阈值、NUMA绑核（默认关闭，ATOM_NUMA_BIND=1才生效，见numa_utils.py）
 #   2. 连接共享内存广播队列（读者端），注册退出处理
 #   3. 启动发送线程：主通道（仅rank 0）、KV通道、集合RPC通道
 #   4. 构造ModelRunner(rank, config)：初始化分布式、加载权重、预热……（第5批）

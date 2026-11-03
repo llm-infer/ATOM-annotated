@@ -30,13 +30,15 @@ instance) has to be sanitised before it gets here.
 #
 #   与 json.dumps 不同，msgspec遇到NaN和Infinity会拒绝，而不是输出非标准的字面量。任何可能进入帧的浮点数
 #   （例如logprobs）都必须在到达这里之前清洗过。
+# 解释：上面的基准脚本路径在作者的机器上，不在本仓库里；目前HTTP帧里的logprobs恒为null（见api_server._build_sampling_params前的说明），
+#   这条提醒针对将来往帧里放浮点数的代码
 #
 # 本文件（第2批2c，B级）：SSE（服务端推送事件）帧的编码与解析，三个小函数
 # SSE帧格式（文本协议，每帧以一个空行结束）：
 #   匿名帧：data: {"id": "chatcmpl-...", "choices": [...]}\n\n                ← OpenAI的流式响应用这种
 #   具名帧：event: message_start\ndata: {"type": "message_start", ...}\n\n     ← Anthropic / Responses的流式响应用这种
 # 调用方：serving_chat / serving_completion / atomesh的atom_standalone_service（data_frame）、
-#   serving_anthropic / serving_responses（event_frame）、api_server._client_stream（iter_sse_data，用于日志和TTFT）
+#   serving_anthropic / serving_responses / api_server的Anthropic ping帧（event_frame）、api_server._client_stream（iter_sse_data，用于日志和TTFT）
 
 # 原理：为什么用SSE而不是WebSocket。生成是单向的（服务端 → 客户端），SSE就是一个普通的HTTP响应、只是不一次性写完，
 #   能穿过一般的HTTP代理和负载均衡，客户端用任何HTTP库逐行读即可。代价是协议本身没有"正常结束"的标志——

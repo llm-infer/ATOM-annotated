@@ -12,18 +12,22 @@ prefill acknowledges the worker's lease. Decode carries no image payload.
 #   确认了worker端的租约之前发送它们。decode不携带图像载荷。
 #
 # 【导读】多模态prefill的运行时：图像经视觉编码器得到的embedding怎么缓存、怎么跨chunked prefill分批填进输入embedding
-# 原理：视觉-语言模型怎样"读"图片。图片先切成固定大小的patch，经视觉编码器（ViT）和投影层（projector）变成一串向量，
-#   每个向量的维度等于语言模型的hidden_size，可以和词嵌入放在同一个序列里。prompt里为每个视觉向量留一个占位token，
-#   prefill时把占位位置的词嵌入换成视觉向量，之后的Transformer层就把它们当作普通token处理（attention、KV cache都一样）。
-#   例（patch=14、2×2合并的ViT，Qwen2-VL一类结构）：448×448的图 → (448/14)²=1024个patch → 合并后256个视觉token，
-#     于是prompt里这张图占256个位置，也占256个token的KV cache
-#   为什么要缓存视觉embedding：视觉编码本身是一次不小的前向；chunked prefill下同一张图可能跨多个chunk，不能每个chunk重算一遍
-#   为什么前缀缓存要带cache_seed：占位token的id对所有图片都一样，只看token id会让"同样的文字 + 不同的图"误命中别人的KV
-# 背景：多模态prompt里每张图对应一段连续的占位token（几百到上千个），prefill时要把这些位置的词嵌入替换成视觉编码器的输出。
-#   ATOM支持chunked prefill，一张图的占位段可能被切进多个chunk，所以需要：
-#   1. 视觉编码只做一次，结果在ModelRunner进程里缓存，直到该请求结束（VisionEmbeddingCache，按cache_seed去重）
+# 前置知识：图片怎样变成一串视觉向量、再覆盖prompt里占位token的词嵌入（占位token、视觉编码器、为什么一张图占几百个token的KV），
+#   见examples/multimodal_inference.py文件头的【科普】；这里只讲span路径多出来的问题
+# 【科普】chunked prefill下的视觉向量：编码一次、缓存起来、按chunk散射
+#   chunked prefill：一个长prompt的prefill不在一个step里算完，而是每个step只算一段（chunk），几个step接力完成（第3批调度器）。
+#   一张图的占位段可能正好被切开，例如位置2~7是一张图的6个占位token（span=(2, 6)），每个chunk 4个token：
+#       prompt位置：   0    1  │  2    3    4    5    6    7  │  8 …
+#                     文本 文本 │ [IMG][IMG][IMG][IMG][IMG][IMG]│ 文本
+#       chunk0（0~3）：           视觉向量第0、1行 → 位置2、3
+#       chunk1（4~7）：                     视觉向量第2~5行 → 位置4~7
+#   所以需要：
+#   1. 视觉编码只做一次（它本身是一次不小的前向），结果在ModelRunner进程里缓存到该请求结束（VisionEmbeddingCache，按cache_seed去重）
 #   2. 每个chunk只把"本chunk范围 ∩ 图像占位段"那部分embedding散射进去（embedding_indices）
-#   3. 第一次prefill成功之后，调度器不再把像素张量发给worker，只发span元数据（prefill_media_payload）
+#   3. 租约（lease）：worker（即ModelRunner）登记"请求X正在用缓存项Y"，登记期间缓存项不会被删；第一次prefill成功、
+#      租约被确认之后，调度器不再把像素张量发给worker，只发span元数据（prefill_media_payload）
+#   为什么前缀缓存要带cache_seed（图片内容的哈希指纹，见下面的multimodal_cache_seed）：占位token的id对所有图片都一样，
+#     只看token id会让"同样的文字 + 不同的图"误命中别人的KV（前缀缓存的科普见entrypoints/openai/serving_chat.py文件头）
 # 数据：multimodal_data是一个dict，由模型的输入构建函数产出，含pixel_values（图像patch张量）、image_grid_thw（每张图的网格）、
 #   token_types、embedding_spans=((起始位置, token数), ...)、cache_seed（内容指纹）
 #   v0.1.8中只有DeepSeek-V4.1的image_processing.build_inputs会产出embedding_spans

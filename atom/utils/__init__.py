@@ -215,7 +215,7 @@ def get_device_indices(
 #   例：attention被标成切分点后，一层模型被切成"attention之前的线性层/归一化"、"attention"、"之后的MLP"几段，
 #   前后各段分别编译。默认--cudagraph-mode是FULL：整步forward（含attention）一起录进一张CUDA Graph；
 #   只有PIECEWISE模式才给每个编译段各录一张graph、attention段留在graph外执行（见utils/backends.py的split_graph附近）
-# 【分支】piecewise编译与CUDA Graph详见第5批
+# 【分支】piecewise编译与CUDA Graph详见第5批；入门图解见config.py里CUDAGraphMode上方的【科普】②④
 def mark_spliting_op(
     is_custom: bool,
     gen_fake: Callable[..., Any] | None = None,
@@ -549,7 +549,7 @@ def get_tcp_uri(ip: str, port: int) -> str:
 # 科普·ZMQ（ZeroMQ）：一个消息队列库，用法像socket，但收发的是完整的"消息"而不是字节流，并自带重连、排队。
 #   地址写成"传输方式://位置"：ipc://<文件路径>（同机进程间，走Unix域socket）、tcp://host:port（跨机器）、
 #   inproc://<名字>（同进程内的线程间）。ATOM用它连接引擎的各个进程，例如CoreManager用ROUTER socket bind、
-#   EngineCore用DEALER connect来发请求；EngineCore用PUSH把结果推回CoreManager的PULL（见engine_core_mgr.py、engine_core.py）
+#   EngineCore用DEALER connect过去、从那里收请求；EngineCore用PUSH把结果推回CoreManager的PULL（见engine_core_mgr.py、engine_core.py）
 # 生成一个唯一的ZMQ进程内（inproc://）地址，只能在同一进程的线程之间通信；调用方：engine_core_mgr.py
 def get_open_zmq_inproc_path() -> str:
     return f"inproc://{uuid4()}"
@@ -1104,6 +1104,10 @@ def _is_torch_equal_or_newer(torch_version: str, target: str) -> bool:
 #   都共享Storage对象，从而*保持*它存活 -> 内存池无法复用这块内存 -> 每个捕获片段的输出不断累积
 #   （DSV4 TP8 PIECEWISE下超过35GB）。因此我们一次性JIT编译一个很小的、等价于`at::from_blob(..., 空操作deleter)`的算子
 #   （缓存在~/.cache/torch_extensions下），让PIECEWISE cudagraph的内存池像上游vLLM一样覆盖复用。
+# 解释（"覆盖复用"图解；CUDA Graph本身见config.py里CUDAGraphMode上方的【科普】）：所有graph共用一个私有显存池
+#   （model_runner.py的graph_pool），capture_cudagraph按尺寸从大到小依次录制：
+#     有弱引用：录bs=512 → 输出占块A，只被弱引用 → 录bs=256时可以落在A的位置 → 池 ≈ 最大那张图的用量
+#     强引用：  块A一直被输出张量持有         → bs=256只能另开块B、bs=128再开C… → 池 ≈ 所有图的用量之和
 _ATOM_WEAKREF_OP = None  # None = not attempted, False = unavailable, else callable
 # 【译】（行尾）None = 尚未尝试，False = 不可用，否则是可调用对象
 

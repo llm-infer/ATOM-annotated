@@ -58,6 +58,7 @@ logger = logging.getLogger("atom")
 #     EPLBConfig                             专家负载均衡（第7批）
 #     DCPConfig + qrep_* / indexer_cp_*      decode上下文并行及其门控函数（第9批）
 #     Config                                 本文件的主角，见类上方的总览
+#   （括号里的"第N批"指ANNOTATION_PLAN.md的阅读批次：表示"细节在那一批的文件里讲"，不是本文件里的位置）
 #     set/get_current_atom_config            进程内"当前Config"的全局变量
 #
 # 一个命令行参数怎样变成Config字段，见arg_utils.py的文件头；Config.__post_init__的步骤见Config类上方
@@ -164,6 +165,7 @@ class KVCacheTensor:
     # 【译】线性注意力层的ReplaySSM记录缓冲区：(k, u, g) 三个pool中属于这一层的切片。
     #   其他注意力类型都是None。放在这里，是因为"层号 -> 线性注意力序号"的映射本来就在
     #   builder的 build_kv_cache_tensor 里。
+    # 解释：ReplaySSM是什么（只记每个token的输入、回滚只挪游标）见envs.py ATOM_ENABLE_REPLAYSSM上方的科普
     replay_buf_k: torch.Tensor = None
     replay_buf_u: torch.Tensor = None
     replay_buf_g: torch.Tensor = None
@@ -181,6 +183,7 @@ class KVCacheTensor:
     #   从那里读取），但按请求槽位寻址，所以任何按block寻址的搬运器都不能碰它们。dense codec会跳过它们；
     #   状态层通过 state_entry_views 访问同样的字节。
     # 解释：分页KV按block id寻址（block_table），递归状态按请求槽位寻址，两者的搬运方式完全不同（第4、9批）
+    #   什么是"每请求状态"、它为什么不能像KV block那样直接复用：见arg_utils.py EngineArgs.state_checkpoint_interval_tokens上方的【科普】
     per_request_state: bool = False
 
 
@@ -215,12 +218,13 @@ class KVCacheConfig:
 #     FULL模式则是连注意力一起录成一张整图（需要注意力kernel本身支持被录制）。
 #   ATOM里的实现：录图在 ModelRunner.capture_cudagraph，编译后端在 utils/backends.py（第5批）。
 #
-# CUDAGraphMode：CUDA Graph的录制方式（--cudagraph-mode，含义见arg_utils.py的EngineArgs.cudagraph_mode）
-# 背景：CUDA Graph把一次forward里的几百个kernel launch录制下来，之后一次性回放，
-#   省掉decode阶段占比很高的CPU launch开销；代价是输入形状和地址必须固定（所以按batch size分桶录制）
+# CUDAGraphMode：CUDA Graph的录制方式（--cudagraph-mode；各模式在原生ATOM里的实际行为以下面的适用场景表为准）
+# 背景见上面【科普】②（为什么能省CPU launch开销、为什么要按batch size分桶录制）
 # 取值分两类：
 #   单一模式：NONE / PIECEWISE / FULL，value是一个整数
 #   组合模式：value是(decode用的模式, 混合batch用的模式)二元组，例如FULL_DECODE_ONLY=(FULL, NONE)
+#     "混合batch"（prefill和decode在同一个batch里）是vLLM的概念；ATOM原生调度器一步只做prefill或只做decode
+#     （scheduler.py的_schedule：先试prefill，没有才做decode），所以原生下只区分"decode batch"和"prefill batch"
 #     注意：在Enum类体内部，FULL、NONE此时还只是普通整数2和0，所以FULL_DECODE_ONLY.value == (2, 0)
 # 各成员调用下面方法的结果（已用Python验证）：
 #   成员                value    decode_mode  mixed_mode  requires_piecewise_compilation  has_full_cudagraphs
@@ -244,7 +248,7 @@ class KVCacheConfig:
 #   NONE                与FULL相同：走手动整图捕获                几乎不用；想真正关图请用--enforce-eager    —（原生ModelRunner不认NONE；只有
 #                       （ModelRunner不单独判断NONE）                                                     backends.py的copy_inputs分支看它）
 #   FULL                decode按capture_sizes录整张forward图      默认；多数模型的标准选择；                 好处：CPU launch开销最低，一次回放
-#                       prefill/混合batch不走图（仍跑编译后代码） DeepSeek-V4.1必须用它（Engram stream       代价：attention kernel必须可录制；
+#                       prefill batch不走图（仍跑编译后代码）     DeepSeek-V4.1必须用它（Engram stream       代价：attention kernel必须可录制；
 #                                                                 fork/join要求整图），recipe里多数是FULL     超过最大capture size的batch退回eager
 #   PIECEWISE           按level 3切出的稠密片段各录各的图，        attention元数据形状多变、不宜整图录的场景， 好处：attention可以是任意eager实现
 #                       attention在片段之间eager运行；            如DSpark的ragged verify（recipes/DSpark.md  代价：每层attention仍有launch开销；
@@ -277,7 +281,8 @@ class CUDAGraphMode(enum.Enum):
     # 解释："运行时模式"指forward_context.cudagraph_runtime_mode：ModelRunner捕获/回放时把它设成PIECEWISE或NONE，
     #   module_dispatch_ops.py等据此判断当前是否处在分段graph里（第5批）
 
-    # 不录制CUDA Graph
+    # vLLM语义是"不录制CUDA Graph"；但原生ModelRunner不认NONE，仍走手动FULL整图捕获（见上面适用场景表），
+    #   原生下真正不录图要用--enforce-eager
     NONE = 0
     # 分段录制：编译切出的各段（attention之间的稠密部分）各自录制成graph，attention本身在段之间eager运行
     #   需要--level 3的分段编译（详见下面CompilationConfig.cudagraph_mode的docstring，第5批）
@@ -524,7 +529,8 @@ class CompilationConfig:
     # 解释：这段docstring大部分来自vLLM，"v1""默认模式"说的是vLLM。ATOM命令行默认传FULL，
     #   只有传入None（插件模式或直接构造Config）时，Config.__post_init__才在level 3下落到PIECEWISE
     # 解释：ATOM原生ModelRunner对FULL_AND_PIECEWISE走的是逐片段捕获路径（_piecewise_cg_active为True），
-    #   decode并不捕获整图，见上面CUDAGraphMode的说明（第5批）
+    #   decode并不捕获整图；上面译文里"NONE：不捕获"在原生下也不成立：NONE同FULL走整图捕获，
+    #   只有--enforce-eager才不录图。见上面CUDAGraphMode的适用场景表（第5批）
 
     # 累计的编译耗时（秒），由编译后端在每次编译后累加，用于日志
     compilation_time: float = field(default=0.0, init=False)
@@ -2870,6 +2876,7 @@ class EPLBConfig:
 # ---------------- 【分支】DCP（decode上下文并行）的子配置与门控函数，见第9批 ----------------
 # DCP：decode时把一个请求的KV按token切分到TP组内的多张卡上，每张卡只存1/dcp的KV，
 #   注意力分别算完再合并（合并输出需要一次集合通信）
+#   MLA（kv_lora_rank、"KV只有1个头"）、DCP的token分布图和LSE合并的数字例子，见arg_utils.py EngineArgs.decode_context_parallel_size上方的【科普】
 
 # DCP合并输出时可选的通信方式：ag_rs = AllGather LSE + ReduceScatter输出；a2a = 一次all-to-all
 DCP_COMM_BACKENDS = ("ag_rs", "a2a")
@@ -2907,6 +2914,7 @@ class DCPConfig:
     # 【译】对MiniMax-M3的lightning索引器做上下文并行，"代替"对KV cache做：每个rank在1/P的block上
     #   为全部索引头打分，然后一次all-to-all把每个头的候选发给拥有该头的rank。稀疏注意力、KV几何和MoE
     #   仍然是TP。要求 decode_context_parallel_size == 1——见 indexer_cp_unsupported_reason。
+    # 解释：lightning索引器就是MiniMax-M3的DSA式稀疏注意力索引器（入门见glm5_kpool_block_size上方【科普】②）
     indexer_dcp_only: bool = False
 
     # 类型统一 + 取值校验；comm_backend必须在DCP_COMM_BACKENDS里
@@ -3250,7 +3258,7 @@ def indexer_cp_unsupported_reason(
 # 注意：这里的@dataclass没有slots=True（nano-vllm加了），所以__post_init__和其他组件还能给实例挂上
 #   未声明的属性，例如multimodal_config、offload_page_hf_geometry，以及EngineCore回填的pool_entries
 #
-# __post_init__的步骤（★是主干，其余是分支，读第1批时可以先跳过）：
+# __post_init__的步骤（★是主干，其余是分支，读第1批时可以先跳过；带报错/降级条件的流程图和一个走查例子在__post_init__开头）：
 #   1. MoE后端字段的规范化与校验（moe_all2all_backend、moe_backend）                          第7批
 #   2. 子配置dict→对象并重新校验（compilation_config、eplb_config、dcp_config）
 #   3. 强制接受率与DSpark置信度调度互斥；RapidServe换runner类                                 第7、5批
@@ -3282,6 +3290,7 @@ class Config:
     attn_prefill_chunk_size: int = 16384
     # 【分支】以下到enable_encoder_swa_bounded_replay为止，是带每请求状态的模型（DeepSeek-V4/V4.1、GDN等）
     #   的状态缓存与有界重放，读取方是BlockManager和调度器，见第4、8批
+    #   概念入门（每请求状态、状态checkpoint、SWA有界重放，带图和数字）见arg_utils.py EngineArgs.state_checkpoint_interval_tokens上方的【科普】
     # Tokens between rungs of the state-checkpoint ladder, shared by every
     # Pool.STATE class. Must be a multiple of the prefix-cache hash block size
     # (snapped, with a warning, in BlockManager).
@@ -3325,6 +3334,7 @@ class Config:
     # Set by the model: V4.1's Engram n-gram lookback.
     # 【译】一次重放forward之前、后端要读取的token（Replay.history_ids）。由模型设置：V4.1的Engram n-gram回看。
     # 解释：__post_init__末尾对V4.1设为engram_max_ngram_size - 1；调度器据此在Replay里带上历史token
+    #   Engram是什么（按最近几个token的n-gram查一张大表）见envs.py ATOM_ENGRAM_*上方的科普
     replay_history_tokens: int = 0
     # How far below a prefix hit with no state checkpoint behind it a prefill
     # starts to rebuild that state exactly (`BlockManager.replay_start`), 0 =
@@ -3451,7 +3461,8 @@ class Config:
     # 【译】求解出的chunk大小的下限。每多一个chunk就要再付一次重建已缓存前缀的代价，
     #   所以这个下限就是限制这种放大的手段。
     dynamic_chunking_min_chunk_size: int = 4096
-    # TP进程组的集合端口：ModelRunner设置MASTER_PORT=port（不是HTTP端口）
+    # 引擎内部端口：ModelRunner把它写进环境变量MASTER_PORT（不是HTTP端口）；torch.distributed主进程组的集合点
+    #   其实是parallel_config.data_parallel_master_ip / data_parallel_base_port，见arg_utils.py EngineArgs.port的说明
     port: int = 8006
     # torch profiler的trace输出目录；__post_init__在非插件模式下会自动创建它
     # 注意：default_factory在构造时读环境变量ATOM_TORCH_PROFILER_DIR，但只在调用方没传这个参数时生效；
@@ -3485,7 +3496,7 @@ class Config:
     #   parallel_config.data_parallel_size 仍是真实的rank数，因为它决定进程组和token集合通信的大小。
     # 读取方：只有 moe.py（专家切分宽度）；写入方：CoreManager（engine_core_mgr.py）
     dp_logical_size: int = 0
-    # TP进程组的集合地址：ModelRunner设置MASTER_ADDR=master_addr
+    # ModelRunner把它写进环境变量MASTER_ADDR；与上面的port同理，它不是torch.distributed主进程组的集合地址
     master_addr: str = "127.0.0.1"
     # 【分支】DP attention：注意力按DP切分、MoE在DP rank间协同，见第7、9批
     # 用途：MLA这类KV头很少的模型，注意力做TP会让每张卡重复存同一份KV；改成每张卡独立处理不同请求（DP），
@@ -4040,7 +4051,8 @@ class Config:
         # assert self.max_num_batched_tokens >= self.max_model_len
         # 每步单请求的prefill上限必须在[一个block, max_model_len]之间
         # 谁读：Scheduler 在chunked prefill时，把单条长prompt每步的chunk截到这个长度，
-        #   防止一条超长prompt独占整步token预算、饿死同一步里的其他请求和decode
+        #   防止一条超长prompt独占整步token预算、挤掉同一步里的其他prefill请求
+        #   （decode不在同一步里：ATOM一步只做prefill或只做decode，见arg_utils.py文件上方总览表的注①）
         if self.long_prefill_token_threshold > 0:
             if self.long_prefill_token_threshold > self.max_model_len:
                 raise ValueError(
@@ -4250,7 +4262,23 @@ class Config:
         #   第567行），它保留着原始的 "DeepseekV4ForCausalLM[NextN]" 名字。
         # 解释：注释里的"第567行"是旧行号，指get_hf_config中_CONFIG_REGISTRY分支末尾"把丢掉的字段补回来"的循环；
         #   实际上architectures本来就是deepseek_v3 schema里的字段，不需要补回也会保留原名
-        # 解释：m、m'是V4两种压缩注意力的压缩率（4和128），CSA是其中压缩率为4的那种，第8批详解
+        # 【科普】DeepSeek-V4的压缩注意力（CSA / HCA）与m、m'——从MHA/GQA出发
+        #   V4的KV只有1个共享头（MQA：GQA的极端，所有q头读同一份KV，head_dim 512），每层按hf_config.compress_ratios取一种：
+        #     ratio 0  ：只有滑动窗口（每个token只看最近window_size=128个原始token）
+        #     ratio 4  ：CSA（Compressed Sparse Attention）：每4个相邻token的KV用可学习的门控池化压成1行（相邻组有重叠），
+        #                再用索引器（DSA式，见glm5_kpool_block_size上方【科普】②）在压缩行里挑top-k
+        #                （recipes/DeepSeek-V4.md：1024）做注意力，外加滑动窗口
+        #     ratio 128：HCA：每128个token压成1行，不用索引器、看全部压缩行，外加滑动窗口
+        #   m = 4、m' = 128 就是这两种压缩率（models/deepseek_v4.py的DeepseekV4Attention）：
+        #
+        #       原始token:  0 1 2 3 | 4 5 6 7 | ...... | 252 253 254 255    （一个KV block = 256个原始token）
+        #       CSA行:        c0        c1     ......        c63            -> 每block 256/4   = 64行
+        #       HCA行:      h0（token 0~127）            h1（token 128~255）  -> 每block 256/128 = 2行
+        #
+        #   例：上下文 2^20 = 1048576 个token：CSA层有 262144 个压缩行、只读其中1024行；HCA层只有 8192 行
+        #   block_size必须让两种压缩都落在整行上（lcm(4,128)=128的倍数）；取256是为了CSA每block正好64行（FP4索引kernel要求）
+        #   V4.1的CSA2是同一思路的变体：每层压缩率只取0/1/2，后面的层可复用前面"KV源层"的压缩KV和top-k
+        #     （deepseek_v41/config.py的build_attention_topology）；第8批详解
         arches = getattr(self.hf_config, "architectures", None) or []
         is_deepseek_v4 = any(
             str(a).startswith(("DeepseekV4For", "DeepseekV4MTP", "DeepseekV4DSpark"))
@@ -4389,6 +4417,7 @@ class Config:
         #   原生单节点的V4默认使用FP4索引器，gfx942除外。插件的代理pool和KV传输的区域映射还不能描述单独的
         #   FP4 scale pool，所以这些集成在其布局支持之前保留FP8。其他所有模型沿用历史默认值：跟随KV cache的dtype。
         # index_cache_dtype 是DSA/CSA稀疏注意力的"索引器key缓存"（与主KV cache分开的一块pool）的格式。
+        #   DSA/索引器入门见glm5_kpool_block_size上方【科普】②，CSA见上面第12步V4部分的【科普】
         # 谁读：各注意力backend（aiter_mla.py、deepseek_v41/backend.py、v4_kernels 等）按它分配索引pool并选打分kernel；
         #   pool_layout/v4_pool_fields.py 按它算每个block的字节布局；KV offload（offload/config.py、keys.py、
         #   kv_byte_codec.py）按它编解码、并编进存储key；compute_hash 也包含它

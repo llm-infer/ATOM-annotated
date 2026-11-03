@@ -19,14 +19,23 @@
 #   {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}  ┐
 #   {"choices": [], "usage": {...}}                                    ├ 最后三帧合并成一次发送
 #   [DONE]                                                             ┘
-# 原理：工具调用（function calling）在模型看来只是"按约定格式写一段文本"
-#   1. 请求带tools（JSON Schema描述的函数）→ chat template把它们渲染进prompt（通常在system段），告诉模型有哪些工具、怎么调用
-#   2. 模型决定调用时，输出模板约定格式的文本，例如Hermes / Qwen风格：
-#        <tool_call>{"name": "get_weather", "arguments": {"city": "北京"}}</tool_call>
-#      格式由模型训练时的模板决定，服务端必须用对应的解析器（启动时从模板推断，见tool_parser/registry.py）
-#   解释：上面这行JSON写法是Hermes格式，ATOM并没有注册Hermes解析器——tool_parser/下只有qwen3（XML：<function=NAME>
-#     <parameter=P>…）、kimi、kimi_k3、glm、deepseekv4 / deepseekv41（DSML）、minimax这几种；模板是Hermes JSON格式时，
-#     --tool-call-parser auto识别不出格式，工具调用会作为普通文本交付（见下面"例"里的真实XML格式）
+# 【科普】工具调用（function calling）—— 在模型看来只是"按约定格式写一段文本"
+#   模型仍然只是逐个预测下一个token；"调用工具"是它在训练中学会的一种输出格式，服务端在两头做翻译：
+#
+#     请求的tools（JSON Schema）──chat template──> prompt里的一段工具说明（通常在system段，见chat_encoders.py文件头【科普】③）
+#                                                        │ 模型续写
+#                                                        ▼
+#     输出文本：<tool_call>\n<function=get_weather>\n<parameter=city>北京</parameter>\n</function>\n</tool_call>
+#                                                        │ 工具调用解析器（tool_parser/，按这个模型的格式）
+#                                                        ▼
+#     响应：tool_calls=[{"function": {"name": "get_weather", "arguments": "{\"city\": \"北京\"}"}}]，finish_reason="tool_calls"
+#
+#   1. 请求带tools（JSON Schema描述的函数）→ chat template把它们渲染进prompt，告诉模型有哪些工具、怎么调用
+#   2. 模型决定调用时，输出模板约定格式的文本（上图是Qwen3-Coder的XML格式）。格式由模型训练时的模板决定，服务端必须用
+#      对应的解析器：启动时从渲染出的模板推断（tool_parser/registry.py），或用--tool-call-parser显式指定。
+#      ATOM注册的格式只有这几种（括号里是--tool-call-parser用的名字）：qwen（上图的XML）、kimi、kimi_k3、glm、
+#      dsml / dsml_v41（DeepSeek-V4 / V4.1）、minimax。没有Hermes（<tool_call>{"name": …, "arguments": {…}}</tool_call>
+#      这种JSON写法）的解析器：这类模型启动时识别不出格式，工具调用会作为普通文本交付
 #   3. 服务端把这段文本解析成结构化的tool_calls，不再作为content返回，finish_reason为tool_calls
 #   4. 客户端执行工具，把结果作为role="tool"的消息（带tool_call_id）发回，下一轮由模板再渲染进prompt
 #   服务端从不执行工具，它只负责"文本 ↔ 结构"的双向翻译（回传的历史调用见protocol._normalize_tool_call_arguments）
@@ -37,7 +46,8 @@
 #   {"delta": {}, "finish_reason": "tool_calls"}
 # 对比nano-vllm：nano-vllm没有这一层
 #
-# ---- 一个chat请求从messages到帧的完整流程（api_server.chat_completions负责前半，本文件负责后半）----
+# ---- 一个chat请求从messages到帧的完整流程（api_server.chat_completions负责前半，本文件负责后半；
+#      前半的逐步细节见api_server.py文件头图1的①~⑨）----
 #   messages + tools + tool_choice + response_format + thinking / reasoning_effort
 #     │ normalize_chat_tools（Anthropic形状的工具 → OpenAI形状）→ validate_chat_request（形状不对 → 400）
 #     │ resolve_thinking → (enabled, effort)，与--default-chat-template-kwargs、chat_template_kwargs合并
@@ -81,6 +91,24 @@
 #   → ChatMessage.to_template_dict把arguments反序列化回dict（protocol._normalize_tool_call_arguments），模板才能渲染
 #   → 模型这次输出普通文本"北京今天晴，18℃。"，finish_reason="stop"
 #   要点：服务端全程不执行工具；被max_tokens截断在工具区域中间时报"length"而不是"tool_calls"（protocol.openai_stop_reason_with_calls）
+#
+# ---- 【科普】前缀缓存与usage里的cached_tokens —— 从"注意力是因果的"讲起 ----
+#   ① MHA / GQA的因果注意力里，第i个token在每一层的K、V只取决于第0~i个token。所以两个请求只要开头的token完全相同，
+#     这段开头在每一层算出的K/V也完全相同：前一个请求算过的KV还留在显存里，后一个请求直接拿来用，这部分不必再prefill
+#   ② ATOM把KV cache按block管理（--block-size默认16个token一块，有的模型在config.py里改写它）。每个装满的block按
+#     "前一个block的hash + 本block的token id"算hash，一环扣一环；只要中间有一个token不同，之后所有block的hash都对不上
+#   ③ 新请求进来时，从第一个block开始逐块查hash，连续命中的block直接挂进它的block表，第一次不命中就停；
+#     prompt的最后一个block永远重算（prefill至少要前向一个block，才能得到采样第一个token用的logits）（第4批block_manager.py）
+#   例（block=16）：请求A、B用同一段system prompt，渲染后位置0~99的token完全相同，从位置100起不同；A的block还没被淘汰
+#       token位置：  0───15 16──31 32──47 48──63 64──79 80──95 96────111 …
+#       block：      blk0   blk1   blk2   blk3   blk4   blk5   blk6
+#       B查A留下的： 命中   命中   命中   命中   命中   命中   不命中（96~99相同、100起不同）→ 停
+#     → B的usage：prompt_tokens仍是完整prompt的长度，prompt_tokens_details.cached_tokens = 6 × 16 = 96，
+#       只有96之后的token真正做了prefill，TTFT相应变短
+#   多轮对话同理：第2轮的prompt通常以第1轮的prompt开头，这一段整块命中；但模板渲染历史时若改了文字
+#     （如Qwen3.5的生成提示以"<think>\n"结尾，而历史回合里不再写它），命中只到第一处不同之前（见tests/test_state_checkpoint.py）
+#   cached_tokens因此总是block大小的整数倍。chat（流式和非流式）、/v1/responses报告它，/v1/messages叫cache_read_input_tokens，
+#     /v1/completions的usage里没有这个字段
 #
 # ---- 适用场景：stream与非stream ----
 #   stream=true：聊天界面、Agent逐步显示；用户感知的是TTFT而不是总时延。代价：每帧一次JSON编码 + 一次socket写，
@@ -528,10 +556,8 @@ async def stream_chat_response(
         finish_reason = openai_stop_reason_with_calls(
             engine_finish_reason, has_tool_calls
         )
-        # usage总是作为倒数第二帧发出（choices为空列表），不看OpenAI的stream_options.include_usage（服务端没有读取它的代码，atom/里只有benchmarks客户端会发送它）；
-        #   只读choices[0]而不判空的客户端在这一帧上会出错。cached_tokens：prompt中命中前缀缓存、跳过了prefill计算的token数，
-        #   例：多轮对话第二轮，前一轮的1500个token仍在缓存里，新prompt共1600个token → prompt_tokens=1600，cached_tokens≈1500
-        #   （前缀缓存按整块命中，所以通常是block大小的整数倍）
+        # usage总是作为倒数第二帧发出（choices为空列表；不看stream_options.include_usage，见文件头"适用场景"的include_usage）。
+        #   cached_tokens：prompt中命中前缀缓存、跳过了prefill计算的token数（科普与例子见文件头的【科普】前缀缓存）
         usage = {
             "prompt_tokens": num_tokens_input,
             "completion_tokens": num_tokens_output,

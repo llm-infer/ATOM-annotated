@@ -25,6 +25,18 @@ from atom.sampling_params import SamplingParams
 #   Replay：DeepSeek-V4等模型的"有界重放"记录，见第4、8批
 #   SequenceStatus / SequenceType：序列的生命周期状态、本step做prefill还是decode
 #   OffloadJointRecord：KV offload联合加载的协议状态，见第9批
+#
+# 术语导航（只熟悉MHA/GQA时先看这里；每个概念只在一处详细讲，其余地方都指回下面这些位置）：
+#   分页KV / block table .......... BlockTable类上方"科普：KV cache分块"
+#   状态checkpoint、有界重放 ........ Replay类上方"科普：状态checkpoint与有界重放"
+#   抢占、PD分离、KV offload ........ SequenceStatus类上方及类内的科普
+#   前缀缓存 / block hash ........... Sequence类上方"科普：前缀缓存"
+#   延迟输出（deferred output） ...... Sequence类上方"延迟输出"一段
+#   投机解码（MTP / DSpark） ......... Sequence.__init__里num_draft_tokens处
+#   线性注意力（GDN）的每请求状态 ..... Sequence.__init__里has_per_req_cache处（数学推导见model_config/qwen3_next.py科普②）
+#   多模态输入、M-RoPE .............. Sequence.__init__里multimodal_data、mrope_positions处（图解见model_config/qwen3_5.py科普①②）
+#   chunked prefill ............... Sequence.__init__里is_partial_prefill处
+# 文中"第N批"指仓库根目录ANNOTATION_PLAN.md里的阅读批次
 
 
 # 创建存放token id的数组：array("i")，即C语言int32的紧凑数组
@@ -81,9 +93,10 @@ _block_table_versions = count()
 # 对比nano-vllm：nano-vllm用list，每步把整张表重新发给其他rank；ATOM做了两点优化
 #   1. 继承array("i")：拼进int32缓冲区时是一次内存拷贝，不用逐个拆箱
 #   2. 带一个version字段，配合block_table_codec只把"新追加的block"发给worker进程，而不是整张表
-# version示例：
-#   第1步：bt=[5,9]，version=7         -> 发送完整表[5,9]，接收方记下(version=7, 长度2)
-#   第2步：bt.append(12)，version仍为7  -> 接收方发现版本相同，只需发送[12]
+# version示例（记账的是发送方：调度器侧的BlockTableDeltaEncoder记着每条请求上次发出的(version, 长度)，
+#   见block_table_codec.py；worker侧的BlockTableDeltaDecoder按"保留前base个 + 追加新id"还原）：
+#   第1步：bt=[5,9]，version=7         -> 第一次发，发完整表[5,9]，编码器记下(7, 2)
+#   第2步：bt.append(12)，version仍为7  -> 编码器发现版本相同、长度没变短，只需发送新增的[12]
 #   第3步：被抢占，del bt[:]，version=8 -> 版本变了，下次重新发送完整表
 class BlockTable(array.array):
     """A sequence's physical block ids, tagged with a mutation `version`.
@@ -137,7 +150,7 @@ class BlockTable(array.array):
     # __slots__：只允许实例拥有version这一个额外属性，不创建__dict__，节省内存
     __slots__ = ("version",)
 
-    # array是C实现的不可变类型构造方式：元素类型"i"必须在__new__里传给父类
+    # array是C实现的类型，元素类型码在__new__（而不是__init__）里就定下来，所以子类必须在__new__里把"i"传给父类
     def __new__(cls, block_ids=()):
         return super().__new__(cls, "i", block_ids)
 
@@ -220,9 +233,34 @@ def new_block_table(block_ids=()) -> BlockTable:
 
 
 # 【分支】有界重放（bounded replay），主要用于DeepSeek-V4等带滑动窗口/压缩状态的模型，见第4、8批
-# 背景：前缀缓存命中后，KV可以直接复用，但有些模型还有"状态"（如滑动窗口、压缩器状态），
-#   命中点上如果没有保存状态checkpoint，就要从命中点往前退一段重新算（重放），把状态重建出来
-#   一条Replay记录描述这样一次prefill，四个字段的含义见下方docstring的翻译
+#
+# 科普：状态checkpoint与有界重放（从MHA出发，四步）
+#   ① MHA/GQA：前缀缓存命中N个token，就直接复用这N个token的KV，从位置N接着算。KV按token存，任何位置都能接上：
+#        位置：  0 ..................... N-1 │ N ........ 末尾
+#        KV：   [命中，直接复用（只读）     ] │ [本次prefill计算]
+#   ② 有些层除了（或代替）按token分页的KV，还有一份随token"原地更新"的每请求状态：
+#        - GDN线性注意力：每层一个固定大小的矩阵S（见下方Sequence.__init__里has_per_req_cache处的科普）
+#        - DeepSeek-V4：每层的滑动窗口（只看最近W个token的KV，默认W=128，环形缓冲区）+ 压缩器还没凑满一组的token
+#          （压缩器把每compress_ratio个连续token的KV合并成1行，见atom/models/deepseek_v4.py的Compressor）
+#      状态被原地覆盖：算到位置N时"位置N处的状态"只存在一瞬间。想让以后的请求从N接上，就得当时另存一份快照，
+#      这就是状态checkpoint。快照很占地方，所以只在少数位置存（BlockManager.checkpointers_at）：
+#        - 阶梯：每 Config.state_checkpoint_interval_tokens（默认8192）个token一级
+#        - prompt末尾的锚点（Sequence.checkpoint_end_pos）和"按需"补放的一级（checkpoint_demand_pos）
+#   ③ 于是命中会被"状态门控"截短：KV命中到N，状态却只能从N之下最近的checkpoint接上（BlockManager._gated_hit）
+#        例：上一轮prompt 20000个token，checkpoint在8192、16384（末尾锚点在20000附近）；新请求与它共享前19000个token
+#            -> KV最多命中约19000（按block向下取整），但状态只有16384处的快照 -> num_cached_tokens=16384，从16384重算
+#   ④ 有界重放（只用于DeepSeek-V4，且要设ATOM_DSV4_STATE_REPLAY）：V4的状态是"局部"的——第l层位置H的窗口
+#      只依赖第l-1层最近W个位置，所以不必找checkpoint：从H往前退 Config.state_replay_tokens 个token重算一遍，
+#      所有层的状态就被精确重建；退回的那段KV本来就在cache里，只读不写
+#        state_replay_tokens = W + (L-1)·(W-1)，L=层数（MTP/DSpark草稿层也算），见model_ops/attentions/deepseek_v4_replay.py
+#        例（假设W=128、L=4 -> 128 + 3×127 = 509）：KV命中H=12800，最近的checkpoint在8192
+#            不重放：从8192接上，要重算4608个token；重放：从12800-509=12291开始，只多算509个token
+#            位置：  0 .......... 12290 │ 12291 ...... 12799 │ 12800 ...... 末尾
+#                  [KV复用，不碰      ] │[重放：只为重建状态] │[正常prefill]
+#        只有KV命中比最近的checkpoint远出state_replay_tokens以上、重放更省时才这么做（BlockManager._replay_hit）
+#   一条Replay记录描述这样一次prefill（until=H，start=重放第一个forward的起点），四个字段的含义见下方docstring的翻译
+#   字段里的"V4.1的Engram n-gram历史"：Engram是DeepSeek-V4.1按前n-1个token查主机侧大表的n-gram模块，
+#     所以重放forward还要带上起点之前 Config.replay_history_tokens（= engram_max_ngram_size - 1）个token，见recipes/Engram.md
 # NamedTuple：带字段名的不可变元组，既能r.until访问，也能像元组一样解包
 class Replay(NamedTuple):
     """A prefill forward starting below the point its seq resumed at: that
@@ -287,8 +325,8 @@ class Replay(NamedTuple):
 #   ⑥   RUNNING -> WAITING_FOR_       仅KV offload：running里的半途prefill要等一段外部加载时被挂起
 #         REMOTE_KVS                  （Scheduler._park_ready_offload_partial_prefills，同时清掉is_partial_prefill）
 #   ⑦   WAITING/RUNNING -> ABORTED    客户端断开：EngineCore收到abort -> Scheduler.abort_request
-#   ⑧   WAITING_FOR_REMOTE_KVS ->     PD decode端接收KV失败（_abort_failed_remote_receive）：decode节点不会自己补做prefill
-#         ABORTED
+#   ⑧   WAITING_FOR_REMOTE_KVS ->     PD decode端接收KV失败（_abort_failed_remote_receive）：decode节点不会自己补做prefill；
+#         ABORTED                     客户端断开也会走到这里：挂起的序列仍在waiting队列里，abort_request照样能找到它
 #   ⑨   WAITING -> FINISHED           准入时判定无法调度（如prompt超过max_model_len），leave_reason="unschedulable: ..."；
 #                                     从没运行过，CoreManager._deliver_terminal_output给客户端补发一个finished的RequestOutput
 #   ⑩   ABORTED -> FINISHED           在waiting里的：立即由_reject_aborted_waiting结束（abort_request内或下次调度开头）；
@@ -298,19 +336,24 @@ class Replay(NamedTuple):
 # 对比nano-vllm：nano-vllm要等prefill全部算完才变成RUNNING；
 #   ATOM在第一次被调度做prefill时就变成RUNNING并进入running队列，
 #   chunked prefill没算完的序列留在running里（is_partial_prefill=True），下一步由调度器的Phase 1继续
-# 客户端断开：WAITING/RUNNING -> ABORTED，调度器在下一步按正常结束路径释放资源 -> FINISHED（见上表⑦⑩）
 #
 # 科普：抢占（preemption）
 #   KV block不够用时（例如很多序列同时decode、每条都要再领一个新block），调度器会把某条RUNNING序列
 #   "踢回"等待队列：Scheduler.preempt把状态改回WAITING，删掉末尾的占位token，
 #   BlockManager.deallocate释放它的全部block（block_table清空、num_cached_tokens归0），再放到waiting队首。
 #   ATOM采用"重算"而不是"换出到CPU"：重新调度时把prompt+已生成的token整体当作prompt再prefill一遍
-#   （释放前已登记hash的block若还没被别的请求复用，重新准入时可能命中前缀缓存，少算很多）
+#   （已登记hash的block释放后仍留在前缀缓存索引里，直到被当作新block分配出去时才被驱逐；
+#    重新准入时只要还没被驱逐就能命中，少算很多。别的请求命中、共享它并不会把它挤掉）
 class SequenceStatus(Enum):
     # 科普：PD分离（prefill/decode disaggregation）
     #   prefill是一次算很多token（算力瓶颈），decode是每步算1个token（显存带宽瓶颈），混在同一组GPU上会互相拖累。
-    #   PD分离把两者放到不同节点：prefill节点算完prompt的KV，通过RDMA等方式（atom/kv_transfer/disaggregation/，
-    #   如mooncake、moriio connector）传给decode节点，decode节点直接从第一个生成token开始解码。
+    #   PD分离把两者放到不同节点：prefill节点算完prompt的KV，通过RDMA等方式（网卡直接读写对端内存、不经CPU中转；
+    #   atom/kv_transfer/disaggregation/，如mooncake、moriio connector）传给decode节点，decode节点直接从第一个生成token开始解码。
+    # 科普：KV offload（和PD分离不同：还是同一组GPU，只是给前缀缓存加一层更大、更慢的存储）
+    #     HBM前缀缓存（快、小） ──算好的KV另存一份──> CPU内存(L2) / NVMe(L3)（LMCache、Mooncake Store，慢、大）
+    #     新请求准入：HBM里已被驱逐、但这一层还有 ──加载回显存──> 免去重算；加载期间请求停在WAITING_FOR_REMOTE_KVS
+    #   入口与例子见arg_utils.py开头的【科普】KV offload，实现在atom/kv_transfer/offload/（README.md）；
+    #   带状态的模型还要同时取回状态checkpoint，见OffloadJointRecord
     # 【分支】PD分离的decode端：等待prefill节点把KV传过来（KV offload从外部加载时也会停在这里），见第9批
     WAITING_FOR_REMOTE_KVS = auto()
     # 在等待队列中，还没开始prefill（新请求、或被抢占后重新排队）
@@ -324,6 +367,8 @@ class SequenceStatus(Enum):
     # 【译】客户端断开：序列仍然存活（它的KV必须走正常的停止路径释放）。调度器会在下一步结束它
     #   （若在running中），或在它从waiting中取出时丢弃。与FINISHED区分开，是为了让它仍经过一次
     #   清理流程；在那之前 is_finished() 一直是False。
+    # 核对代码：Scheduler.abort_request对waiting里的序列当场就调用_reject_aborted_waiting结束它，
+    #   不用等它被取出（见上方状态表⑩）
     ABORTED = auto()
     # 已结束，KV block已释放
     FINISHED = auto()
@@ -372,6 +417,12 @@ def resumes_offload_prefill(seq) -> bool:
 # 背景：混合模型的前缀复用需要两条腿同时到位：KV（从LMCache等外部存储加载）+ 状态（从状态层加载），
 #   两者必须对齐到同一个边界位置，这个类记录这次联合加载的边界和各段范围
 # 第1批只需知道它属于offload分支，字段细节读第9批时再细看
+# 图示：一次联合加载里几个token位置的先后关系（由BlockManager._joint_kv_boundary算出，从左到右递增）
+#   0 ──────── HBM命中 ──────── claim_tokens ──────── boundary_tokens ──── kv_tokens ──── kv_prefix_tokens
+#   │ KV在HBM，状态也能接上 │ KV还在HBM，状态接不上 │ KV要从LMCache取 │ 多取到chunk尾 │ LMCache还有，用不上
+#   ·"HBM命中"即准入后的num_cached_tokens；两条腿都报告完成前它一直停在这里，之后才抬到boundary_tokens
+#   · 状态腿取回的是boundary_tokens处的checkpoint（boundary_hash）
+#   · kv_only_tokens 是另一回事：只给DeepSeek-V4有界重放用（见Replay类上方科普④）
 @dataclass
 class OffloadJointRecord:
     """The KV-transfer offload/joint-load protocol state for one sequence.
@@ -462,6 +513,17 @@ class OffloadJointRecord:
 # 一条请求在引擎内部的表示：保存token、计数、KV block映射、采样参数和各特性的状态
 # 由InputOutputProcessor.preprocess创建（第2批），之后由调度器（第3批）和BlockManager（第4批）读写
 #
+# 本类导读（__init__里字段的出现顺序；第1批只需读打★的主干）：
+#   ★ 身份与token：block_size、id、status、type、token_ids、num_tokens、num_prompt_tokens
+#     穿插的特性字段：投机解码（num_draft_tokens）、每请求状态（has_per_req_cache）、多模态（multimodal_data、mrope_*）
+#   ★ 计数：num_cached_tokens（prefill进度）、num_hashed_tokens（已登记前缀缓存）
+#     从replay到prefix_cache_hit_tokens：前缀缓存与状态checkpoint的细节（第4批）
+#   ★ is_partial_prefill、block_table；之后是state_slots、offload_joint（第4、9批）
+#   ★ 采样参数与停止条件、logprobs、流式回调、output_tokens、num_placeholder_tokens
+#     之后：投机token、统计时间戳、PD参数、n>1扇出、DP路由
+#   方法：num_tokens的setter（顺带算num_blocks）、state_slot、block(i)、append_token、__getstate__（跨进程pickle）
+# 下面的两个例子和一张总表只跟踪★计数字段
+#
 # 主干计数字段的变化示例（block_size=16，prompt长40，前缀缓存命中1个block，每步token预算16）：
 #   创建：              num_tokens=40，num_prompt_tokens=40，num_cached_tokens=0，block_table=[]
 #   第1次调度：          命中1个block -> num_cached_tokens=16；分配block_table=[7,3,9]（16+16+8=40个token）
@@ -475,20 +537,7 @@ class OffloadJointRecord:
 #   GPU算完第N步之前，CPU就要调度第N+1步，此时第N步采样出的token还不知道，
 #   postprocess先往token_ids末尾追加占位token（值为eos_token_id），等下一步拿到真实token后原地覆盖
 #   num_placeholder_tokens记录末尾有几个这样的占位，抢占时要先把它们删掉
-#
-# 第二个小例子（block_size=4，prompt 10个token，不考虑延迟输出的占位）：
-#   创建：num_tokens=10 -> num_blocks=3，last_block_num_tokens=2
-#   准入：BlockManager查前缀缓存。只有"填满的block"才有hash（token 0~3、4~7两块；token 8~9不满不算），
-#         假设两块都没命中 -> num_cached_tokens=0，block_table=[5,9,2]
-#   prefill（预算够，一次算完位置0~9）-> postprocess：hash_blocks登记两个满block的hash，num_cached_tokens=10，
-#         追加第1个生成token -> num_tokens=11（它的KV还没算，下一步才写进block 2的第3格）
-#   decode步1：算位置10的KV，采样出新token -> num_tokens=12
-#   decode步2：算位置11的KV，block 2写满 -> hash_decode_blocks可把它登记进前缀缓存（num_hashed_tokens跟着增长），
-#         这样下一轮对话"上轮prompt+上轮回答"也能命中；num_tokens=13
-#   decode步3：要写位置12的KV，block 2已满 -> 调度时BlockManager.may_append追加一个新block -> block_table=[5,9,2,7]
-#   若此时被抢占：block全部释放、block_table=[]、num_cached_tokens=0，token_ids里的真实token保留
-#         （num_prompt_tokens仍是10），重新准入时把已有token整体再prefill一次，能命中前缀缓存的部分可跳过
-#   同一prompt的第二个请求到来：前两块的hash命中 -> num_cached_tokens=8，只需算位置8~9
+#   默认是开的：只有流水线并行、或带递归状态的模型做PD分离的prefill端时才关闭（model_runner.py的tokenIDProcessor.is_deferred_out）
 #
 # 科普：前缀缓存（prefix caching）与block hash
 #   很多请求共享开头（system prompt、多轮对话的历史），它们的KV完全相同，可以直接复用而不是重算。
@@ -497,9 +546,11 @@ class OffloadJointRecord:
 #   BlockManager维护hash -> 物理block的索引，新请求准入时从头逐块查，命中多少块就跳过多少块的计算
 #   （实现：block_manager.py的compute_hash / hash_blocks / can_allocate，hash函数在prefix_hash.py）
 #
-# 字段演化总表：把上面几个例子合成一条请求的完整时间线（已按Scheduler.postprocess、BlockManager.hash_blocks /
+# 字段演化总表：block_size=4的小例子，一条请求的完整时间线（已按Scheduler.postprocess、BlockManager.hash_blocks /
 #   hash_decode_blocks / may_append / deallocate的代码逐行推算）
-#   设定：block_size=4，prompt 10个token（位置0~9），前缀缓存未命中，每步prefill最多6个token，不开延迟输出
+#   设定：block_size=4，prompt 10个token（位置0~9），前缀缓存未命中，每步prefill最多6个token，
+#     不开延迟输出（实际默认是开的，见上一段；这里关掉只为让数字好读）
+#   创建时 num_tokens=10 -> num_blocks=3、last_block_num_tokens=2
 #   "真实token数" = num_tokens - num_placeholder_tokens（开MTP或延迟输出时token_ids末尾还挂着占位，这里不计）
 #
 #   步骤                    │ status   │partial│真实token数│cached│hashed│ block_table │本步新增token│ 说明
@@ -522,7 +573,11 @@ class OffloadJointRecord:
 #     第5b步位置15的KV是被拒绝草稿c的，所以block 3不登记
 #   - 5b与5a是同一时刻的两种走法；*开MTP时token_ids还带k个占位，may_append按含占位的长度和draft_lookahead
 #     提前补块，补块的时机会比5a早
-#   - 6'之后重新准入：把10+已生成的token整体当prompt重算，前面登记过hash的block若还没被复用就能命中
+#   - 只有填满的block才登记hash：位置8~9不满一块，block 2要等decode把位置10、11的KV也算好（第4步）才登记，
+#     这样下一轮对话"上轮prompt+上轮回答"也能命中它；第2步采样出的t0在位置10，它的KV到第3步才算
+#   - 6'只释放block：token_ids里的真实token和num_prompt_tokens(=10)都保留。之后重新准入：把10+已生成的token
+#     整体当prompt重算，前面登记过hash的block若还没被驱逐就能命中
+#   - 同一prompt的第二个请求在第2步之后到来：block 0、1的hash命中 -> 准入时num_cached_tokens=8，只需算位置8~9
 class Sequence:
     # 类变量，所有实例共享：全局自增器，为每条序列分配唯一id
     counter = count()
@@ -603,12 +658,18 @@ class Sequence:
         # 解释：这类状态大小固定、不随token数增长，存在单独的状态池里，见第4批
         # 科普：线性注意力/状态空间模型（GDN、Mamba等）的"每请求状态"
         #   标准注意力要保存每个历史token的K、V（随长度线性增长，可以分页）；线性注意力把全部历史压缩成
-        #   一个固定大小的状态（例如每个head一个d×d矩阵），每来一个token就原地更新一次。
+        #   一个固定大小的状态（例如每个head一个d×d矩阵），每来一个token就原地更新一次（公式见model_config/qwen3_next.py科普②）。
+        #     全注意力层：block_table -> [blk5][blk9][blk2]...  每个token占一格，序列越长占得越多
+        #     GDN层：     state_slots -> [s0]                    一条请求一个槽位，长短序列一样大
+        #   例（Qwen3-Next默认配置、TP=1）：一层GDN的状态约52万个数，约等于512个token在一层全注意力里的KV
         #   因此：1. 它不能按token切成block，只能每条请求占一个"槽位"（state_slots）；
         #         2. 状态会被原地覆盖，前缀缓存想复用"前N个token之后的状态"，就必须在N处另存一份快照（checkpoint），
-        #            这就是下面一串checkpoint_*字段存在的原因；
-        #         3. 投机解码猜错要回滚，所以每个草稿位置多留一个回滚槽位（state_slots[1:]）
+        #            这就是下面一串checkpoint_*字段存在的原因（图解见Replay类上方"科普：状态checkpoint与有界重放"）；
+        #         3. 投机解码猜错要回滚，所以每个草稿位置多留一个回滚槽位（state_slots[1:]）：
+        #            k=3时 state_slots = [s0, r1, r2, r3]，s0是已提交状态，r1~r3分别存"接受1/2/3个草稿后"的状态
         #   混合模型（如Qwen3-Next：部分层GDN、部分层全注意力）两种缓存同时存在：KV走block_table，状态走state_slots
+        #   哪些模型打开它：InputOutputProcessor._per_req_cache_model_types（llm_engine.py），
+        #     deepseek_v4已在其中，上面英文里的"future DeepseekV4"已过时
         self.has_per_req_cache = has_per_req_cache
         # 科普：多模态输入
         #   图片先被视觉编码器变成一串向量，prompt里为每张图预留一段占位token（几百到上千个），

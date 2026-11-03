@@ -31,15 +31,21 @@ import enum
 #                                METRICS            EngineCore定时推送的指标快照
 #                                SHUTDOWN           EngineCore已退出
 #   ABORT、START_DP_WAVE、EXECUTOR_FAILED 在仓库里没有使用（中止请求走的是UTILITY命令"abort_request"）
+#   走哪个socket：→方向的ADD走input socket，UTILITY / SHUTDOWN走control socket；←方向全部走同一条PUSH→PULL
+#     （拓扑图见engine_core_mgr.py文件开头）
 #
 # 一个请求在这条通道上的消息时间线（DP=1，时间只是示意；→ 为CoreManager发往EngineCore，← 反之）：
 #   ← READY                      EngineCore加载完模型、分好KV池、抓完CUDA Graph后只发一次
 #   → ADD [A]           t=0      请求A到达；前端已经tokenize好，发过去的是token id而不是文本
 #   ← STREAM [(A,..)]   t=80ms   A的prefill那一步结束，带回第1个token（这就是TTFT的来源）
+#                                （ModelRunner默认开延迟输出：forward第N步时才交回第N-1步的token，所以实际通常再晚一步，
+#                                  见engine_core.py文件开头【3】）
 #   → ADD [B]           t=95ms   B到达：不必等A结束，B在随后的step里就会被调度（continuous batching）
 #   ← STREAM [(A,..),(B,..)]     此后每个step一条STREAM，装着"本步有新token的所有序列"
 #   ← ADD [A]                    A结束（eos / stop / max_tokens）：EngineCore保证先发它最后一步的STREAM，再发这条
 #   → UTILITY abort_request(B)   客户端断开：B在EngineCore的下一个postprocess里以"aborted"结束
+#                                （B若还在waiting队列里则立即移出；两种情况最后都回一条 ← ADD [B]，
+#                                  完整链路见engine_core_mgr.py abort_request上方）
 # 要点：一条STREAM对应EngineCore busy_loop的一次迭代（一次schedule + forward + postprocess），而不是一个请求；
 #   从前端看，EngineCore是一条持续运转的流水线：任何时刻都能塞进新请求，输出按step一批批流回来
 #

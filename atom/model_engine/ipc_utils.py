@@ -30,13 +30,25 @@ Phase 2 (weight sharing):
 #     - export_model_weight_handles  —— 由PrefillEngineCore在 load_model() 之后调用
 #     - import_model_weights         —— 由DecodeEngineCore在启动时调用（释放它自己的那份）
 #
-# 本文件：【分支】RapidServe（同机PD分离）的显存共享工具，见第9批
+# 本文件：【分支】RapidServe（同机PD分离）的显存共享工具，见第9批（RapidServe是什么见engine_core_mgr.py DisaggCoreManager上方的【科普】）
 #   同一组GPU上跑两个EngineCore：prefill一个、decode一个。decode端不另外加载权重、不另外分配KV池，
 #   而是通过IPC句柄把prefill进程的那块显存映射进来，两边看到的是同一份权重和同一个KV池
 # 调用方：ModelRunner.export_model_weight_ipc_handles / import_model_weight_ipc_handles /
 #   export_kv_cache_ipc_handle / import_kv_cache_ipc_handle（model_runner.py，每个TP rank各自导出/导入自己那张卡的）；
 #   它们再由PrefillEngineCore / DecodeEngineCore经call_func驱动（engine_core.py），句柄经临时文件和ZMQ传给对端
 # 解释：所以准确地说，这些函数运行在prefill/decode两边的ModelRunner进程里，而不是EngineCore进程里
+#
+# 【科普】CUDA/HIP IPC是什么——从"一个进程用一张卡"出发：
+#   平时一个进程hipMalloc一块显存，得到的指针只在本进程里有意义；另一个进程即使在同一张卡上，也不能直接用这个指针。
+#   IPC（进程间通信）句柄就是这块显存的"跨进程通行证"：
+#
+#       prefill进程（TP rank i）                              decode进程（同一个TP rank i，同一张GPU）
+#       某个权重张量w ──hipIpcGetMemHandle──► 句柄（几十字节）+ dtype/shape/stride
+#                     ──写进临时文件，文件路径经ZMQ发过去──► hipIpcOpenMemHandle(句柄) ──► 指向同一块物理显存的张量
+#       GPU显存：[====== 本卡约17.5GB的权重（70B模型、TP8，见下面的例子），只有一份 ======]  ←── 两个进程读写的是同一块
+#
+#   每个张量只传几十字节的句柄和形状信息，不拷贝数据；一边写入、另一边就能读到（何时写完要靠消息告知，RapidServe用PrefillDone）。
+#   每个TP rank各自导出/导入自己那张卡上的显存（见上面"调用方"）
 #
 # 为什么同机PD分离要共享显存，而不是各自加载一份：
 #   权重：例如一个70B模型的bf16权重约140GB，TP=8时每张卡约17.5GB；prefill、decode两个进程各放一份就是35GB/卡，
@@ -146,6 +158,10 @@ def import_kv_cache(meta: dict) -> torch.Tensor:
 
 # 导出模型的所有权重张量：参数、注册的buffer、以及模块上的普通张量属性
 # 输出：{"__param__名字" / "__buf__名字" / "__attr__模块.属性": 元数据dict}，前缀告诉导入端该放回哪里
+# docstring里的"MLA权重吸收"：MLA（DeepSeek-V2/V3等的注意力）的KV cache每token只存一个所有头共享的低维latent向量
+#   （图解见engine_core_mgr.py CoreManager.__init__第2步的【科普】）。加载后process_weights_after_loading把kv_b_proj
+#   （latent -> 每头K/V的上投影）拆成W_K、W_V（及其scale）另存为普通属性，decode时把W_K并到query一侧、W_V并到输出一侧，
+#   直接在latent空间里算注意力，不必把latent展开成每头完整的K/V（见第7批model_ops/attention_mla.py）
 def export_model_weight_handles(model: nn.Module) -> dict:
     """Export all model parameter tensors as CUDA IPC handles.
 
@@ -195,7 +211,9 @@ def export_model_weight_handles(model: nn.Module) -> dict:
     return handles
 
 
-# decode端：用prefill显存上的视图替换本进程模型的参数/buffer/属性，然后本进程原来的那份被释放
+# decode端：用prefill显存上的视图替换本进程模型的参数/buffer/属性
+#   RapidServe的decode模型一开始就建在meta设备上（PyTorch的虚拟设备：张量只有形状和dtype，不分配显存；
+#   见model_runner.py的RapidServeModelRunner._build_and_load_model），所以docstring说的"释放原来的权重"在v0.1.8里其实无可释放
 def import_model_weights(model: nn.Module, handles: dict) -> None:
     """Replace model parameters with views into another process's GPU allocation.
 

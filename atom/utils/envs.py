@@ -249,7 +249,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_H2D_BACKEND": lambda: os.getenv("ATOM_H2D_BACKEND", "packed"),
     # 科普·PD分离（Prefill/Decode disaggregation）：prefill是算力密集、decode是访存密集，放在同一组GPU上会互相拖累；
     #   PD分离让一组GPU（P节点）只做prefill，算完把KV cache通过RDMA网络传给另一组GPU（D节点）继续decode。
-    #   Mooncake / MoRI-IO是负责这次KV传输的传输引擎；HCA即RDMA网卡。实现见atom/kv_transfer/disaggregation/（mooncake/、moriio/）
+    #   Mooncake / MoRI-IO是负责这次KV传输的传输引擎；HCA即RDMA网卡（Host Channel Adapter；
+    #   与DeepSeek-V4的"HCA压缩注意力层"同名不同义，后者见config.py __post_init__第12步V4部分的【科普】）。实现见atom/kv_transfer/disaggregation/（mooncake/、moriio/）
     # 【PD/offload】ATOM_MOONCAKE_MATCHED_RAILS：Mooncake传输引擎使用哪些RDMA网卡（HCA）；空=不启用；读取方：mooncake_connector.py
     # Opt-in single-HCA engine pool: "auto" or explicit comma-separated HCAs.
     # 【译】可选的单HCA引擎池："auto"，或显式给出逗号分隔的HCA列表。
@@ -257,8 +258,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 科普·MLA（Multi-head Latent Attention，DeepSeek-V2/V3、Kimi、GLM-5等使用）：标准MHA每个token要缓存2*头数*head_dim个数，
     #   MLA把K/V先压成一个所有头共享的低维latent向量（DeepSeek是512维 + 64维RoPE部分 = 576维）只缓存它，计算时再用
     #   kv_b_proj展开（或把展开矩阵"吸收"进q）。KV cache因此小一个数量级。实现见atom/model_ops/attention_mla.py、attentions/aiter_mla.py
+    #   （带图和DeepSeek-V3数字的版本见arg_utils.py EngineArgs.tensor_parallel_size下方的【科普】MLA）
     # 科普·DCP（Decode Context Parallel）：长上下文decode时，把同一条序列的KV cache按token分散存到DCP组的多张卡上，
     #   每张卡只对自己那份KV算部分注意力，再用log-sum-exp合并结果；省的是每卡KV显存。实现见atom/distributed/dcp_utils.py、model_ops/dcp_ops
+    #   （token分布图和LSE合并的数字例子见arg_utils.py EngineArgs.decode_context_parallel_size上方的【科普】）
     # 【PD/offload】ATOM_PD_MLA_STAGING：prefill端把某个DCP decode rank需要的MLA KV先聚到GPU暂存槽，再按整页发送（默认开）
     # Prefill (`kv_producer`, plain `mooncake`) only: gather the MLA tokens a
     # DCP decode rank owns into a GPU staging slot and send whole destination
@@ -653,8 +656,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_AITER_FP8_PREFILL_ATTN": lambda: (
         os.getenv("ATOM_AITER_FP8_PREFILL_ATTN", "1") == "1"
     ),
-    # 科普·mHC（Manifold-Constrained Hyper-Connections）：DeepSeek-V4把普通的"x + f(x)"单条残差流扩成几条并行残差流，
-    #   每层进出时用小矩阵在这几条流之间混合（models/deepseek_v4.py里的mhc_pre/mhc_post）。下面的开关决定这部分小计算用FP32还是BF16 hi/lo拆分
+    # 科普·mHC（Manifold-Constrained Hyper-Connections，DeepSeek-V4/V4.1）：
+    #   普通Transformer（MHA、GQA都一样）每个子层只有一条残差流：x = x + Attn(Norm(x))。
+    #   mHC把残差流加宽成hc_mult=4条并行的流，每个子层（attention或FFN）前后各做一次小混合：
+    #
+    #       4条残差流 [n, 4, dim] ──hc_pre：按门控权重pre把4条加权合成1条──> [n, dim] ──Norm + Attn/FFN（照常）──┐
+    #             │                                                                                      │
+    #             └──comb（4x4混合矩阵，作用在旧的4条流上）──> (+) <──hc_post：按门控权重post把输出分回4条──┘
+    #
+    #   pre、post、comb都是每个token从残差现算出来的：pre是sigmoid门、post是2*sigmoid门，comb经Sinkhorn迭代（默认20次）
+    #   投影成"双随机矩阵"（每行、每列之和都≈1，这就是Manifold-Constrained），混合时不会把残差整体放大或缩小
+    #   （model_ops/sparse_attn_v4.py的hc_split_sinkhorn）。
+    #   例（数字是假设的）：dim=4096时，每个token的残差从4096个数变成4x4096=16384个数；attention/FFN本身的计算量不变，
+    #   多出来的只是这些4维的小矩阵运算。实现见models/deepseek_v4.py的Block.hc_pre / hc_post
+    #   （优先用aiter的mhc_pre / mhc_post融合kernel）。下面的开关决定这部分小计算用FP32还是BF16 hi/lo拆分
     # 【模型】ATOM_MHC_USE_BF16：DeepSeek-V4的mHC（超连接）模块加载后打包fn权重、用BF16 hi/lo计算（默认开）；读取方：models/deepseek_v4
     # Pack mHC fn weights once after loading and use BF16 hi/lo computation.
     # Set to 0 before model loading to retain FP32 fn and FP32 mHC computation.
@@ -735,6 +750,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #   不保存逐token的K/V，而是每个头维护一个固定大小的状态矩阵，每来一个token就更新一次（像RNN）。好处是显存不随长度增长；
     #   坏处是前缀复用时没法"取前N个token的KV"，只能复用在第N个token处保存下来的状态快照，这就是"状态checkpoint"。
     #   这些模型通常是线性注意力层与普通注意力层混合。实现见model_ops/attention_gdn.py、attentions/gdn_attn.py、fla_ops/
+    #   状态checkpoint怎样放置、命中时从哪里恢复（带图和数字），见arg_utils.py EngineArgs.state_checkpoint_interval_tokens上方的【科普】
     # 【状态缓存】ATOM_STATE_CHECKPOINT_DEMAND：前缀命中因没有合适的状态checkpoint而被拒绝时，是否按需补放一个checkpoint（默认开）
     #   背景见上面的科普；机制在第4批；读取方：block_manager.py
     # Set to 0 to stop a refused state-cache hit from placing a checkpoint of
@@ -1072,6 +1088,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # --- ReplaySSM (linear-attention state) ---
     # 【译】--- ReplaySSM（线性注意力状态）---
+    # 科普·ReplaySSM：投机解码一步要验证k+1个token，线性注意力（GDN/KDA）的状态S会被它们依次更新；
+    #   后面的草稿被拒绝时，要退回到"只接受了前几个token"时的状态。以k=3为例：
+    #
+    #       朴素做法：  S0 → S1 → S2 → S3 → S4           每个位置存一份完整状态矩阵（k+1 = 4份），拒绝后挑对应那份
+    #       ReplaySSM： S0 + 记录[(k,u,g)₁ (k,u,g)₂ (k,u,g)₃ (k,u,g)₄]   只记每个token的输入；拒绝 = 把游标往回挪，
+    #                   需要时从S0按记录重放出S_i；记录攒满L个（ATOM_REPLAYSSM_CACHE_LEN）才把完整状态写回一次
+    #
+    #   状态池于是不再随投机宽度k成倍增长（数字见下面英文注释里Kimi-K3的例子）
     # 【状态缓存】ATOM_ENABLE_REPLAYSSM：投机解码时缓存SSM的输入，而不是每个投机token一份完整状态
     #   未设置（None）时跟随是否开启投机解码：有投机就开、没有就关；设置后强制开/关（gdn_attn.py）
     # Cache the SSM *inputs* (k, u, g) instead of one full recurrent state per
@@ -1348,6 +1372,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_USE_V4_PREFILL_ASM_FOR_DECODE", "0") == "1"
     ),
     # 【注意力】ATOM_V4_HCA_PERSIST：DeepSeek-V4 HCA层（压缩比128）的fp8 decode用aiter的persistent V4-NM kernel（默认开）
+    #   CSA/HCA是什么见config.py __post_init__第12步V4部分的【科普】
     # DeepSeek-V4 HCA (compress_ratio 128) fp8 decode through aiter's
     # persistent V4-NM kernel (one launch, in-kernel split + merge) instead of
     # the decode ASM + split plan. gfx950, 128 local heads only; quietly off
@@ -1827,6 +1852,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 【译】PP边界上的hidden_states/residual在TP间是复制的；开启时每个rank只发送它的1/tp_size切片，由接收端all-gather，
     #   把PP链路流量降低tp_size倍。默认开启；设为"0"发送完整张量。
     "ATOM_PP_SEND_ALLGATHER": lambda: os.getenv("ATOM_PP_SEND_ALLGATHER", "1") == "1",
+    # 科普·Engram（DeepSeek-V4.1）：给模型加一张"按最近几个token查表"的记忆。它不是注意力（MHA/GQA那套q·k不参与），
+    #   而是在第1、14层的attention之前，往残差流上加一个查表得到的向量（recipes/Engram.md）：
+    #
+    #       token序列（示意：一个字当一个token）:  ... 北  京  大  学
+    #       当前token"学"往回看3个token，取各阶n-gram（n = 2..4）:  "大学"  "京大学"  "北京大学"
+    #         每个n-gram x 每个hash头 ──hash──> 行号 ──> 在巨大的嵌入表里取一行 ──> 投影 + 门控 ──> 加到残差上
+    #
+    #   hash之前先把token id映射到一个更小的"规范化词表"（大小写、重音、空白不同的token算同一个，mapping.py的CompressedTokenizer）。
+    #   表非常大（两张表合计约188.83GiB，E4M3数值 + E8M0 scale），所以放在主机内存里，每步只取用到的那几行。
+    #   因为要往回看3个token，前缀命中后的重放也要带上命中点之前的3个token（config.py的replay_history_tokens = engram_max_ngram_size - 1）
     # 【模型】ATOM_ENGRAM_*（下面4个）：DeepSeek-V4.1的Engram（n-gram记忆，表放在主机内存里）相关开关；读取方：model_ops/engram/
     # 【模型】ATOM_ENGRAM_UVA：GPU通过UVA直接读主机内存里的n-gram表，而不是在主机上gather（默认开）
     # Engram: read the n-gram tables with a device kernel over UVA instead of

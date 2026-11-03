@@ -374,7 +374,7 @@ class ChatCompletionRequest(BaseModel):
     response_format: dict[str, Any] | None = None
     # V4.1 also accepts an exact integer budget; bool/float coercion is invalid.
     # 【译】V4.1还接受一个精确的整数预算；bool/float的强制转换是无效的。
-    # Annotated[int, Field(strict=True, ge=1, le=100)]：严格模式下True、5.0这类值不会被转成int，取值范围1~100
+    # 解释：V4.1指DeepSeek-V4.1。Annotated[int, Field(strict=True, ge=1, le=100)]：严格模式下True、5.0这类值不会被转成int，取值范围1~100
     reasoning_effort: str | Annotated[int, Field(strict=True, ge=1, le=100)] | None = (
         None
     )
@@ -385,6 +385,7 @@ class ChatCompletionRequest(BaseModel):
     # 【译】K3的思考控制（客户端通过extra_body发送）：
     #   {"type": "enabled"|"disabled", "keep": "all", "effort": "low"|"high"|"max"}。
     #   没有这个字段的话，pydantic（extra="ignore"）会悄悄丢掉它，于是effort永远到不了模板，流式推理门控也永远不会触发。
+    # 解释：K3指Kimi-K3；如今对所有模型都由serving_chat.resolve_thinking读这个字段，再翻译成各模板自己的开关（api_server.chat_completions）
     thinking: dict[str, Any] | None = None
     # Accepted for compatibility, not actively used:
     # 【译】为兼容而接受，实际不使用：

@@ -26,6 +26,30 @@ Usage:
 # 职责：把HTTP请求变成引擎里的Sequence，再把引擎每个step吐出的token变回HTTP响应。
 #   它运行在API server进程里，和LLMEngine / CoreManager同一个进程；推理本身在EngineCore进程和ModelRunner进程里
 #
+# ---- 阅读路线（本文件约4000行，先看这一段）----
+# 文件头（到import为止）依次是：接口一览 → 各接口的适用场景 → 首次出现的概念与术语 → 原理（服务层做哪五件事、为什么要流式、
+#   为什么断开要立刻abort）→ 图1 流式chat请求的完整路径 → 图2 输出线程如何把结果交给事件循环 → 图3 时间线 → 图4 断开→abort
+# 代码按五个"# ====="分节横幅组织（横幅里是英文标题和【译】）：
+#   ① Global State：main()启动时写入的全局变量（engine、tokenizer、推理方言、工具调用格式……）、delivered_text、reasoning_channel；
+#      其后是/v1/messages专用的anthropic_*辅助函数、Prometheus指标对象、_get_dp_session_affinity_ids
+#   ② Request/Response Logging：_log_request_*，以及所有SSE流的最外层包装_client_stream
+#   ③ Engine Interface：_build_sampling_params / _coerce_n / 长度校验 → 多模态预处理 → 输出线程上的流式回调与flush
+#      → generate_async*（非流式）→ setup_streaming_request*（流式）→ cleanup_* → _race_disconnect（非流式的断开检测）
+#   ④ FastAPI Application：lifespan、错误处理器、各接口函数（chat_completions、completions、anthropic_messages、
+#      responses_create、/v1/models、/health、/metrics、/debug/*、/kv_transfer_info、/server_info、profiler开关）
+#   ⑤ Main Entry Point：main()（解析参数 → tokenizer → 启动期探测chat template → create_engine → 投递器 → uvicorn.run）
+# 建议先读主路径：图1 → chat_completions → setup_streaming_request → serving_chat.stream_chat_response
+#   → streaming_dispatch.py → cleanup_stream；再读非流式的generate_async → _race_disconnect；最后读main()看全局变量从哪来。
+#   anthropic_* / responses_create / *_fanout（n>1）/ *_multimodal 是B级分支，第一遍可以跳过
+# 入门【科普】（都从"Transformer把token id序列映射成下一个token的logits"讲起，各讲一次，其他地方只指过去）：
+#   chat template与特殊token → chat_encoders.py文件头；推理内容（<think>）→ 本文件chat_completions里；
+#   工具调用格式、前缀缓存与cached_tokens → serving_chat.py文件头；增量反分词与偏移量 → streaming_dispatch.py的
+#   IncrementalStreamDetokenizer前；图片占位token与视觉编码器 → examples/multimodal_inference.py文件头
+# 注释里的记号（注释计划ANNOTATION_PLAN.md的约定）：
+#   "第N批"=按主题划分的阅读批次，用来指路：第1批配置与请求对象、第2批引擎主循环与服务层（2b多模态、2c本服务层）、
+#   第3批调度器、第4批KV cache、第5批ModelRunner、第7批投机解码、第8批新模型、第9批PD分离与分布式、第10批指标等周边；
+#   "A级"=逐行详注的主干，"B级"=只注关键行；"【分支】"=主路径之外的功能分支，指向详细讲它的那一批
+#
 # 接口一览：
 #   POST /v1/chat/completions   chat_completions     主路径（A级详注）
 #   POST /v1/completions        completions          主路径（A级详注）
@@ -38,13 +62,14 @@ Usage:
 #   接口                    典型调用方                    适用场景 / 注意
 #   ──────────────────────  ────────────────────────────  ──────────────────────────────────────────────────────────
 #   /v1/chat/completions    OpenAI SDK、聊天前端、Agent    对话/指令模型的默认选择：服务端套chat template，拆出reasoning_content、
-#                                                         tool_calls；未传的采样参数用协议默认值（temperature=1.0）
+#                                                         tool_calls；未传的采样参数用协议默认值（temperature=1.0、max_tokens=8192，
+#                                                         不读generation_config）
 #   /v1/completions         lm_eval的local-completions     裸prompt续写：base模型、客户端已自己拼好模板、或直接给token id
 #                           （GSM8K评测）、PD路由、压测    （prompt传数组或prompt_token_ids）；不做推理内容/工具调用拆分
 #   /v1/messages            Claude Code等Anthropic客户端    同一模型按Anthropic格式对外（content块、stop_reason、事件流）；
-#                                                         未传的采样参数优先取generation_config的推荐值
+#                                                         未传的采样参数优先取generation_config的推荐值；max_tokens缺省4096
 #   /v1/responses           Codex CLI                      OpenAI Responses格式（含Codex专有工具）；未给max_output_tokens时
-#                                                         用serving_responses.DEFAULT_MAX_OUTPUT_TOKENS（4096）
+#                                                         用serving_responses.DEFAULT_MAX_OUTPUT_TOKENS（4096）；采样参数默认值同上一行
 #   /v1/models              客户端探测                     只返回一个ModelCard（id=model_name）
 #   /health                 负载均衡、容器探针              只说明事件循环活着，不代表GPU上的模型正常（见/health前的注释）
 #   /metrics                Prometheus                     周期刷新的缓存指标文本，抓取本身不访问引擎
@@ -52,11 +77,6 @@ Usage:
 #   /kv_transfer_info       PD分离部署                     PD角色与握手端口
 #   /debug/*、/start_profile、/stop_profile  开发者        投机解码/前缀缓存统计、GC普查、开关profiler
 #   注意：没有vLLM / SGLang那种原生的 /generate 接口；想直接喂token id，用 /v1/completions 的 prompt_token_ids
-#
-# 文件结构（自上而下）：
-#   全局状态（main()启动时填好）→ 推理内容 / Anthropic的辅助函数 → 请求日志、_client_stream
-#   → 引擎接口：SamplingParams构造、长度校验、流式chunk投递、generate_async*、setup_streaming_request*、
-#     cleanup、客户端断连处理 → FastAPI应用（lifespan、错误处理、各接口）→ main()
 #
 # ---- 几个第一次出现的概念（只在这里讲一次）----
 # asyncio：单线程的协作式并发。async def定义"协程"，执行到await时把控制权交还给"事件循环"（event loop），
@@ -71,15 +91,26 @@ Usage:
 # SSE（服务端推送事件）：一种HTTP流式响应。响应头 Content-Type: text/event-stream，响应体不一次性返回，
 #   而是一帧一帧地写，每帧形如 "data: {json}\n\n"；OpenAI的流式协议以 "data: [DONE]\n\n" 结尾。
 #   FastAPI的StreamingResponse包装一个异步生成器：生成器每yield一个字符串，就往socket写一次
+#   （具名帧"event: ...\ndata: ..."，以及为什么用SSE而不是WebSocket，见sse.py）
+# 下文常用的引擎侧术语（详细讲解在括号里的批次）：
+#   prefill / decode：prefill是一次前向处理整段prompt、写入KV cache并采样出第1个token；decode是之后每步只喂上一个token、
+#     生成下一个。KV cache按固定大小的block分给各序列（科普见examples/simple_inference.py，第4批）
+#   投机解码（MTP等）：先由便宜的草稿头猜出后面几个token，主模型一次前向同时验证，猜对几个就一个step输出几个（第7批）
+#   Sequence：引擎里"一条生成序列"的对象，带prompt token、采样参数、已生成的token和KV block表（第1批sequence.py）
+#   ZMQ：本进程与EngineCore进程之间收发请求、输出和控制命令（utility command）用的消息库（第2批engine_core_mgr.py）
+#   DP（数据并行）：起多个EngineCore副本，每个是一个DP rank，各有自己的调度器和KV cache；CoreManager把每个请求分给某个rank，
+#     并在本进程里为每个rank起一个输出线程（EngineCoreOutputThread-DP{rank}）
+#   PD分离：prefill和decode放在不同节点上跑，prefill节点算完的KV传给decode节点，由PD路由器转发请求（第9批）
+#   atomesh：atom/mesh下的Rust路由网关（多worker负载均衡、PD路由），见entrypoints/atomesh/server.py文件头
 #
 # ---- 原理：一个"OpenAI兼容服务器"到底要做什么 ----
 # 引擎只认token id和SamplingParams，客户端说的是OpenAI的JSON协议；服务层就是两者之间的翻译，主要五件事：
-#   1. 输入：messages → chat template → prompt字符串 → token id（chat_encoders.py；tokenize在preprocess里做）
+#   1. 输入：messages → chat template → prompt字符串 → token id（chat_encoders.py，文件头有【科普】；tokenize在preprocess里做）
 #   2. 采样：temperature / top_p / top_k / max_tokens / stop / n → SamplingParams（_build_sampling_params）
 #   3. 输出：token id → 文本（非流式一次decode，流式增量反分词），再拆出reasoning_content / tool_calls（serving_chat.py）
 #   4. 结束：引擎的leave_reason → finish_reason（stop / length / tool_calls，见protocol.openai_stop_reason*）
 #   5. 计量：usage = prompt_tokens（渲染模板后的prompt长度，含模板加的特殊token）/ completion_tokens /
-#      prompt_tokens_details.cached_tokens（前缀缓存命中、不用重新prefill的prompt token数）
+#      prompt_tokens_details.cached_tokens（前缀缓存命中、不用重新prefill的prompt token数，科普见serving_chat.py文件头）
 # 为什么要流式：自回归生成的总时延 ≈ TTFT + (输出token数 - 1) × TPOT
 #   TTFT（首token时延）= 排队 + prefill；prefill是计算密集的，随prompt长度增长
 #   TPOT（每个输出token的时间）≈ 一个decode step的耗时；decode是访存密集的（每步都要读一遍权重和整段KV），随batch和上下文缓慢增长
@@ -469,7 +500,7 @@ def delivered_text(token_ids) -> str:
     return synthetic_token_text * len(token_ids)
 
 
-# 决定本请求的输出如何切分"思考段"和"正文"：返回ReasoningChannel（reasoning.py），
+# 决定本请求的输出如何切分"思考段"和"正文"（什么是思考段、为什么要拆，见chat_completions里的【科普】推理内容）：返回ReasoningChannel（reasoning.py），
 #   之后用它的.stream()得到流式过滤器，或用.split(text)一次性切分
 #   prompt_opens：渲染出的prompt本身是否已经打开了思考段（由prompt_starts_in_reasoning等判断）
 #   template_kwargs：合并后的chat template参数，用来判断推理是否被关掉
@@ -943,7 +974,7 @@ async def _client_stream(
 #     这是作者在该模型上调出的最好设置（推理模型在temperature=1时更容易发散、重复）
 #   chat / completions接口在请求没传时用协议默认值（pydantic字段的默认值就是DEFAULT_*，到这里已分不清"没传"和"传了1.0"）；
 #   /v1/messages和/v1/responses则优先取模型推荐值。所以评测或压测chat接口时，最好显式传采样参数
-# logprobs：SamplingParams本身有logprobs字段（离线的LLMEngine.generate会返回每个token的logprob），但HTTP请求模型没有声明它
+# logprobs：SamplingParams本身有logprobs字段（离线调用LLMEngine.generate时把它设为真，输出dict里才有每个token的logprob），但HTTP请求模型没有声明它
 #   （extra="ignore"直接丢弃），这里也不传，所以serving_chat / serving_completion的帧里"logprobs"恒为None
 def _build_sampling_params(
     temperature: float,
@@ -1724,6 +1755,8 @@ def _engine_kv_transfer_params(
 
 # /v1/messages和/v1/responses在prompt过长时会截断（chat / completions则直接拒绝），这里算截断时给输出预留多少token
 # 例：max_ctx=32768 → headroom=max(1024, 32768//8)=4096；无PD交接、max_tokens=2000时取min → 2000
+# 注意：截断后的序列照样要过_validate_sequence_context_length，而预留量最多只有max(1024, max_ctx//8)。
+#   max_tokens比它大时仍会被拒绝：max_ctx=32768、max_tokens=8000 → 预留4096，prompt截到约28672个token，28672 + 8000 > 32768 → 400
 def _prompt_headroom(
     max_tokens: int, max_ctx: int, kv_transfer_params: dict[str, Any] | None
 ) -> int:
@@ -2346,7 +2379,8 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         # a string tool_choice ("auto"/"none"/"required"), and thinking/effort.
         # 【译】转发K3模板需要、而pydantic本身不会传下去的模板控制项：结构化输出的 response_format、
         #   字符串形式的 tool_choice（"auto"/"none"/"required"），以及 thinking/effort。
-        # 解释：这些键对所有模型都会写进merged_kwargs。Jinja模板会忽略不认识的kwarg；
+        # 解释：K3指Kimi-K3（它用模型目录里自带的Python消息编码器而不是Jinja模板，见chat_encoders.py）。
+        #   这些键对所有模型都会写进merged_kwargs。Jinja模板会忽略不认识的kwarg；
         #   模型自带的Python encoder则由MessageEncoderAdapter按函数签名过滤（chat_encoder_adapters.py）
         if request.response_format is not None:
             merged_kwargs["response_format"] = request.response_format
@@ -2437,14 +2471,9 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         else:
             # 普通情况：在事件循环上直接渲染chat template，得到prompt字符串（Jinja路径固定tokenize=False、add_generation_prompt=True）；
             #   tokenize留到preprocess在线程池里做
-            # 原理：chat template为什么必须是模型自己的那一份。模型在SFT/RLHF阶段见过的每条对话都是用这个模板拼出来的：
-            #   角色标记（如<|im_start|>user）、system prompt放在哪、工具描述怎么写、回合结束符（如<|im_end|>）都是它"学会"的格式。
-            #   模板不匹配的典型后果：①模型认不出角色边界，把自己当user接着写；②模型输出的回合结束符不在stop_token_ids里，停不下来，
-            #   一直写到max_tokens；③system prompt或工具描述放错位置，指令遵循和工具调用质量明显下降
-            #   add_generation_prompt=True在末尾补上assistant回合的开头（如"<|im_start|>assistant\n"），告诉模型"轮到你说了"；
-            #   有的模板还会顺手预填思考段的开头（如"<think>\n"），所以下面要检查prompt是否已处在思考段内
-            # 注意：渲染结果里的特殊token是以文本形式出现的，preprocess里tokenizer.encode会把它们识别回特殊token id；
-            #   encode默认add_special_tokens=True，若模板文本本身已以BOS开头、tokenizer又自动加BOS，就会出现两个BOS
+            # chat template、特殊token、add_generation_prompt是什么，为什么必须用模型自己的模板，以及"两个BOS"的坑，
+            #   都在chat_encoders.py文件头的【科普】里。有的模板还会顺手预填思考段的开头（如"<think>\n"），
+            #   所以下面要检查prompt是否已处在思考段内（见下面的【科普】推理内容）
             prompt_or_tokens = apply_chat_template(
                 tokenizer,
                 custom_message_encoder,
@@ -2453,12 +2482,23 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 **merged_kwargs,
             )
 
-        # 原理：推理（thinking）模型的输出形如 "<think>\n先算……\n</think>\n\n答案是42"，服务端把它拆成两个字段：
-        #   reasoning_content="先算……"，content="答案是42"。为什么要拆：①UI通常折叠或不展示思考过程；
-        #   ②多轮对话里，不少模板渲染历史assistant消息时会丢掉旧回合的思考，客户端回传时需要能区分两者；
-        #   ③工具调用解析只应看content，否则模型在思考里"设想"的调用会被当成真调用（见anthropic_template_kwargs的docstring）
-        #   难点是"从哪开始"：模板若已在prompt末尾写了"<think>\n"，模型的第一个token就在思考段内，输出里不会再出现<think>，
-        #   只会在某处出现</think>——所以要先判断prompt是否已打开思考段（ReasoningChannel的starts_open）
+        # 【科普】推理内容（thinking / reasoning）—— 从"模型只是逐个预测下一个token"讲起
+        #   ① 模型眼里只有一条token序列。推理模型训练时学会了先写一段"草稿"、再写答案，草稿用一对标记包住
+        #     （Qwen3.5的<think>是一个特殊token，id 151667；特殊token是什么见chat_encoders.py文件头的【科普】）：
+        #       ...<|im_start|>assistant\n │ <think>\n先算……\n</think>\n\n │ 答案是42 │ <|im_end|>
+        #            （prompt到这里为止）     └──── 草稿 → reasoning_content ┘ └ content ┘
+        #     对模型来说这些都是普通的"下一个token"，没有特殊的计算路径：草稿同样占KV cache、计入completion_tokens
+        #   ② 服务端按方言（reasoning_dialect：开始 / 结束标记是什么，启动时从模板读出）把反分词后的文本切成两个字段：
+        #       reasoning_content="先算……"，content="答案是42"
+        #     为什么要拆：UI通常折叠思考过程；多轮对话里不少模板渲染历史assistant消息时会丢掉旧回合的思考，客户端回传时要能区分；
+        #     工具调用解析只应看content，否则模型在思考里"设想"的调用会被当成真调用（见anthropic_template_kwargs的docstring）
+        #   ③ 难点是"从哪开始"。有的模板会替模型把开始标记预填在prompt末尾：
+        #       ...<|im_start|>assistant\n<think>\n │ 先算……\n</think>\n\n答案是42
+        #                                         └ 模型的第一个token已在思考段内，输出里只会出现</think>
+        #     所以要先判断渲染出的prompt是否已打开思考段（下面的prompt_starts_in_reasoning → ReasoningChannel的starts_open）；
+        #     DeepSeek-R1这类模型更隐蔽：只看prompt和输出都看不出开头，启动时从模板源码判断（全局变量model_starts_in_reasoning）
+        #   ④ 关掉推理：请求的thinking / reasoning_effort被翻译成模板开关（上面的reasoning_toggle，如Qwen的enable_thinking=False），
+        #     模板预填一个空的思考段，模型直接写答案（见chat_encoders.resolve_reasoning_toggle前的例子）
         # The K3 template may open the reasoning channel in text or token IDs.
         # 【译】K3模板可能以文本或token ID的形式打开推理通道。
         # prompt是字符串时检查文本末尾；是token id时只解码末尾几个token再检查（reasoning.py）
@@ -2804,7 +2844,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
 # 与chat接口的几处差别：
 #   - thinking在prompt里回应（anthropic_template_kwargs），请求没开thinking时响应里扣下推理内容（anthropic_drop_reasoning）
 #   - 未传的采样参数取模型generation_config的推荐值
-#   - prompt过长时截断（保留开头的max_input个token），而不是像chat那样拒绝
+#   - prompt过长时截断（保留开头的max_input个token），而不是像chat那样拒绝（max_tokens大于预留量时仍会400，见_prompt_headroom）
 #   - 流式生成器定义在函数内部，自己处理异常帧、保活ping和最终的stop_reason
 @app.post("/v1/messages")
 async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Request):

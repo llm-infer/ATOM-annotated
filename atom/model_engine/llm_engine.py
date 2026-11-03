@@ -28,6 +28,18 @@ logger = logging.getLogger("atom")
 #   在线用法：api_server不调用generate，而是直接调engine.io_processor.preprocess / preprocess_fanout
 #     把请求变成Sequence，再调engine.core_mgr.add_request；结果经流式回调送回（第2批openai/api_server.py）
 #
+# 本文件按三部分组织：
+#   ① 文件开头的总览：请求生命周期图 → 对比nano-vllm → 为什么tokenize放在前端（GIL；前端与EngineCore分进程的主说明，
+#     engine_core_mgr.py只引用它）→ "step"的两层含义 → 进程/线程/socket归属图 → 适用场景
+#   ② class LLMEngine：__init__（构造Config、跨特性兼容性检查、拉起CoreManager）、add_request / step / generate（离线主路径）、
+#     转发到EngineCore的统计 / profile工具RPC
+#   ③ class InputOutputProcessor：preprocess / preprocess_fanout（文本 -> Sequence）、postprocess（Sequence -> 文本 + TTFT/TPOT）
+# 建议阅读顺序：生命周期图 → add_request上方的流程图 → generate上方的时序图 → preprocess_fanout的7个步骤；
+#   __init__第3步（TBO/PCP等兼容性检查）和get_*_statistics都是分支，第一遍可跳过。下游接着读engine_core_mgr.py → engine_core.py
+# 前置概念：TP/DP/PP/DCP等并行方式见第1批arg_utils.py"并行"一段；prefill/decode、continuous batching（连续批处理）、
+#   延迟输出的原理见engine_core.py文件开头的【1】~【3】；CUDA Graph见config.py里CUDAGraphMode上方的【科普】；
+#   DP-attention / EP / MLA见engine_core_mgr.py CoreManager.__init__第2步的【科普】
+#
 # 一个请求的完整生命周期（单机、DP=1、TP=2为例；箭头上标的是传输方式）：
 #
 #   用户进程（本文件 + CoreManager）       EngineCore进程（每个DP rank一个）         ModelRunner进程×TP（每张GPU一个，由AsyncIOProc承载）
@@ -56,7 +68,7 @@ logger = logging.getLogger("atom")
 #   step()就是"schedule → model_runner.call('run') → postprocess"一次完整迭代，由generate的while循环驱动；
 #   ATOM的LLMEngine只做tokenize/detokenize和进程间收发：调度器在EngineCore进程里自己循环，
 #   GPU计算在每张卡单独的ModelRunner进程里，step()不驱动任何计算，只是"等下一批结束的请求"
-#   这样做的好处：tokenize、HTTP处理、调度、GPU计算分在不同进程，互不抢GIL；DP>1时可以有多个EngineCore
+#   这样做的好处：tokenize、HTTP处理、调度、GPU计算分在不同进程，互不抢GIL（为什么这很重要见下一段）；DP>1时可以有多个EngineCore
 #
 # 为什么tokenize / detokenize放在前端进程，而不放进GPU循环所在的EngineCore：
 #   GPU循环的理想状态是"上一步forward一结束，下一步的输入已经备好"。一步decode往往只有几到几十毫秒，
@@ -69,6 +81,7 @@ logger = logging.getLogger("atom")
 #   EngineCore里的一步 = busy_loop的一次迭代：schedule()选出一批 → 一次forward → postprocess。
 #     与nano-vllm相同，一批要么全是prefill、要么全是decode（不混合；有可调度的prefill时通常先做prefill）；
 #     decode批里每条序列这一步只长1个token（开投机解码时可以一次接受多个）
+#     （为什么这样调度、prefill与decode的性能差异，见engine_core.py文件开头【1】【2】）
 #   本文件的step() = 从outputs_queue取一项"已结束的序列列表"，与GPU的步调无关：EngineCore可能已经跑了几百步才回来一项
 #
 # ── 进程 / 线程 / socket 归属（单机 -dp 1 -tp 2；排查"卡住了"时先对照它看是哪一段在等） ──
@@ -97,6 +110,8 @@ logger = logging.getLogger("atom")
 #   │ 读MessageQueue → forward → 采样 │ ◄═══► │ 读MessageQueue → forward        │  RCCL all-reduce
 #   └────────────────────────────────┘       └────────────────────────────────┘
 #   （KV聚合输出和集合RPC回复另有"每个worker一条"的PUSH通道，见async_proc.py）
+#   进程名对照：图里的EngineCore-DP0是multiprocessing.Process的name；ps/top里的进程标题由set_process_title设置
+#     （装了setproctitle时），形如ATOM::EngineCore（DP>1时ATOM::EngineCore_DP{r}）、ATOM::TP{i}（DP>1时ATOM::DP{r}TP{i}）
 #
 # ── 适用场景 ──
 #   离线 generate(prompts, sp)：批量评测、数据合成、离线打分
@@ -190,6 +205,14 @@ class LLMEngine:
         # 解释：CoreManager构造时若开启--enable-dp-attention，还会把parallel_config.data_parallel_size
         #   乘以原TP（见engine_core_mgr.py）；这里记录的是那之前的值
         # ---------- 3. 跨特性兼容性检查（TBO / PCP / PP / DP-attention），均为分支，见第9批 ----------
+        # 术语（第一遍可以跳过整个第3步）：
+        #   TBO（two-batch overlap） 把一个batch拆成两个微batch（ubatch）交替执行，让一个的通信与另一个的计算重叠
+        #                            （详见utils/envs.py"科普·TBO"）
+        #   PCP（prefill上下文并行） prefill时把一条长prompt的token切到多张卡上各算一段（详见utils/envs.py"科普·PCP"）
+        #   PP（流水线并行）         按层把模型切成几个stage，每个stage一个EngineCore（见第1批arg_utils.py"并行"一段）
+        #   DP-attention / EP / mori 注意力按DP切（每卡各算各的请求）、MoE按专家并行（EP）铺到所有卡，token经all-to-all送到
+        #                            专家所在的卡；mori是AMD做这种all-to-all的通信库。从MHA/GQA讲起的图解见
+        #                            engine_core_mgr.py CoreManager.__init__第2步的【科普】
         self.data_parallel_size = config.parallel_config.data_parallel_size
         # TBO's two concurrent ubatches are supported by the mori EP
         # dispatch/combine path. The EP collective fallback instead issues
@@ -316,7 +339,8 @@ class LLMEngine:
         self.io_processor = InputOutputProcessor(
             config, self.tokenizer, config.kv_cache_block_size
         )
-        # 【分支】RapidServe（同机PD分离：prefill与decode两个EngineCore共享KV/权重），见第9批
+        # 【分支】RapidServe（同机PD分离：prefill与decode两个EngineCore共享KV/权重），见第9批；
+        #   图解见engine_core_mgr.py DisaggCoreManager上方的【科普】
         if config.enable_rapidserve:
             self.core_mgr = DisaggCoreManager(config)
         else:
@@ -330,6 +354,7 @@ class LLMEngine:
         import json
 
         # 【分支】PD分离 / KV offload的KV传输配置（ATOM_KV_OFFLOAD也被折叠进这里，见第1批arg_utils.py），见第9批
+        #   两者是什么：arg_utils.py里"【科普】PD分离"和"【科普】KV offload"两段
         # 解释：Config.__post_init__已经解析过同一个kv_transfer_config，这里在本进程的config上再解析一次；
         #   此时EngineCore进程已经用各自的Config副本启动，不受影响。kwargs里没有这个键时结果为{}；
         #   注意这里只捕获JSONDecodeError，若kwargs传的是dict而不是JSON字符串，json.loads会抛TypeError
@@ -351,7 +376,7 @@ class LLMEngine:
         """Shut down engine and release all GPU resources."""
         # 【译】关闭引擎并释放所有GPU资源。
         # 关闭顺序：CoreManager.close()给每个EngineCore发SHUTDOWN → EngineCore退出时调用call_func("exit")
-        #   关闭各ModelRunner进程（见async_proc.py）→ CoreManager等待/终止EngineCore进程
+        #   关闭各ModelRunner进程（见async_proc.py）→ CoreManager等待/终止EngineCore进程（完整链路见engine_core_mgr.py close上方）
         # hasattr：__init__中途失败时core_mgr可能还没创建
         if hasattr(self, "core_mgr"):
             self.core_mgr.close()
@@ -494,16 +519,15 @@ class LLMEngine:
         # 一次性把整批序列交给CoreManager：pickle后经ZMQ发给EngineCore（DP>1时按负载均衡分到各DP rank）
         #   seq id在本进程里由Sequence.counter分配（Sequence.__init__），所以跨所有DP rank唯一，EngineCore直接沿用
         #   DP>1时每条序列单独选rank（_dispatch_to_dp_ranks），n>1的兄弟序列也可能落到不同rank
-        # 背压（back-pressure）：这里没有显式的背压，add_request从不因为"引擎太忙"而阻塞或拒绝——
-        #   make_zmq_socket把这些socket的SNDHWM/RCVHWM设为0（不设上限），outputs_queue也是无界的queue.Queue。
-        #   超出GPU容量的请求会在EngineCore的scheduler.waiting里排队（受max_num_seqs、max_num_batched_tokens和空闲KV block限制），
-        #   表现为TTFT变长；需要限流的话得在更上层（网关或客户端并发数）做
+        # 背压（back-pressure）：没有。add_request从不因为"引擎太忙"而阻塞或拒绝，过载只表现为TTFT变长；
+        #   原因、例子和前端唯一会做的拒绝，见engine_core_mgr.py文件开头"背压"一段
         self.core_mgr.add_request(reqs)
 
     # 取回下一批"已结束"的序列（阻塞直到有结果）
     # 对比nano-vllm：nano-vllm的step()执行一次"调度 + forward + 后处理"，返回本步结束的序列和吞吐数据；
     #   ATOM的EngineCore进程一直在自己的busy_loop里跑，这里的step()只是从CoreManager的outputs_queue里
-    #   阻塞取一项。若取到的是异常对象（例如进程关闭时放入的），get_output会把它抛出
+    #   阻塞取一项（没有超时）。get_output里有"取到异常对象就抛出"的分支，但CoreManager的outputs_queue
+    #   只会被放入list[Sequence]（进程关闭时放SystemExit的是async_proc.py里另一个同名队列），那是防御性代码
     # 从前端看continuous batching（示意：A、B一起提交，C稍后才到达；横轴是EngineCore的step编号）：
     #   step:  1        2 ........ 40 ....... 120 ...... 300
     #   A      prefill  decode ... 结束
@@ -580,7 +604,8 @@ class LLMEngine:
         # seq_id -> 输出dict
         outputs = {}
         # 循环条件：还有未结束的请求，并且（还有EngineCore进程活着，或者outputs_queue里还有没取的结果）
-        #   后半个条件保证：EngineCore进程全部意外退出时循环能结束，而不是永远卡住
+        #   后半个条件让EngineCore进程全部意外退出后循环能结束；但它只在每次step()返回后才检查——
+        #   若进程是在step()已经阻塞在outputs_queue.get()（没有超时）时才退出，这里仍会一直等
         while not self.is_finished() and (
             self.core_mgr.is_alive() or self.core_mgr.is_rest()
         ):
@@ -694,6 +719,7 @@ class LLMEngine:
 
     # 前缀缓存命中统计，跨DP rank聚合；调用方：api_server的/debug/cache_stats接口
     #   各计数器的定义见engine_stats.py的EngineStats（缓存部分细节见第4批）
+    #   前缀缓存是什么见utils/envs.py"科普·前缀缓存"；下面的"CPU offload层"（offload_tokens）见arg_utils.py"【科普】KV offload"
     def get_cache_statistics(self, timeout: float = 30.0) -> dict[str, Any]:
         """Return aggregated prefix-cache statistics across DP ranks.
 
@@ -1057,7 +1083,8 @@ class InputOutputProcessor:
         #   requests                 seq.id -> Sequence：本进程发出、还没被取走的请求
         #   _external_to_internal    用户请求id -> seq.id；_internal_to_external 反过来（只在n=1且带了request_id时登记）
         #   has_per_req_cache        模型是否需要分页KV池之外的逐请求状态缓存（GDN/线性注意力、DeepSeek-V4等），见第4批
-        #   num_speculative_tokens   投机解码每步的草稿token数（0表示未开启），见第7批
+        #                            （这种"每请求状态"是什么见sequence.py里"科普：线性注意力/状态空间模型"）
+        #   num_speculative_tokens   投机解码每步的草稿token数（0表示未开启），见第7批（投机解码是什么见arg_utils.py"【科普】投机解码"）
         #   prefix_hash_block_size   前缀缓存hash块的token数（0表示不在前端算hash链）
         self.config = config
         self.tokenizer = tokenizer
@@ -1093,7 +1120,8 @@ class InputOutputProcessor:
         # 0 = no prefix cache. The engine rehashes on a mismatch.
         # 【译】BlockManager.hash_block_size，用于发送prompt的hash链；0 = 没有前缀缓存。不一致时引擎会重新计算hash。
         # 解释：在前端（本进程）提前算好prompt的链式hash，随ADD消息一起发给EngineCore，省掉调度线程上的计算；
-        #   hash块大小 = block_size x DCP大小（prefix_hash.hash_block_size_for），前缀缓存细节见第4批
+        #   hash块大小 = block_size x DCP大小（DCP=decode上下文并行，见第1批arg_utils.py；prefix_hash.hash_block_size_for），
+        #   前缀缓存细节见第4批
         self.prefix_hash_block_size = 0
         if getattr(config, "enable_prefix_caching", False):
             self.prefix_hash_block_size = hash_block_size_for(

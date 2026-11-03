@@ -17,23 +17,36 @@ when one was found, or to ``tokenizer.apply_chat_template`` otherwise.
 #   找到了自定义编码器就透明地交给它，否则交给 tokenizer.apply_chat_template。
 #
 # 本文件（第2批2c，B级）：把chat消息渲染成prompt字符串
-# chat template（第一次出现，讲一次）：模型仓库tokenizer配置里的一段Jinja模板，把消息列表变成带特殊token的prompt；
-#   add_generation_prompt=True会在末尾补上assistant回合的开头，让模型接着以assistant身份续写。例（Qwen风格）：
-#   [{"role": "user", "content": "你好"}] → "<|im_start|>user\n你好<|im_end|>\n<|im_start|>assistant\n"
-# 一个带system和tools的例子（Qwen风格，具体文本以模型模板为准）：
-#   [{"role": "system", "content": "你是助手"}, {"role": "user", "content": "北京天气？"}] + tools=[get_weather]
-#   → "<|im_start|>system
-# 你是助手
+# 【科普】chat template与特殊token —— 从"模型只是把token id序列映射成下一个token的logits"讲起
+#   ① 模型只认一条token序列。MHA / GQA的Transformer输入一串token id，输出每个位置上"下一个token"的logits；
+#     它本身没有"消息""角色""回合"的概念，多轮对话必须先被拼成一条序列，模型才能续写
+#   ② 特殊token：词表里专门留给"结构"的条目。以Qwen3.5为例（id取自tests/test_state_checkpoint.py里按Qwen3.5写的常量）：
+#     <|im_start|>（回合开始）= 151644，<|im_end|>（回合结束）= 151645，<think> = 151667。
+#     它们在文本里写成一串字符，但tokenize时整体识别成一个id，而不会被拆成"<"、"|"、"im"……
+#   ③ chat template：模型仓库tokenizer配置里的一段Jinja模板，规定消息列表怎样拼成带特殊token的prompt：
 #
-# # Tools
-# ...<tools>{get_weather的JSON Schema}</tools>...<|im_end|>
-# "
-#     "<|im_start|>user
-# 北京天气？<|im_end|>
-# <|im_start|>assistant
-# "
-#   模板决定了：system prompt和工具说明放在哪、用什么标记分隔回合、assistant回合怎么开始；模型只在这个格式上被训练过，
-#   换一个模板（哪怕只差一个换行或角色标记）都可能明显降低质量，所以服务端必须用模型自带的模板（或--chat-template显式覆盖）
+#       messages = [{"role": "user", "content": "你好"}]
+#            │ apply_chat_template（add_generation_prompt=True：末尾补上assistant回合的开头，意思是"轮到你说了"）
+#            ▼
+#       "<|im_start|>user\n你好<|im_end|>\n<|im_start|>assistant\n"
+#            │ tokenize（在preprocess里做；每个特殊token变成一个id）
+#            ▼
+#       [151644, 872 "user", 198 "\n", …"你好"的几个id…, 151645, 198, 151644, 77091 "assistant", 198]
+#            │ 模型逐个预测下一个token
+#            ▼
+#       "你好！有什么可以帮你？" + <|im_end|>   ← 模型学会了用回合结束token收尾
+#
+#     回合结束token是tokenizer.eos_token_id或generation_config里声明的其他EOS之一，调度器生成到它就结束这条序列：
+#       是tokenizer.eos_token_id时leave_reason为"eos"，是其他EOS时为"stop_<token_id>"（对外都报finish_reason="stop"）
+#     带system和tools时，模板还决定system prompt和工具说明放在哪（Qwen风格：都放进system段；具体文本以模型模板为准）：
+#       "<|im_start|>system\n你是助手\n\n# Tools\n…<tools>{get_weather的JSON Schema}</tools>…<|im_end|>\n"
+#       "<|im_start|>user\n北京天气？<|im_end|>\n<|im_start|>assistant\n"
+#   ④ 为什么必须用模型自己的模板：模型在SFT/RLHF阶段见过的每条对话都是用这个模板拼的，角色标记、system prompt的位置、
+#     工具描述的写法、回合结束符都是它"学会"的格式（哪怕只差一个换行或角色标记都可能明显降低质量）。模板不匹配的典型后果：
+#     模型认不出角色边界，把自己当user接着写；输出的回合结束符不在stop_token_ids里，停不下来，一直写到max_tokens；
+#     system prompt或工具描述放错位置，指令遵循和工具调用质量明显下降。所以服务端用模型自带的模板（或--chat-template显式覆盖）
+#   ⑤ 渲染结果里的特殊token是以文本形式出现的，preprocess里tokenizer.encode会把它们识别回特殊token id；
+#     encode默认add_special_tokens=True，若模板文本本身已以BOS开头、tokenizer又自动加BOS，就会出现两个BOS
 # 本文件的函数：
 #   启动时：load_custom_message_encoder（找Python编码器）；chat_template_source / render_probe_prompt /
 #     resolve_reasoning_toggle（向模板"提问"：有哪些标记、怎样关掉推理）——结果由api_server.main存进全局变量

@@ -227,9 +227,28 @@ class EngineArgs:
     #   例：70B模型bf16权重约140GB，-tp 8后每卡约17.5GB；代价是每层1~2次all-reduce，卡越多通信占比越大。
     #   实现在 model_ops/linear.py（ColumnParallelLinear / RowParallelLinear 等）
     tensor_parallel_size: int = 1
+    # 【科普】MLA（Multi-head Latent Attention，DeepSeek-V2/V3、Kimi-K2、GLM-5等使用）——从MHA/GQA出发
+    #   MHA每个token每层缓存"头数"份K和V；GQA让几个q头共用一组K/V，缓存按KV头数算。MLA更进一步：K/V不直接缓存，
+    #   而是先把hidden压成一个所有头共用的低维"潜在向量"c（latent），只缓存c，用的时候再展开：
+    #
+    #       hidden ──kv_a_proj_with_mqa──┬─> c（kv_lora_rank=512维）─────┐ 每token每层只缓存这 512+64 = 576 个数
+    #                                    └─> k_rope（64维，所有头共用）──┘
+    #       用时：kv_b_proj 把 c 展开成每个头的 K_nope、V（decode时常把它"吸收"进q，直接在512维的c上算注意力）
+    #
+    #   例（DeepSeek-V3：128个头，K每头192维、V每头128维）：每token每层
+    #     MHA要存 128 x (192 + 128) = 40960 个数；MLA只存 576 个，约1/71
+    #   副作用：缓存里只剩"1个头"（所有q头读同一份c，相当于GQA的极端MQA），TP按头切不开它，于是有了下面的DCP
+    #   更完整的推导（RoPE为什么要单独拆出64维）见 atom/model_config/kimi_k25.py 文件头【科普】①；实现在 model_ops/attention_mla.py
     # 【分支】decode上下文并行（DCP）：把一个请求的KV按token切分到TP组内的多张卡上，必须整除TP
     # 【科普】为什么需要：MLA这类模型KV只有1个"头"，TP切head切不动KV，于是TP组里每张卡都存一整份KV（重复）。
     #   DCP让这几张卡各存一部分token的KV，各自算局部注意力，再用LSE合并结果。
+    #
+    #       -dcp 2（interleave_size=1，按token轮流分）：token 0 2 4 6 ... 的KV存卡0；token 1 3 5 7 ... 存卡1
+    #       每张卡：q 对自己那一半token做softmax注意力 -> 局部输出 o_i + lse_i
+    #
+    #   LSE（log-sum-exp）合并：lse_i = log Σexp(本卡各token的注意力分数)，即本卡softmax分母取log；
+    #     o = Σ exp(lse_i)·o_i / Σ exp(lse_i)，结果与在全部token上做一次softmax完全相同。
+    #     例：卡0 lse=ln3、o=1.0，卡1 lse=ln1、o=5.0 -> o = (3x1.0 + 1x5.0) / (3 + 1) = 2.0
     #   例：-tp 8 -dcp 8，每张卡只存1/8的token的KV，同样显存能放约8倍长的上下文；代价是每层多一次通信。
     #   不增加卡数（复用TP的卡）。实现见 distributed/dcp_utils.py、model_ops/dcp_ops.py，文档docs/context_parallel_guide.md
     decode_context_parallel_size: int = 1
@@ -302,6 +321,8 @@ class EngineArgs:
     # 【科普】DSA（DeepSeek Sparse Attention）：每个query不看全部历史token，而是先用一个很小的"索引器"
     #   给所有历史token打分，挑出top-k（如2048个）再做真正的注意力。索引器自己也要缓存每个token的key，
     #   这就是"索引缓存"，与主KV cache分开存放。实现见 model_ops/sparse_indexer_*.py 等
+    #   从MHA/GQA讲起、带图的入门见config.py glm5_kpool_block_size上方【科普】k-pool的②；
+    #   DeepSeek-V4的变体（先压缩、再在压缩行上选top-k，即CSA）见config.py __post_init__第12步V4部分的【科普】
     index_cache_dtype: str | None = None
     # 每个KV block容纳的token数（对比nano-vllm：nano-vllm默认256，ATOM默认16）
     #   block越小，内部碎片越少、前缀缓存的命中粒度越细，但block table越长、管理开销越大
@@ -327,6 +348,25 @@ class EngineArgs:
     #   调大：分段少、更快，但workspace显存更大；调小：反之。<=0时不分配workspace
     #   help里说"默认使用max_num_batched_tokens"，实际是两者默认值都等于16384，并不联动
     attn_prefill_chunk_size: int = 16384
+    # 【科普】每请求状态、状态checkpoint与SWA有界重放——为什么前缀缓存对这些模型不再是"白拿"
+    #   MHA/GQA：每个token每层的K/V各占一行、一直保留，前缀命中就直接复用那些行（见下面enable_prefix_caching）。
+    #   有两类层不是这样，它们只有一份"读到当前位置为止"的每请求状态，会被后面的token不断覆盖：
+    #     线性注意力（GDN：Qwen3-Next/Qwen3.5；KDA：Kimi）：每个头一个固定大小的状态矩阵，每来一个token更新一次
+    #     滑动窗口（SWA，DeepSeek-V4/V4.1，窗口128）：每个token只看最近128个token，每请求只留128行的环形缓冲区
+    #       （V4还有把相邻token压成一行的压缩器，它没凑满的那几个token也是这种状态）
+    #   所以命中第N个token时，KV行在，但"第N个token时的状态"已经没了，只能在一些位置事先存快照（状态checkpoint）：
+    #
+    #       prompt A（20000 token）:  0 ────────── 8192 ────────── 16384 ──────── 20000
+    #       状态checkpoint（间隔8192）:              ▲                ▲               ▲ prompt末尾锚点
+    #       prompt B与A共享前18432个token：KV block命中18432，但状态只能从最近的checkpoint 16384恢复，
+    #         所以B从16384开始prefill（复用16384个token，而不是18432个）
+    #
+    #   间隔越小，可恢复的位置越密，但每个checkpoint都要写一份状态，并让存它的prompt在那里多切一个prefill chunk
+    #     （多一次forward，见BlockManager.checkpointers_at的说明）
+    #   DeepSeek-V4.1的"encoder侧有界重放"换一种做法：不存checkpoint，命中时从命中点往前退一个hash block（128个token，
+    #     正好盖住窗口）重算这一小段来重建窗口状态。例：命中在10240 -> 从10112开始prefill。代价：重算出的窗口被截断，
+    #     数值与完整prefill不等价。"decoder侧有界重放"则是prefill时后半部分层只算每个请求最后128行
+    #     （两者详见docs/deepseek_v41_runtime.md的"Encoder / Decoder SWA bounded replay"）
     # 【分支】带每请求状态的模型（DeepSeek-V4、GDN等），每隔N个token保存一次状态checkpoint，
     #   以后前缀命中时可以从checkpoint恢复；0关闭，-1只在"有需要的位置"和prompt末尾保存，见第4批
     state_checkpoint_interval_tokens: int = 8192
@@ -443,6 +483,7 @@ class EngineArgs:
     #   _get_engine_kwargs里拆成enable_low_latency + moe_all2all_backend两个Config字段
     all2all_backend: str | None = None
     # MoE实现：standard（prepare/GEMM/finalize三段）或mega（FlyDSL融合的MegaMoE）
+    #   mega用一个融合kernel包办dispatch→GEMM→combine；FlyDSL / Triton / ASM这些kernel后端名词见envs.py的"科普·kernel后端"
     moe_backend: str = "standard"
 
     # ---------------- 投机解码（第7批） ----------------
@@ -465,6 +506,11 @@ class EngineArgs:
     #   mtp：用模型checkpoint自带的MTP（Multi-Token Prediction）层当草稿（DeepSeek-V3等）；
     #   eagle3：单独训练的EAGLE-3草稿小模型，复用大模型的hidden state；两者都由spec_decode/eagle_proposer.py实现。
     #   dspark：块并行一次出多个草稿token，实现在 spec_decode/dspark_proposer.py（选择逻辑见spec_decode/factory.py）
+    #   串行草稿与块并行草稿的区别（以要猜3个token为例）：
+    #     MTP / EAGLE3：草稿层跑3次，每次把上一次猜出的token喂回去   t -> 猜a -> 猜b -> 猜c      （3次草稿forward）
+    #     DSpark      ：3个待猜位置先填成noise token，草稿主干一次forward同时给出3个位置；
+    #                   位置之间的先后依赖交给一个很轻的Markov头（1次主干forward）。验证长度默认取checkpoint的
+    #                   dspark_block_size，开confidence_schedule后由置信度头为每个请求单独决定（见--dspark-config）
     method: str | None = None
     # 每步草稿模型自回归生成几个草稿token（MTP的k）
     #   调大：猜对时一步收获更多token；但接受率随位置递减，验证的计算量和KV预留都按k+1增长，
