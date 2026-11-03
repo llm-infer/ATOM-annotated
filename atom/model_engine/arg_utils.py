@@ -168,6 +168,23 @@ def _is_offload_connector(cfg: object) -> bool:
 
 # 引擎参数：每个字段对应一个命令行参数（--xxx-yyy 对应字段 xxx_yyy），默认值也与命令行一致
 # 大部分字段同名传给Config；含义和取值影响在这里说明，Config里不再重复
+#
+# 按目标挑起手配置（每组参数的细节见下面各分组开头的"适用场景"；这里是总览）：
+#   目标           主要动哪些参数                                              为什么
+#   低延迟         较小的--max-num-batched-tokens + --long-prefill-token-threshold   单步变短，长prefill不再挤占decode，ITL更平稳
+#   （ITL/TTFT）   --scheduler-delay-factor 0（默认）；投机解码 --method mtp       不攒批；投机解码让每步出多个token
+#                  -tp 取大一些                                                  单请求的算力更多
+#   高吞吐         --max-num-seqs、--max-num-batched-tokens 取大；-dp 多副本       decode读一遍权重服务更多序列，固定开销被摊薄
+#                  MoE：--enable-dp-attention --enable-expert-parallel           KV容量随卡数增长，并发上得去
+#   长上下文       --max-model-len、--kv_cache_dtype fp8、-dcp（MLA模型）          KV按token切/减半，同样显存放更多token
+#                  chunked prefill保持开启（默认）                               长prompt分多步算，不阻塞decode
+#   显存紧张       --gpu-memory-utilization、--kv_cache_dtype fp8、较小的           KV用fp8；激活buffer、CUDA Graph占用变小
+#                  --max-num-batched-tokens / --max-num-seqs / --cudagraph-capture-sizes
+#                  --online_quant_config（权重FP8/MXFP4）                        权重本身变小
+# 例（小模型、16GB卡、显存紧张，来自recipes/Qwen3-8B-FP8.md）：
+#   python -m atom.entrypoints.openai_server --model Qwen3-8B-FP8 --level 0 --kv_cache_dtype bf16 \
+#     --block-size 64 --max-model-len 19456 --gpu-memory-utilization 0.9 -tp 1
+#   该recipe特别说明：19456约是16GB上的上限，不要把--gpu-memory-utilization提到0.95
 @dataclass
 class EngineArgs:
     """Arguments for configuring the LLM Engine."""
@@ -175,12 +192,27 @@ class EngineArgs:
     # 【译】配置LLM引擎的参数。
 
     # ---------------- 模型 ----------------
+    # 适用场景：仓库里带自定义建模代码的模型（config.json的auto_map指向仓库里的.py）要加--trust-remote-code，
+    #   例如recipes/DSpark.md启动V4-Pro-DSpark时就带了它；只用ATOM自己实现的模型时可以不加
     # 模型的本地路径或HuggingFace名字（不在本地时会下载）
     model: str = "Qwen/Qwen3-0.6B"
     # 是否允许执行模型仓库里的自定义Python代码（transformers的trust_remote_code）
     trust_remote_code: bool = False
 
     # ---------------- 并行（第9批详解；第1~8批只需关心tensor_parallel_size） ----------------
+    # 适用场景/调优建议（各并行方式"切什么、代价、互斥限制"的对比表见config.py ParallelConfig上方）：
+    #   小模型（一张卡放得下）       -tp 1；要吞吐就 -dp N 起N份副本，而不是 -tp N（省掉all-reduce）
+    #   稠密中大模型                 -tp 取"权重 + 足够KV放得下"的最小值；tp越大单请求越快，但all-reduce占比越高
+    #   MoE大模型（DeepSeek/Kimi类）  -tp 8 --enable-dp-attention --enable-expert-parallel（高并发首选）
+    #   长上下文、KV放不下（MLA）     加 -dcp K（K整除tp），例如 -tp 4 -dcp 4
+    #   跨机                          多机DP（--data-parallel-size-local / --data-parallel-rank 等）或 -pp
+    #   例（均取自仓库里的recipe/文档）：
+    #     python -m atom.entrypoints.openai_server --model deepseek-ai/DeepSeek-V4-Pro --kv_cache_dtype fp8 -tp 8 \
+    #       --enable-expert-parallel --enable-dp-attention                    # recipes/DeepSeek-V4.md
+    #     ... --tensor-parallel-size 4 --decode-context-parallel-size 4        # recipes/Agentic-GLM-5.2.md（DCP）
+    #     节点0：python -m atom.entrypoints.openai_server --model <model> -tp 2 --data-parallel-size 8 --data-parallel-size-local 4 \
+    #       --data-parallel-rank 0 --data-parallel-master-ip 10.0.0.1 --data-parallel-base-port 29501
+    #     节点1：同上，但 --data-parallel-rank 4                               # docs/distributed_guide.md（2机x4个DP rank）
     # 张量并行（TP）：每层的权重切分到多张GPU，每张GPU一个ModelRunner进程，层内通过all-reduce合并结果
     # 【科普】直觉：Y = X·W，把W按列（或按行）切成tp份，每张卡只存、只算1/tp，再用通信把结果拼/加起来。
     #   注意力层按head切：例如32个head、-tp 8，每卡算4个head。
@@ -214,6 +246,22 @@ class EngineArgs:
     data_parallel_base_port: int | None = None
 
     # ---------------- 执行方式、KV cache、调度 ----------------
+    # 适用场景/调优建议：
+    #   参数                          延迟优先                      吞吐优先                     显存紧张 / 长上下文
+    #   --max-num-batched-tokens      调小（如2048~8192）           调大（默认16384或更大）       调小：激活buffer更小，KV多分一点
+    #   --long-prefill-token-threshold 设成几千，限制单条prefill    0（不限制）                   —
+    #   --max-num-seqs                按目标并发设，不必过大         大（默认512）                调小：sampling等buffer、CUDA Graph更少
+    #   --gpu-memory-utilization      0.9（默认）                   0.9~0.95（视同机其他进程）    不要贪高，留余量防OOM
+    #   --kv_cache_dtype              bf16或fp8                     fp8（并发翻倍）               fp8
+    #   --max-model-len               按业务最长请求设               同左                         它不决定KV大小，但决定能接纳多长的请求和
+    #                                                                                            block_table等buffer大小；长上下文时调大
+    #   --block-size                  16（默认）                     16~64                        —（V4/V4.1/GLM-5.3会被Config强制覆盖）
+    #   prefix caching                开（默认）；多轮/长系统提示词收益最大；压测随机prompt想测纯prefill时用--no-enable_prefix_caching
+    #   chunked prefill               开（默认）；关掉（--no-enable_chunked_prefill）后长prompt会独占整步
+    #   --enforce-eager               只在调试时开：不录CUDA Graph，decode会明显变慢
+    #   例：延迟优先 -> --max-num-batched-tokens 4096 --long-prefill-token-threshold 2048
+    #       长上下文 -> --max-model-len 131072 --kv_cache_dtype fp8（MLA模型再加 -dcp）
+    #   （GLM-5.2的agentic recipe用 --max-num-batched-tokens 2048 搭配MTP3和DCP4，属于延迟优先的取法）
     # 强制eager模式：不捕获CUDA Graph（调试时用，性能会明显下降）
     #   CUDA Graph是什么、为什么能加速decode，见config.py里CUDAGraphMode上方的【科普】
     #   注意：它只关CUDA Graph，不关torch.compile（--level仍生效）；CLAUDE.md提醒：被编译的函数里加调试代码
@@ -285,6 +333,8 @@ class EngineArgs:
     enable_chunked_prefill: bool = True
 
     # ---------------- 日志与统计 ----------------
+    # 调优建议：线上压测看状态行里的KV使用率和前缀命中率——KV使用率长期接近100%说明KV是瓶颈
+    #   （考虑fp8 KV、调高gpu_memory_utilization或减小max_num_seqs）；--throughput-log-interval调小可以看得更细
     # 是否周期性打印引擎状态行（running/waiting请求数、KV使用率、前缀缓存命中率、吞吐）
     enable_log_stats: bool = True
     # 状态行的打印间隔（秒）
@@ -293,6 +343,11 @@ class EngineArgs:
     cache_hit_rate_window: int = 1000
 
     # ---------------- 【分支】PP动态分块，见第9批 ----------------
+    # 适用场景：只在 -pp > 1 且有长prompt时有意义（Config._resolve_dynamic_chunking会在条件不满足时校验/降级）
+    #   例（docs/dynamic_chunking_guide.md）：
+    #     python -m atom.entrypoints.openai_server --model <model-path> --pipeline-parallel-size 4 --tensor-parallel-size 1 \
+    #       --max-model-len 262144 --max-num-batched-tokens 32768 --enable-dynamic-chunking \
+    #       --dynamic-chunking-smooth-factor 0.75 --dynamic-chunking-min-chunk-size 4096
     # 让PP下一个prefill请求的各个chunk耗时相等，缩短流水线的填充/排空时间（需要pp>1）
     enable_dynamic_chunking: bool = False
     # None defers to ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR, read only once the
@@ -315,6 +370,13 @@ class EngineArgs:
     gpu_memory_utilization: float = 0.9
 
     # ---------------- 编译与CUDA Graph（第5批） ----------------
+    # 适用场景/调优建议（各cudagraph_mode、各level的完整适用场景表见config.py CUDAGraphMode / CompilationLevel上方）：
+    #   开发调试：--enforce-eager（不录图）或 --level 0（不编译），启动快，便于加日志
+    #   生产默认：--level 3 --cudagraph-mode FULL；DeepSeek-V4.1只能FULL；DSpark用PIECEWISE（V4可用AF_PIECEWISE）
+    #   --cudagraph-capture-sizes：最大值不必超过max_num_seqs（超出的尺寸会被ModelRunner丢掉）；
+    #     并发集中在某段时把那段列密一些，减少padding。例：recipes/Agentic-GLM-5.2.md用 [1,2,4,8,16,24,...,256]
+    #     （16以后每隔8一档）；列表越长，启动录图越久、图占的显存越多
+    #   改了模型代码再重启前：rm -rf /root/.cache/atom/*（CLAUDE.md，否则可能静默用旧编译结果）
     # decode阶段捕获CUDA Graph的batch size列表（字符串形式，_get_engine_kwargs里解析成列表）
     #   运行时batch向上取整到最近的捕获尺寸并回放；超过最大值的batch以eager模式运行
     #   （向上取整用np.searchsorted，见utils/forward_context.py；例：实际9条序列 -> 补到16条回放）
@@ -331,6 +393,17 @@ class EngineArgs:
     load_dummy: str | None = None
 
     # ---------------- MoE与专家并行（第7批） ----------------
+    # 适用场景/调优建议：
+    #   --enable-expert-parallel   专家多的MoE、卡数>=8时；常与--enable-dp-attention同开
+    #   --all2all-backend          不传=auto（自动检测MORI）；prefill大batch用high-throughput，decode小batch用low-latency；
+    #                              没装MORI或排查问题时用rccl/none
+    #   --enable-tbo               通信占比高时（EP的all-to-all）：--enable-tbo只给prefill开，--enable-tbo all再加decode；
+    #                              batch太小时拆成两个微batch反而不划算
+    #   --eplb-enable / --fake-eplb 路由明显不均时开EPLB；--fake-eplb只用来测"完全均衡"的性能上限，输出无意义
+    #   --moe-backend mega         必须同时开EP，且不能配rccl（Config.__post_init__第1步会报错）
+    #   例（recipes/TBO.md，2卡）：
+    #     python -m atom.entrypoints.openai_server --model openai/gpt-oss-120b -tp 2 --gpu-memory-utilization 0.4 \
+    #       --enable-dp-attention --enable-expert-parallel --enable-tbo
     # 专家并行（EP）：MoE的专家分布到不同GPU上，token通过all-to-all发送到专家所在的GPU
     # 【科普】MoE：把Transformer的FFN换成很多个"专家"FFN，每个token由router只选其中top-k个（如256选8），
     #   参数量大但每个token的计算量小。EP：例如256个专家、8张卡，每卡放32个完整专家（而不是每个专家切成8份的TP）；
@@ -359,6 +432,17 @@ class EngineArgs:
     moe_backend: str = "standard"
 
     # ---------------- 投机解码（第7批） ----------------
+    # 适用场景/调优建议：
+    #   方法     什么时候选                                     k（--num-speculative-tokens）
+    #   mtp      checkpoint自带MTP层（DeepSeek-V3/GLM等）；不需要--draft-model   常用1~3（上限默认8）
+    #   eagle3   有单独训练好的EAGLE-3草稿模型；必须给--draft-model             上限默认4
+    #   dspark   块并行出草稿，V4自带草稿或独立草稿（Kimi-K3）                  recipe里用7
+    #   低并发/延迟优先时收益最大：decode本来就在空读权重，多验证几个token几乎免费；
+    #   高并发时batch已经把权重读取摊薄，验证的k+1倍计算开始变贵，收益变小，需要实测接受率
+    #   例：... --method mtp --num-speculative-tokens 3                         # recipes/Agentic-GLM-5.2.md
+    #       ... --method dspark --num-speculative-tokens 7 --cudagraph-mode PIECEWISE \
+    #           --enable-dp-attention --dspark-config '{"confidence_schedule": true, "ragged": true, "ragged_graph_sizes": "8"}'
+    #                                                                           # recipes/DSpark.md
     # 投机解码方法：mtp、eagle3、dspark；None表示不开启
     # 【科普】投机解码：decode每步只出1个token但要读一遍全部权重，很浪费。于是先用一个很小的"草稿模型"
     #   快速猜k个token，再让大模型一次forward同时验证这k个（相当于k+1个token的小prefill），猜对的全部接受。
@@ -1207,6 +1291,29 @@ class EngineArgs:
 
     # EngineArgs -> 传给LLMEngine的kwargs
     # 大部分字段同名透传；少数需要改名、解析字符串、或打包成子配置对象（CompilationConfig、SpeculativeConfig等）
+    # 转换总表（左边是EngineArgs字段，右边是返回的kwargs键；没列出的字段同名透传）：
+    #   ┌───────────────────────────────────────┬──────────────────────────────────────────────────────┐
+    #   │ EngineArgs字段                         │ kwargs里的样子                                        │
+    #   ├───────────────────────────────────────┼──────────────────────────────────────────────────────┤
+    #   │ model                                  │ 不进kwargs（create_engine作为第一个位置参数传）        │
+    #   │ block_size                             │ kv_cache_block_size（改名）                           │
+    #   │ level / cudagraph_mode / capture_sizes │ compilation_config = CompilationConfig(...)           │
+    #   │ method / num_speculative_tokens /      │ speculative_config = SpeculativeConfig(...)，         │
+    #   │   draft_model / spec_decode_*          │   method为空或k==0时为None                            │
+    #   │ enable_tbo（None/"prefill"/"all"）     │ enable_tbo + enable_tbo_decode 两个布尔               │
+    #   │ all2all_backend                        │ enable_low_latency + moe_all2all_backend              │
+    #   │ kv_transfer_config（+ATOM_KV_OFFLOAD）  │ kv_transfer_config（offload connector被并进去）       │
+    #   │ dspark_config                          │ dspark = DSparkConfig                                 │
+    #   │ eplb_config / dcp_config               │ EPLBConfig / DCPConfig 对象（同名键）                 │
+    #   │ data_parallel_*                        │ parallel_config = ParallelConfig(...)；               │
+    #   │                                        │   data_parallel_size同时保留在kwargs里（旧路径要读）   │
+    #   └───────────────────────────────────────┴──────────────────────────────────────────────────────┘
+    # 例：-tp 8 --block-size 16 --cudagraph-mode FULL --method mtp --num-speculative-tokens 3 --enable-tbo
+    #   -> {"tensor_parallel_size": 8, "kv_cache_block_size": 16,
+    #       "compilation_config": CompilationConfig(level=3, cudagraph_mode=CUDAGraphMode.FULL, capture_sizes=[1,...,512]),
+    #       "speculative_config": SpeculativeConfig(method="mtp", model=<目标模型路径>, num_speculative_tokens=3, ...),
+    #       "enable_tbo": True, "enable_tbo_decode": False, "enable_low_latency": False, "moe_all2all_backend": "auto", ...}
+    #   之后LLMEngine再按Config字段名过滤一遍，Config里没有的键（如data_parallel_size）在那里被丢掉
     def _get_engine_kwargs(self) -> dict:
         """Get common engine initialization kwargs.
 

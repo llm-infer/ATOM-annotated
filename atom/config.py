@@ -244,7 +244,7 @@ class KVCacheConfig:
 #   NONE                与FULL相同：走手动整图捕获                几乎不用；想真正关图请用--enforce-eager    —（原生ModelRunner不认NONE；只有
 #                       （ModelRunner不单独判断NONE）                                                     backends.py的copy_inputs分支看它）
 #   FULL                decode按capture_sizes录整张forward图      默认；多数模型的标准选择；                 好处：CPU launch开销最低，一次回放
-#                       prefill/混合batch走eager                  DeepSeek-V4.1必须用它（Engram stream       代价：attention kernel必须可录制；
+#                       prefill/混合batch不走图（仍跑编译后代码） DeepSeek-V4.1必须用它（Engram stream       代价：attention kernel必须可录制；
 #                                                                 fork/join要求整图），recipe里多数是FULL     超过最大capture size的batch退回eager
 #   PIECEWISE           按level 3切出的稠密片段各录各的图，        attention元数据形状多变、不宜整图录的场景， 好处：attention可以是任意eager实现
 #                       attention在片段之间eager运行；            如DSpark的ragged verify（recipes/DSpark.md  代价：每层attention仍有launch开销；
