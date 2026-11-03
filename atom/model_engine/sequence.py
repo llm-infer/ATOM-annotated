@@ -997,6 +997,9 @@ class Sequence:
         # DSpark是什么：一种"块"草稿器——不像MTP那样串行猜k个，而是一次并行forward猜出一整块草稿，
         #   再由一个置信度头预测"其中前几个值得验证"，于是每条请求可以验证不同的长度（recipes/DSpark.md）
         #   ell就是这个"值得验证的草稿数"：下一步这条序列验证ell+1个位置
+        # 观察：按代码，atom/ 里只有 scheduler.py 的 postprocess 写这个字段，没有任何地方读它
+        #   （上面英文注释和 dspark_verify.py 的 docstring 说"下一步按它定验证长度"，实际缩短每行验证长度的是
+        #   ModelRunner 一侧的 _dspark_apply_ragged）；读第7批 DSpark 时再核对
         self.dspark_next_ell: int | None = None
 
         # statistics fields
