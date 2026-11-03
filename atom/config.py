@@ -3712,11 +3712,17 @@ class Config:
                     self.hf_config, "rope_type", "default"
                 )
             self.hf_config.rope_parameters = rope_params
+        # 谁读 rope_parameters：模型文件建RotaryEmbedding时（例如qwen3.py取出rope_theta、rope_type等传给get_rope）、
+        #   ModelRunner（看有没有 mrope_section 判断是否多模态M-RoPE）、KV offload（rope设置进KV编码快照，见第9步）
 
         # ---------------- 第6步 ★ 停止token与量化配置 ----------------
         # generation_config.json里的eos_token_id可能是一个整数，也可能是列表；统一成列表放进stop_token_ids
         # := 是"海象运算符"（Python 3.8+）：在表达式里同时赋值和取值，这里把getattr的结果存进eos_ids再判断
         # 之后LLMEngine会从stop_token_ids里去掉tokenizer的eos_token_id（见eos_token_id字段的说明）
+        # 最终读者：Scheduler.__init__ 存为 self.stop_token_ids，每步postprocess检查新生成的token是否在其中，
+        #   在就结束这条序列（第3批）。为什么要读generation_config：很多chat模型有多个结束符
+        #   （例如<|im_end|>和<|endoftext|>），只靠tokenizer.eos_token_id会停不下来
+        # generation_config本身还被 openai/api_server.py 读取（/v1/messages、/v1/responses 取其中推荐的采样参数）
         self.generation_config = get_generation_config(self.model)
         if self.generation_config is not None and (
             (eos_ids := getattr(self.generation_config, "eos_token_id", None))
@@ -3735,6 +3741,9 @@ class Config:
         # 【译】插件模式下，如果HF量化config没有产生任何排除项（非quark的量化方法），就用vLLM的
         #   ignored_layers 补充 exclude_layers。
         # 【分支】插件模式，见第10批
+        # 为什么只在"空"时补：ATOM自己的解析器已经解析出排除项时以它为准；解析结果为空时
+        #   （英文注释说的非quark方法），用vLLM从同一checkpoint解析出的 ignored_layers 兜底，
+        #   避免lm_head等本该bf16的层被当成量化层
         if (
             self.plugin_config is not None
             and self.plugin_config.vllm_config is not None
@@ -3750,6 +3759,12 @@ class Config:
         # 例：--max-model-len 32768，模型max_position_embeddings=40960 -> 32768
         #     不传 -> 40960；传65536 -> 截断为40960
         # 对比nano-vllm：nano-vllm默认4096再取min；ATOM默认None表示"用模型的上限"
+        # 谁读max_model_len：
+        #   - Scheduler：拒绝prompt超过max_model_len的请求（block_table放不下，接纳时就拒绝，而不是跑到一半崩溃）
+        #   - ModelRunner / 各注意力backend：按它预分配block_table（每条序列 max_model_len / block_size 列）、
+        #     arange等buffer和CUDA Graph里的元数据buffer
+        #   - 本函数后面GLM-5.3的稀疏开关校验
+        #   所以它越大，常驻的元数据buffer越大；它不直接决定KV cache有多大（那由gpu_memory_utilization决定）
         hf_config_max_position_embeddings = getattr(
             self.hf_config, "max_position_embeddings", 8192
         )
@@ -3763,6 +3778,8 @@ class Config:
         #   放不进一步的长prompt由chunked prefill分多步算完）
         # assert self.max_num_batched_tokens >= self.max_model_len
         # 每步单请求的prefill上限必须在[一个block, max_model_len]之间
+        # 谁读：Scheduler 在chunked prefill时，把单条长prompt每步的chunk截到这个长度，
+        #   防止一条超长prompt独占整步token预算、饿死同一步里的其他请求和decode
         if self.long_prefill_token_threshold > 0:
             if self.long_prefill_token_threshold > self.max_model_len:
                 raise ValueError(
@@ -3777,6 +3794,9 @@ class Config:
                     f"kv_cache_block_size ({self.kv_cache_block_size})."
                 )
         # 非插件模式下，profiler目录不存在就创建（exist_ok=True：已存在不报错）
+        # 谁用这个目录：ModelRunner在下面按rank建子目录写trace（start/stop_profile时）；RapidServe时
+        #   CoreManager给prefill进程另配一个子目录。在Config构造时检查，路径不可用会在启动时就报错，
+        #   而不是等到抓trace时才发现
         if not is_plugin_mode():
             if self.torch_profiler_dir is not None:
                 os.makedirs(self.torch_profiler_dir, exist_ok=True)
@@ -3792,6 +3812,9 @@ class Config:
         #   torch compile的策略：插件模式（vllm）使用ATOM的编译策略
         #   cuda graph的捕获：插件模式（vllm）使用vLLM的cuda graph捕获策略
         # 条件：原生模式或vLLM插件，且level==3（PIECEWISE）。原生默认就是level 3，所以通常都会进来
+        # 这里填好的 splitting_ops / cudagraph_mode / compile_sizes 由 utils/backends.py（VllmBackend切图、
+        #   决定哪些尺寸提前编译）和 ModelRunner.capture_cudagraph（按什么模式录图）读取（第5批）
+        # SGLang/RTP-LLM插件不进来：它们用宿主框架自己的编译和图捕获
         if (
             not is_plugin_mode()
             or (self.plugin_config is not None and self.plugin_config.is_vllm)
@@ -3816,6 +3839,8 @@ class Config:
 
         # ---------------- 第9步 ★ 权重dtype与KV传输配置 ----------------
         # 模型权重的数据类型：HF config里声明了dtype就用它，否则bf16
+        # 注意它和QuantizationConfig.torch_dtype是分别从hf_config算出来的同一个值；
+        #   这里的给ModelRunner用：建模型前设成torch默认dtype、hidden states等buffer的dtype，各层也通过它分配激活buffer
         self.torch_dtype = (
             self.hf_config.dtype
             if getattr(self.hf_config, "dtype", None) is not None
@@ -3837,6 +3862,8 @@ class Config:
 
                 self.kv_transfer_config = ast.literal_eval(self.kv_transfer_config)
         # 【分支】KV offload：在Config发往各进程之前，给模型的cache几何参数拍一个快照，见第9批
+        # 这两个快照挂在Config上（未声明的属性），读取方是 kv_transfer/offload/config.py（建页命名空间）和
+        #   mooncake_store/keys.py（存储key）。命名空间对不上的后果是"永远不命中"，不报错，很难发现
         if self.kv_transfer_config:
             # The offload namespace hashes the model's cache geometry. A worker
             # normalises `hf_config` while it builds the model (Kimi-K3 derives
@@ -3862,6 +3889,7 @@ class Config:
             self.offload_kv_encoding = snapshot_kv_encoding(self.hf_config)
 
         # ---------------- 第10步【分支】动态分块prefill的校验/降级，见第9批 ----------------
+        # 放在这里是因为要用到前面已经确定的 pipeline_parallel_size、enable_chunked_prefill、kv_transfer_config
         self._resolve_dynamic_chunking()
 
         # ---------------- 第11步【分支】投机解码：num_speculative_tokens的上限，见第7批 ----------------
@@ -3870,6 +3898,9 @@ class Config:
         #   DSpark独立草稿：checkpoint的dspark_max_block，否则16
         #   DSpark内嵌草稿（V4）：草稿config的sliding_window，否则128
         # 例：--method mtp --num-speculative-tokens 10，checkpoint没声明上限 -> 10 > 8，报错
+        # 为什么在Config里校验：k决定了草稿模型的图形状、每条序列预留的KV slot数、CUDA Graph的捕获尺寸，
+        #   超限的k要么在建图/分配时深处报错，要么悄悄跑出很低的接受率；在启动入口拒绝最清楚
+        # 放在这里而不是SpeculativeConfig.__post_init__：上限要看草稿config经过hf_config_override之后的字段
         if self.speculative_config is not None:
             num_spec = self.speculative_config.num_speculative_tokens
             # getattr(..., lambda: False)()：对象没有use_dspark方法时，用一个返回False的匿名函数代替再调用
@@ -3931,6 +3962,9 @@ class Config:
         # 共同原因：BlockManager和slot_mapping都假定全局只有一个block_size，而这几个模型的kernel对它有硬要求，
         #   所以在Config里统一改掉，后面的调度器、BlockManager、ModelRunner读到的都是改后的值
         #   （用户传的--block-size会被静默覆盖，不报错也不警告）；V4.1的覆盖（128）在后面第13步
+        # 改后的 kv_cache_block_size 的读取方很多：BlockManager（block池、前缀缓存hash粒度）、调度器、
+        #   ModelRunner（block_table列数、slot_mapping）、各注意力backend（KV pool形状），
+        #   以及PD分离/KV offload的connector（两端必须用相同的block大小才能对齐地搬KV）
         # DeepSeek V4: paper §3.6.1 mandates classical KV cache block_size =
         # a multiple of lcm(m, m'). For V4-Pro / V4-Flash lcm(4, 128) = 128;
         # we use 2*lcm = 256 so each block holds k1=256/4=64 CSA entries — the
@@ -4039,6 +4073,9 @@ class Config:
         #   所以在大约 batch*context ~ 1M token以下是亏的。警告并回退而不是报错——这是一个性能开关，从不涉及正确性。
         #   运维用的环境变量覆盖优先于config字段，两个方向（开/关）都是。
         # 环境变量ATOM_M3_INDEXER_CP设置了就以它为准："1"开启，其他值关闭；没设置（None）时用dcp_config里的值
+        # 结果 dcp_config.indexer_dcp_only 的读取方：distributed/indexer_cp.py（运行时是否走CP）、
+        #   minimax_m3/model.py / linear.py（index_q投影要不要加宽）、本类的compute_hash（编译缓存key）
+        # 必须放在第5步之后：要用到 hf_config 的架构名、kv头数和 sparse_attention_config
         if envs.ATOM_M3_INDEXER_CP is not None:
             self.dcp_config.indexer_dcp_only = envs.ATOM_M3_INDEXER_CP == "1"
         if self.dcp_config.indexer_dcp_only:
@@ -4082,6 +4119,10 @@ class Config:
         # 【译】在模型架构确定之前一直保持 None，这样"没有指定索引缓存选项"仍能与"显式指定fp8/bf16"区分开。
         #   原生单节点的V4默认使用FP4索引器，gfx942除外。插件的代理pool和KV传输的区域映射还不能描述单独的
         #   FP4 scale pool，所以这些集成在其布局支持之前保留FP8。其他所有模型沿用历史默认值：跟随KV cache的dtype。
+        # index_cache_dtype 是DSA/CSA稀疏注意力的"索引器key缓存"（与主KV cache分开的一块pool）的格式。
+        # 谁读：各注意力backend（aiter_mla.py、deepseek_v41/backend.py、v4_kernels 等）按它分配索引pool并选打分kernel；
+        #   pool_layout/v4_pool_fields.py 按它算每个block的字节布局；KV offload（offload/config.py、keys.py、
+        #   kv_byte_codec.py）按它编解码、并编进存储key；compute_hash 也包含它
         # 决策表（只在用户没指定--index-cache-dtype时）：
         #   V4、原生、无KV传输：gfx942 -> fp8，其他 -> fp4；V4插件或有KV传输 -> fp8
         #   V4.1 -> fp8；其他模型 -> 等于kv_cache_dtype
@@ -4107,6 +4148,8 @@ class Config:
                 self.index_cache_dtype = self.kv_cache_dtype
 
         # DeepSeek-V4.1：block_size强制128，并设置有界重放所需的两个字段，最后交给V4.1自己的运行时校验
+        # 用model_type判断：V4.1的config由它自己的normalize_hf_config生成（get_hf_config路径1），
+        #   model_type固定为deepseek_v41_text，不像V4那样被_CONFIG_REGISTRY改写
         if self.hf_config.model_type == "deepseek_v41_text":
             # CSA2's index plane is paged by the same scorer GLM's is, so a
             # PAGE again has to hold a whole number of `MQA_LOGITS_PRESHUFFLE_ROWS`
@@ -4129,16 +4172,26 @@ class Config:
             #   越大则前缀复用越粗、重放的行越多，128是两者的折中
             self.kv_cache_block_size = 128
             # 这两个字段供BlockManager/调度器决定重放从哪里开始、带多少历史token（第4批）
+            #   min_final_prefill_rows：BlockManager.replay_start 读，前缀命中后最后一次prefill至少从
+            #     prompt末尾往前 sliding_window 行开始重算，SWA层才能拿到完整窗口（deepseek_v41/bounded_replay.py）
+            #   replay_history_tokens：Scheduler 读，重放时额外把开始位置之前这么多个token一起带上，
+            #     供Engram做n-gram查找（n-gram需要看前 n-1 个token）
             if self.enable_decoder_swa_bounded_replay:
                 self.min_final_prefill_rows = self.hf_config.sliding_window
             self.replay_history_tokens = self.hf_config.engram_max_ngram_size - 1
 
             from atom.models.deepseek_v41.config import validate_runtime_config
 
-            # 在加载权重之前拒绝V4.1尚未实现的执行模式（例如不支持的CUDA Graph模式）
+            # 在加载权重之前拒绝V4.1尚未实现的执行模式（不支持的CUDA Graph模式、torch.compile level 1/2、
+            #   PP、上下文并行、不带DP attention的DP/TBO、除lmcache_mp以外的KV传输等），
+            #   这样配置错误几秒内就报出来，而不是等几分钟加载完权重才失败
+            # 放在最后：它要检查的是本函数改写之后的最终值（block_size、cudagraph_mode等）
             validate_runtime_config(self)
 
         # DeepSeek-V4：根据窗口感受野算出state_replay_tokens（没设ATOM_DSV4_STATE_REPLAY或条件不满足时为0），第8批
+        # 读取方：BlockManager（为0时，背后没有状态checkpoint的前缀命中直接放弃；>0时从命中位置往前这么多token
+        #   开始重算来重建状态）、Scheduler、KV offload的 mp/native_state_* （决定状态能否按命中复用）
+        # 放在最后：state_replay_tokens(self) 要读本函数已经定下来的 kv_cache_block_size 等字段
         if is_deepseek_v4:
             from atom.model_ops.attentions.deepseek_v4_replay import (
                 state_replay_tokens,
@@ -4148,6 +4201,13 @@ class Config:
 
     # 动态分块prefill（PP专用）的校验与降级；调用方：__post_init__第10步
     # 先做"参数本身是否合法"的硬校验（raise），再看拓扑是否适用（不适用就警告并关掉）
+    # 动态分块是什么：PP下一个长prompt被切成多个chunk依次流过各stage；chunk越靠后，要attend的前缀越长、
+    #   算得越慢，固定chunk大小会让流水线出现气泡。动态分块按延迟模型给每个chunk算不同的大小，使各chunk耗时接近
+    # 结果的读取方：
+    #   enable_dynamic_chunking：EngineCore（启动时让ModelRunner做profiling，失败或非head stage时再关掉）、
+    #     Scheduler（_dynamic_chunk_limit）、dynamic_chunking_worker.py（运行时计时）
+    #   smooth_factor / min_chunk_size：Scheduler 求解chunk大小时用（平滑系数、chunk下限）
+    # 为什么"警告并关掉"而不是报错：它只是性能开关，同一份启动脚本可能跑在不适用的拓扑上
     def _resolve_dynamic_chunking(self) -> None:
         """Validate dynamic chunking, or turn it off where it cannot size a chunk.
 
@@ -4377,7 +4437,10 @@ def _get_current_atom_config_from_vllm_forward_context() -> Config | None:
 
 
 # 读取当前Config；在一个从未设置过的进程里调用会触发断言错误
-# 调用方：模型层、注意力后端、算子等，atom/下有几十个文件调用它
+# 调用方：模型层、注意力后端、算子等，atom/下约50个文件调用它（例如moe.py读EP/EPLB开关、
+#   deepseek_v2.py读dcp_config、eplb.py读eplb_config）
+# 注意：只在ModelRunner进程（或插件的模型进程）里能用；EngineCore、调度器所在进程没有调用过set，
+#   那里的代码应直接用传进来的config
 def get_current_atom_config() -> Config:
     # Try to get the atom config from forward context first in vLLM plugin mode.
     # 【译】vLLM插件模式下，先尝试从forward context里取atom config。
@@ -4393,7 +4456,8 @@ def get_current_atom_config() -> Config:
 # 用法：with use_custom_atom_config(draft_config): 构造草稿模型
 #   草稿模型的层构造时调用get_current_atom_config()，拿到的是草稿自己的Config（例如往它的
 #   static_forward_context里登记层），而不是主模型的
-# 调用方：vLLM、RTP-LLM插件构造草稿模型时（第10批）
+# 调用方：vLLM插件 model_wrapper.py 构造投机解码草稿模型时（第10批）——vLLM插件下主模型和草稿模型在同一进程，
+#   全局变量里是主模型的Config，不临时换掉的话草稿层会把自己登记到主模型的forward context里
 # @contextmanager：把一个带yield的生成器函数变成上下文管理器：yield之前的代码在进入with时执行，
 #   yield的值绑定到as后面的变量，finally里的代码在离开with时执行（即使块内抛了异常也会执行）
 @contextmanager
