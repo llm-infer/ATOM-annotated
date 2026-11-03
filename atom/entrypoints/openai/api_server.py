@@ -475,7 +475,8 @@ _stream_batch_dispatcher: StreamBatchDispatcher | None = None
 # 【译】当一次运行自己的文本没有意义时为 SYNTHETIC_TOKEN_TEXT，否则为None。
 #   两种投递方式共用这一个开关：它们在不同的地方解码，而一个因 stream 取值不同而读起来不一样的响应，
 #   正是推理内容读取器和工具调用读取器被统一时要消除的不对称。
-# 只有开启"强制投机接受"的压测选项时才不为None（见main()）
+# 只有开启"强制投机接受"的压测选项时才不为None（见main()）：草稿token不再与主模型比对，而是按设定的接受长度 / 接受率直接接受，
+#   用来在压测里固定投机解码的收益，生成的文本因此不是模型真正的输出（docs/forced_acceptance_length.md）
 synthetic_token_text: str | None = None
 
 

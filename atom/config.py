@@ -2266,6 +2266,7 @@ def _normalize_moe_config_fields(
 
 
 # 【分支】SpeculativeConfig：投机解码的子配置，挂在Config.speculative_config上（不开启时为None），第7批详解
+# 投机解码、MTP / EAGLE3（串行草稿）与DSpark（块并行草稿）的入门对比见arg_utils.py EngineArgs.method上方的【科普】
 # 来源：arg_utils.py的_get_engine_kwargs，在--method非空且--num-speculative-tokens>0时构造；
 #   MTP没有独立草稿模型，model填目标模型路径（MTP层就在目标checkpoint里）
 # __post_init__做三件事：

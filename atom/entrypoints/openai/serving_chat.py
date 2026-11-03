@@ -204,6 +204,8 @@ def _tool_parser_for_request(parser_cls, tools):
     #
     #   没有工具的请求不可能产生可派发的工具调用。对那些标记只用于打开工具调用区域的解析器，直接禁用，
     #   这样一个未闭合的标记仍是普通内容，而不会把流一直扣到EOS。消费全模型通道框架的解析器，在没有工具时也必须保持启用。
+    # 解释："通道框架"（channel framing）指像Kimi-K3那样包住每一个回答的特殊token（不论有没有工具调用），由工具解析器负责丢掉；
+    #   它的START_MARKERS里有不"打开工具区域"的标记（opens_region返回False），见tool_parser/tool_parser.py的opens_region
     if parser_cls is None or tools:
         return parser_cls
     consumes_channel_framing = any(
