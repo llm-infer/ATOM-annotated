@@ -1316,7 +1316,7 @@ class QuantizationConfig:
 
 
 # =====================================================================================
-# 【科普】什么是 k-pool？—— 从你熟悉的 MHA / GQA 出发，四步讲清楚
+# 【科普】什么是 k-pool？—— 从你熟悉的 MHA / GQA 出发，四步讲清楚（①′ 是前置知识 MLA）
 #   （GLM-5.3-Flash 的稀疏注意力索引器；模型实现见第8批 models/glm5_next.py，
 #    kernel 见 model_ops/glm5_next/kpool.py、indexer.py，数字取自 recipes/GLM-5.3-Flash.md）
 # =====================================================================================
@@ -1331,6 +1331,22 @@ class QuantizationConfig:
 #   GQA 只是让多个 q 头共用一组 K/V 头，省的是 KV cache 的显存，"每个 q 要看 L 个 token"这件事没变。
 #   上下文 L = 100万 时，每生成一个 token、每层都要读 100万 个 k/v —— 这是长上下文的主要开销。
 #
+# ①′ 前置：GLM-5.3 的"主注意力"不是 MHA/GQA，而是 MLA —— 下文说的"主 KV"指的就是它
+#   GLM-5.3 有 45 层：34 层是线性注意力 KDA（没有 KV cache，只有固定大小的状态），
+#   11 层（第 3、7、11 … 43 层）是 MLA + 稀疏索引器。k-pool 只出现在这 11 层里。
+#   MLA 一句话：不缓存每个头的 K、V，而是把 hidden 压成一个所有头共用的"潜在向量" c，只缓存 c，用时再展开成各头的 K、V。
+#
+#       MHA（假设 GLM-5.3 不用 MLA）：每 token 每层缓存  64 头 × (K 256 维 + V 256 维) = 32768 个数
+#       MLA（GLM-5.3 实际）         ：每 token 每层只缓存  c 512 维 + 64 维 = 576 个数      ← 约 1/57
+#                                     （多出的 64 维本来留给 RoPE；GLM-5.3 不用位置编码（NoPE），这 64 维恒为 0，
+#                                      只是为了凑成 ROCm MLA kernel 要求的 576 宽，见 models/glm5_next.py 的 _ROPE_PAD）
+#
+#   对理解 k-pool 来说，记住两点就够了：
+#     (a) 主 KV = 每个 token 一行 576 维的 c（bf16 时 1152 字节），按 block 分页存放；
+#     (b) 所有 q 头读的是同一份 c，相当于 GQA 的极端情况 MQA —— 所以 KV 已经很省，剩下的开销主要是"要读多少个 token"。
+#   MLA 的完整讲解（从 MHA/GQA 推导、为什么要单独拆出 RoPE 维、decode 时的"权重吸收"）见
+#   model_engine/arg_utils.py 中 EngineArgs.tensor_parallel_size 下方的【科普】MLA，以及 model_config/kimi_k25.py 文件头【科普】①。
+#
 # ② 稀疏注意力（DSA）：先"粗筛"，只对最相关的 2048 个 token 做真正的注意力
 #   想法：大多数历史 token 对当前 token 几乎没贡献。如果能便宜地挑出最相关的 top-k 个（这里 k = index_topk = 2048），
 #   主注意力就只在这 2048 个 token 上算，代价从"随 L 增长"变成固定的 2048。
@@ -1342,7 +1358,7 @@ class QuantizationConfig:
 #
 #       新token ──> 索引器：给 L 个历史 token 各打一个分（便宜：1个k头、128维、FP8）
 #                     │
-#                     └─> top-2048 的下标 ──> 主注意力（MLA）只读这 2048 个 token 的 KV（贵的部分被限住了）
+#                     └─> top-2048 的下标 ──> 主注意力（MLA，见①′）只读这 2048 个 token 的 c（贵的部分被限住了）
 #
 #   剩下的问题：索引器自己仍然要给"全部 L 个"token 打分、缓存"全部 L 个"索引 key —— 虽然便宜，仍随 L 线性增长。
 #
@@ -1369,6 +1385,12 @@ class QuantizationConfig:
 # ④ 这和 KV block 大小有什么关系？—— 就是下面这个函数要解决的
 #   索引 key 和主 KV 共用同一张 block_table（见文件开头【科普】分页 KV）：一个 KV block 装 B 个 token 的主 KV，
 #   同时也装这 B 个 token 对应的索引 key。池化后，这 B 个 token 只占 B / 4 行索引。
+#   以 B = 64、某一个 MLA 层为例，同一个 block 编号在两块缓存里各占一块：
+#
+#       block #7 ── 主 KV 缓存 ：64 行 × 576 维（每行 = 1 个 token 的 MLA 潜在向量 c，bf16 每行 1152 字节）
+#               └─ 索引 key 缓存：16 行 × 128 维（每行 = 1 个池 = 4 个 token 的池化索引 key，FP8 每行 128 字节 + 缩放因子）
+#
+#   可以看到索引 key 本来就比主 KV 小很多（128 字节 vs 1152 字节/token），池化后再降到约 32 字节/token。
 #   索引打分 kernel（deepgemm_fp8_paged_mqa_logits）按"每 16 行一组"的预重排（preshuffled）布局读每个 block，
 #   所以每个 block 的索引行数必须是 16 的倍数（MQA_LOGITS_PRESHUFFLE_ROWS = 16）：
 #
