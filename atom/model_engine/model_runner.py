@@ -1336,12 +1336,15 @@ class ModelRunner:
 
         # CUDA Graph的捕获档位（decode的batch size阶梯）。[0]是占位：还没录图（或enforce_eager）时只有0档，
         #   ForwardMode.decide找不到合适档位就走eager；capture_cudagraph录完后换成真正录到的档位（第5批capture_cudagraph）
+        # 【译】（行尾注释）用于退回eager
         self.capture_sizes = [0]  # for eager fallback
         # The same ladder as an ASCENDING int32 array, which is what
         # `ForwardMode.decide` searches. Separate from the list because the list
         # is re-sorted in both directions during capture; rebound (never
         # mutated) once capture narrows it, so a search cannot read a transient
         # order.
+        # 【译】同一个阶梯的*升序*int32数组，`ForwardMode.decide` 搜索的就是它。与列表分开存，是因为录图期间列表会被
+        #   正反两个方向重新排序；录图收窄档位后整体换一个新数组（从不原地修改），所以搜索不会读到一个中间状态的顺序。
         self.capture_sizes_np = np.asarray(self.capture_sizes, dtype=np.int32)
         # PIECEWISE cudagraph state, populated by capture_cudagraph. Empty when
         # capture never ran (enforce_eager), so the ragged-bucket paths no-op.
@@ -1354,7 +1357,8 @@ class ModelRunner:
         #   子进程忽略SIGINT（Ctrl+C交给主进程统一编排），收到SIGTERM时走exit()
         init_exit_handler(self)
         # 与nano-vllm相同的技巧：临时把默认dtype设成模型dtype、默认device设成本rank的GPU，
-        #   之后创建的模型参数、buffer直接以模型dtype建在GPU上，省去.to()拷贝；构造和预热结束后再恢复（见下面"Restore the implicit CPU default"）
+        #   之后创建的模型参数、buffer直接以模型dtype建在GPU上，省去.to()拷贝；构造和预热结束后默认device恢复为None
+        #   （见下面"Restore the implicit CPU default"；默认dtype则一直保持模型dtype，见那里的观察）
         default_dtype = self.config.torch_dtype
         torch.set_default_dtype(default_dtype)
         torch.set_default_device(self.device)
@@ -1544,6 +1548,8 @@ class ModelRunner:
         #   包括张量view以及Triton对指针/stride做特化时的查询。
         # 对比nano-vllm：nano-vllm在这里写的是torch.set_default_device("cpu")；ATOM改成None，原因就是上面这段：
         #   设成任何显式device都会让PyTorch在每次创建张量时多走一层DeviceContext分派，热路径上的开销不可忽略
+        # 观察：default_dtype取自config.torch_dtype，而不是进入__init__前的torch.get_default_dtype()，所以下面这句"恢复"
+        #   其实又设了一遍模型dtype——服务期间本进程的默认浮点dtype一直是模型dtype（如bf16）；nano-vllm则恢复成原来的值
         torch.set_default_device(None)
         torch.set_default_dtype(default_dtype)
 
@@ -1653,7 +1659,7 @@ class ModelRunner:
     #       TP组：{0,1,2,3}、{4,5,6,7}（每层的all-reduce在组内做）；DP组大小为2（按这种排布是{0,4}、{1,5}…）
     #   例2：单机 -pp 2 -tp 4：PP的每个stage是独立的EngineCore，engine_index = pp_rank，stage 1在GPU 4~7
     #   例3：-tp 4 --prefill-context-parallel-size 2：stage_span = 8，一个EngineCore带8个worker（进程数 = TP × PCP，不乘PP）
-    #   例4：2机×8卡 -dp 4 -tp 4：第2台机器上dp_rank=3（本机第1个DP，dp_rank_local=1）的TP rank 1 →
+    #   例4：2机×8卡 -dp 4 -tp 4（每台机器2个DP）：第2台机器上dp_rank=3（本机的第二个DP，dp_rank_local=1）的TP rank 1 →
     #       local_device_rank = 1×4+1 = 5（本机GPU 5），global_rank = 3×4+1 = 13
     #   各通信组（由aiter的init_dist_env / PP时的init_pp_aware_dist_env在world里划分；之后用get_tp_group()等取用）：
     #     TP组：每层线性层的all-reduce / all-gather；DP组：DP rank之间对齐token数（get_dp_padding、DPMetadata）；
@@ -2786,15 +2792,15 @@ class ModelRunner:
     #   变量                     怎么得到                                                                  例（GB）
     #   current                 分配器当前已分配的字节：权重 + forward_vars等常驻buffer                         70
     #   peak                    warmup开头reset_peak_memory_stats之后分配器的最高点 = 常驻 + 激活峰值             78
-    #   peak_torch              max(peak, current)                                                         78
+    #   peak_torch              取 max(peak, current)                                                      78
     #   non_torch               (total − free) − memory_reserved()：不经PyTorch分配器的显存——RCCL/aiter custom
     #                           all-reduce的缓冲、HIP运行时，以及同卡上其他进程占的                                ≈2
     #   cudagraph_overhead      _estimate_cudagraph_overhead()：FULL时 (peak − current) × 0.2                  1.6
-    #   safety_margin           total × 2%                                                                 3.84
-    #   non_kv_overhead         peak_torch + non_torch + cudagraph_overhead + safety_margin               85.44
+    #   safety_margin           整卡的 total × 2%                                                          3.84
+    #   non_kv_overhead         上面四项之和：peak_torch + non_torch + cudagraph_overhead + safety_margin  85.44
     #   available_for_kv_budget budget − non_kv_overhead − extra_reserve（RapidServe 8%）− connector_bytes   87.36
     #   free_for_kv             free − connector_bytes：物理上限，别的进程占着的显存不能算给KV                    ≈120
-    #   available_for_kv        min(available_for_kv_budget, free_for_kv)                                  87.36
+    #   available_for_kv        取 min(available_for_kv_budget, free_for_kv)                               87.36
     #
     # ② 一个block多少字节：不再是一个写死的公式，而是每个注意力builder声明的子池规格（sub_pool_specs）
     #   (a) MHA/GQA（aiter_attention.py + mha_kv_pool.py）：一个block = 本rank所有全注意力层的K、V（fp8时再加scale）
@@ -3306,6 +3312,8 @@ class ModelRunner:
         # hooks can access it without re-deriving from hf_config.
         # 【译】提升为self的属性，这样注意力builder的build_kv_cache_tensor()钩子不用再从hf_config推导就能拿到。
         self.num_kv_heads = num_kv_heads
+        # 【译】（行尾注释）下面为DeepSeek-V3.2设置
+        # 解释：实际由MLA builder的allocate_kv_cache_tensors返回、经_back_paged_pools setattr（DSA索引key每行的对齐宽度，如144）
         self.aligned_index_dim = None  # set below for DeepSeek-V3.2
 
         # Primary KV cache allocation: one buffer, one region per builder, each
@@ -3707,6 +3715,7 @@ class ModelRunner:
         # 【译】收缩要求上一个batch恰好就是这一组decode、顺序也相同（没有新序列/prefill序列，没有重排），因为下面每个请求的长度
         #   是从那个batch的 `num_bonus` 里读出来的。任何偏差 → 视为边界步。
         if prev_req is None or prev_req != cur_req:
+            # 【译】（行尾注释）边界步 / 顺序变了：跳过ragged，保持矩形
             return  # boundary / reorder step: skip ragged, stay rectangular
 
         # Positional, which is what the `prev_req == cur_req` guard buys: entry
@@ -3734,9 +3743,11 @@ class ModelRunner:
             old_nst[:scheduled_bs],
         )
         if new_len is None:
+            # 【译】（行尾注释）保持矩形
             return  # stay rectangular
 
         if not (new_len < old_nst[:scheduled_bs]).any():
+            # 【译】（行尾注释）这一步没有可缩的 → 用Phase-1（矩形）布局
             return  # nothing to shrink this step -> Phase-1 layout
 
         # q_eff, and the replay-shape feasibility check, BEFORE anything on the
@@ -3787,6 +3798,7 @@ class ModelRunner:
             #   回放反正是矩形的。落在*哪个*宽度不在这里问：`ForwardMode.decide` 按DP一致同意的总数来定，而在本rank自己的计数上
             #   再搜一次，正是两边曾经不一致的原因。那边没命中时这次run就eager执行，这也正是上面enforce_eager分支已经在做的。
             if not self._piecewise_cg_active():
+                # 【译】（行尾注释）保持矩形
                 return  # stay rectangular
 
         # Rebuild scheduled_tokens (flat) to the ragged per-seq layout: keep the

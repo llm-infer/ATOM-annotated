@@ -26,7 +26,8 @@
 #
 # ---------------------------------------------------------------------------------------------------------
 # 【前置①】TP 的列切与行切（概念的完整讲解见 arg_utils.py tensor_parallel_size 上方【科普】；实现在第 6 批 linear.py）
-#   nn.Linear 的权重存成 [out_features, in_features]，y = x · Wᵀ。以 Qwen3-8B（Llama-3-8B 形状相同）的注意力为例：
+#   nn.Linear 的权重存成 [out_features, in_features]，y = x · Wᵀ。以 Qwen3-8B（Llama-3-8B 形状相同）的注意力为例
+#   （这里先把 q_proj 当作独立的层；ATOM 实际把 q/k/v 融合成一个参数，见【前置②】）：
 #   hidden = 4096，32 个 q 头、8 个 KV 头（GQA），head_dim = 128；TP = 4：
 #     列切（ColumnParallelLinear，tp_dim = 0，切输出维 = 权重的行）：
 #       q_proj.weight [4096, 4096] → rank r 只存第 [1024r, 1024r+1024) 行 = [1024, 4096]，即第 8r ~ 8r+7 个 q 头
@@ -66,7 +67,7 @@
 #   共享专家也可以当作第 n_routed 个专家塞进同一个堆叠张量（名字改写成 experts.256.*，见 weight_names.py）
 #
 # ---------------------------------------------------------------------------------------------------------
-# 【全流程图】（左边是数据，右边是负责的代码）
+# 【全流程图】（顶格写的是流动的数据，`│` 后面是处理它的代码）
 #
 #   磁盘：model-00001-of-000163.safetensors …（每个分片 = 8 字节长度 + header(JSON：名字→dtype/shape/偏移) + 数据区）
 #     │  weight_iterator.safetensors_weights_iterator（主线程上的一个生成器）
@@ -130,8 +131,9 @@
 #   5 记账：_record 把 param_name 记进 loaded_weights_record；q_proj、v_proj 到达时写同一个参数的另外两段
 #   6 加载后处理：bf16 不量化时 LinearBase.process_weights_after_loading 不改它（只有量化权重才 shuffle 成 AITER 的布局）；
 #     配了在线量化时，在这一步才把整个 [1536, 4096] 量化成目标格式
-#   变体：KV 头数少于 tp 时（例如 8 个 KV 头、TP = 16）每卡放 1 个 KV 头、两张卡共用：num_kv_head_replicas = 2，
-#     shard_rank = tp_rank // 2，rank 0 和 rank 1 取的都是 checkpoint 的第 0 个 KV 头
+#   变体：KV 头数少于 tp 时（Llama-3-8B 的 8 个 KV 头、TP = 16；llama.py 允许，qwen3.py 断言 KV 头数能被 tp 整除、不允许）
+#     每卡放 1 个 KV 头、两张卡共用一个：num_kv_head_replicas = 2，shard_rank = tp_rank // 2，
+#     rank 0 和 rank 1 取的都是 checkpoint 的第 0 个 KV 头
 #   MoE 专家的对应例子（per expert 路径、专家暂存）见 weight_dispatch.py 文件头
 #
 # ---------------------------------------------------------------------------------------------------------
@@ -140,7 +142,8 @@
 #   真正的 weight_loader 在工作线程里跑：
 #     ・mmap 路径下 get_tensor 拿到的是映射在文件上的张量，真正读盘发生在 copy_ 第一次碰到这些页的时候（缺页）——
 #       多个线程同时 copy_，就同时有多个读请求在途，冷启动时更能把磁盘带宽用满
-#     ・从普通（pageable）内存拷到 GPU 对调用线程是同步的，而 PyTorch 在执行算子时释放 GIL，所以多个线程能真正并行
+#     ・从普通（pageable）内存拷到 GPU 对调用线程是同步的，而 PyTorch 的 Python 绑定在执行算子（包括 copy_）时释放 GIL，
+#       所以多个线程能真正并行
 #   规模（数字来自 loading_core.py 的源码注释）：DeepSeek-V3 / R1 每层 256 个专家 × 3 个投影，加上同样多的 scale，
 #     全模型约 9 万个专家张量
 #   代价：在途张量和暂存缓冲多占主机内存；设为 1 退回逐个顺序写入（也就关掉了下面的专家暂存），便于排查
@@ -148,8 +151,8 @@
 # 【要点②】专家暂存（expert_staging.py）
 #   逐专家的张量很小：V3、TP = 8 时每个专家的 gate_proj 本 rank 只有一片 [256, 7168] FP8 = 1.75 MiB，一个个 H2D 是
 #     延迟受限而不是带宽受限的。于是先拷进一块和整个堆叠参数一样大的 pinned（页锁定）CPU 缓冲，等本 rank 的路由专家
-#     都到齐（w13 要 2 × E_local 份、w2 要 E_local 份）再一次大拷贝写回 GPU
-#   例：V3、TP = 8，一层的 w13_weight 本 rank 有 256 × 512 × 7168 字节 ≈ 0.875 GiB（FP8）→ 512 次小拷贝变成 1 次
+#     都到齐（w13 要"本 rank 路由专家数 × 2"份 = gate + up，w2 要"路由专家数"份）再一次大拷贝写回 GPU
+#   例：V3、TP = 8，一层 w13_weight 的路由专家部分本 rank 有 256 × 512 × 7168 字节 ≈ 0.875 GiB（FP8）→ 512 次小拷贝变成 1 次
 #   只在开线程池时启用（loading_core.py：batching_enabled = executor is not None）
 #
 # 【要点③】流式在线量化（online_quant_streaming.py；ATOM_ONLINE_QUANT_STREAMING=1 才开，默认关）

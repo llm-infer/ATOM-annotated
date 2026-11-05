@@ -48,7 +48,8 @@ can still write around this protocol: producers must migrate with their buffers.
 #   只有一个 slot 的话，第 k+1 个微批要等第 k 个微批的 H2D 执行完，而那条 H2D 排在第 k-1 个微批的整个 forward 后面，
 #   CPU 的领先量就被压回 1 步。于是 ModelRunner._init_forward_vars_ring 给每个可能在途的微批一套独立的 forward_vars
 #   （CpuGpuBuffer.clone：pinned 端和 GPU 端都复制），每套一个 event、一个 PublicationOwner，轮流使用，CPU 最多领先 pp_size 步。
-#   本模块"不持有环"：环和 event 都属于 ModelRunner，这里只管单个 slot 内的规则。
+#   PP 下每个 slot 的 event 还会在用它的那次 forward 结束时再 record 一次（_record_forward_vars_event），所以一个 slot
+#   要等那次 forward 整个跑完才会被复用。本模块"不持有环"：环和 event 都属于 ModelRunner，这里只管单个 slot 内的规则。
 #     例：pp_size=4 → 4 套缓冲。按默认 max_num_batched_tokens=16384、max_num_seqs=512 估算每套里的几个大头：
 #       input_ids int32 [16385] ≈ 64 KiB、positions int64 [16384] = 128 KiB、slot_mapping int64 [16384] = 128 KiB、
 #       block_tables int32 [512, max_model_len/block_size]（max_model_len=32768、block_size=16 时 512×2048×4 B = 4 MiB），

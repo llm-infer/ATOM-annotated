@@ -208,7 +208,7 @@ class WeightDispatcher:
                 v, shard_id = packed_value
                 param_name = name.replace(k, v)
                 # FIXME output_scale has a value, so accuracy is incorrect. this should be loaded and used in llfp4.
-                # 【译】FIXME：output_scale 是有值的，所以（跳过它）精度不对。它应该被加载并在 llfp4 中使用
+                # 【译】FIXME：output_scale 是有值的，所以精度不对。它应该被加载并在 llfp4 中使用
                 #   （现状：名字含 output_scale 的张量在这里被直接跳过；_report_coverage 也把 output_scale 列为"无害的丢弃"）
                 if "output_scale" not in param_name:
                     param = self._parameter(orig_ckpt_name, param_name)
