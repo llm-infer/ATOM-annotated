@@ -62,9 +62,10 @@ each request's own span keeps that unexpressible.
 # 【导读】decode_input_ids.py：延迟输出下，decode 步的 input_ids 怎样直接由上一步留在 GPU 上的采样结果拼出来，不回 CPU
 #   调用方：model_runner.py tokenIDProcessor.prepare_input_ids 的 decode 路径（is_deferred_out 为 True 且有 prev_batch 时）；
 #     测试 tests/test_decode_input_ids.py 用下面的 CPU 参考实现验证性质
-#   前置：延迟输出（engine_core.py 文件头【3】）——第 N 步 forward 只等待并返回第 N-1 步的 token，第 N 步自己采到的
-#     sampled_token_ids 留在 GPU 上（另由 async_copy_stream 异步拷回），下一步才取。所以 CPU 准备第 N+1 步输入时，
-#     还没有第 N 步的 token：调度器写进序列 / scheduled_tokens 的只是占位（eos id，见 scheduler.py 文件头【前置②】）
+#   前置：延迟输出（原理见 engine_core.py 文件头【3】；GPU 侧怎样记下 prev_batch / prev_token_ids、怎样把每个请求分成
+#     deferred / new，见 model_runner.py tokenIDProcessor 上方【科普】）。要点：第 N 步 forward 只等待并返回第 N-1 步的 token，
+#     第 N 步自己采到的 sampled_token_ids 留在 GPU 上（另由 async_copy_stream 异步拷回），下一步才取。所以 CPU 准备第 N+1 步
+#     输入时，还没有第 N 步的 token：调度器写进序列 / scheduled_tokens 的只是占位（eos id，见 scheduler.py 文件头【前置②】）
 #   对比nano-vllm：nano-vllm 在 postprocess 里同步把 token 拷回 CPU、append 进序列，prepare_decode 再用 seq.last_token 建
 #     input_ids 并 H2D——CPU 必须等 GPU 算完才能准备下一步。ATOM 让 CPU 准备下一步时根本不需要知道 token 的值：
 #     input_ids 由这个 kernel 在 GPU 上从 prev_token_ids 拼出来，排在上一步采样 kernel 之后（同一条 stream）
@@ -86,10 +87,8 @@ each request's own span keeps that unexpressible.
 #
 #   width（要清零到哪）：调用方传 fill_to = max(本步 decode token 数, 图宽 × tokens_per_seq)。回放的图读固定的 running 行数，
 #     多出来的行不清零就是上一次 forward 留下的 id（PIECEWISE 路径另由 ModelRunner._padded_decode_inputs 清零）
-#   观察：调用方算图宽用的是 next(g for g in reversed(capture_sizes) if g >= bs)。capture_cudagraph 结束时 capture_sizes
-#     已排成升序（model_runner.py 中 self.capture_sizes.sort()），reversed 后从大到小，取到的是 ≥bs 的"最大"档位，而不是
-#     调用方注释里"65 个请求回放 128 的图"那种最小档位。效果只是多清零一些行（上例：512 × 2 → 清到第 1024 行，tail 仍只要
-#     1 个 program）；DP 下 running_bs 可能大于本 rank 的最小档位，按最大档位清零反而把那种情况也覆盖了。不影响正确性
+#   注意：调用方实际取的图宽是阶梯的最大档，而不是被回放的那一档（上例：512 × 2 → 清零 [8, 1024)，tail 仍只要 1 个 program）；
+#     不影响正确性。这条"观察"和理由（含 DP 下的情形）写在 model_runner.py tokenIDProcessor.prepare_input_ids 里 fill_to 的上方
 
 import torch
 import triton

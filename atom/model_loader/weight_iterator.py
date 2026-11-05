@@ -441,7 +441,7 @@ def safetensors_weights_iterator(
         # loader trailing the prefetchers instead of racing ahead of them.
         # 【译】现在才排序，并且下面按同样的顺序读。`glob` 返回的是目录顺序，在一次运行内足够稳定，但并不是承诺；
         #   而各 rank 必须完全一致，否则按步长的分工会漏掉分片。按同样的顺序读，还能让加载器跟在预读线程后面，而不是跑到它们前面
-        # 观察：不开预读时没有排序，读取顺序就是 glob 的目录顺序
+        # 注：不开预读时不排序，读取顺序就是 glob 的目录顺序（那时没有按步长的分工，各 rank 顺序不一致也无妨）
         hf_weights_files = sorted(hf_weights_files)
         _start_prefetch(
             hf_weights_files,

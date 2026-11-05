@@ -1813,7 +1813,7 @@ def get_current_cudagraph_runtime_mode() -> CUDAGraphMode:
 # set_forward_context：把模块级全局换成本步新建的 ForwardContext
 #   调用方：ModelRunner.prepare_inputs（每个真实的步一次；DP dummy 也走 forward，同样经过这里）、capture_cudagraph 的
 #     各录制循环（in_hipgraph=True，每个尺寸一次）、spec_decode/drafter.py、插件（rtpllm / SGLang / vLLM bridge，第10批）
-#     （TBO 微批不调它，而是用下面的线程局部上下文）
+#     （TBO 微批不调它，而是用上面 get_forward_context 之前定义的线程局部上下文 _forward_context_local）
 #   参数：
 #     attn_metadata         builder 刚建好的 AttentionMetaData
 #     atom_config           全局 Config（读 parallel_config、compilation_config.static_forward_context）

@@ -150,7 +150,8 @@
 #
 # 【要点②】专家暂存（expert_staging.py）
 #   逐专家的张量很小：V3、TP = 8 时每个专家的 gate_proj 本 rank 只有一片 [256, 7168] FP8 = 1.75 MiB，一个个 H2D 是
-#     延迟受限而不是带宽受限的。于是先拷进一块和整个堆叠参数一样大的 pinned（页锁定）CPU 缓冲，等本 rank 的路由专家
+#     延迟受限而不是带宽受限的。于是先拷进一块和整个堆叠参数一样大的 pinned（锁页，见 utils/__init__.py 的"科普·锁页内存与
+#     stream"）CPU 缓冲，等本 rank 的路由专家
 #     都到齐（w13 要"本 rank 路由专家数 × 2"份 = gate + up，w2 要"路由专家数"份）再一次大拷贝写回 GPU
 #   例：V3、TP = 8，一层 w13_weight 的路由专家部分本 rank 有 256 × 512 × 7168 字节 ≈ 0.875 GiB（FP8）→ 512 次小拷贝变成 1 次
 #   只在开线程池时启用（loading_core.py：batching_enabled = executor is not None）
@@ -167,9 +168,11 @@
 #     有些模块认领不了，退回加载后处理（这些模块不省显存；日志会报 fallback 数）
 #
 # 【要点④】假权重（--load_dummy，见 arg_utils.py）
-#   不读 checkpoint（loading_core.py 让迭代器的"想要"判断恒为 False），参数保持构造时的样子：
+#   不读任何张量数据（loading_core.py 让迭代器的"想要"判断恒为 False；但路径不是本地目录时仍会下载，每个分片的 header
+#     也仍会读一次，见 loading_core.py 中 verify_shard_files_present 调用处的观察），参数保持构造时的样子：
 #     empty（只写 --load_dummy）= torch.empty 的随机内容，可能有 NaN / Inf；zero / xavier 由 initialize_dummy_weights 填有限值
 #   用途：没有 checkpoint、只测性能 / 显存 / 启动流程；生成的文字没有意义
+#   注意：与流式在线量化同时开时，建在 meta 上的流式参数不会被实体化（见 load_model 第 3 步的观察）
 #
 # ---------------------------------------------------------------------------------------------------------
 # 对比nano-vllm（utils/loader.py，约 30 行）：
@@ -314,9 +317,10 @@ def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
         # 【译】无法解决的形状不匹配——让目标参数停在初始化值几乎总是 bug。load_model() 加载后的检查会发现并告警
         #   （这个 loader 从没写过它，所以参数会出现在 `unloaded` 集合里）。这里抛异常，让失败在拷贝时就大声暴露，
         #   而不是被 RMSNorm 等默认的全 1 初始化掩盖
-        # 观察：括号里的说法与 v0.1.8 的实现不符——WeightDispatcher 在 submit 之后立刻 _record（不论 loader 成功与否），
-        #   所以参数不会出现在 unloaded 里；而且这里一抛异常整个加载就中止（多线程时由 loading_core 排空 futures 时的
-        #   future.result() 重新抛出），走不到覆盖率检查。真正起作用的就是这个 raise
+        # 观察：括号里的说法与 v0.1.8 的实现不符：① 那个检查在 loading_core._report_coverage，不在 load_model；② 它按
+        #   loaded_weights_record 判断，而 WeightDispatcher 提交写入任务后就 _record（多线程时 loader 还没跑）；③ 更关键的是
+        #   这里一抛异常整个加载就中止——单线程时当场抛出，多线程时在 loading_core 排空 futures 的 future.result() 处重新抛出——
+        #   根本走不到覆盖率检查。真正起作用的只有这个 raise
         raise RuntimeError(
             f"default_weight_loader: shape mismatch on {_weight_identity(param)} — "
             f"param={tuple(param.shape)} "

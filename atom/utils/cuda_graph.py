@@ -5,17 +5,14 @@
 #   改编自 vLLM 的 vllm/compilation/cuda_graph.py（见上面的版权头和下面被注释掉的 vLLM import），
 #   ATOM 另加了：按 num_tokens 分桶的内存池、StableOutputs、给 attention 核心单独录图的 CudagraphCaptureRunner
 #
-# 前置：CUDA Graph 回放要求什么（要点；完整科普见 config.py 中 CUDAGraphMode 上方的【科普】②④）
-#   录制（capture）时 GPU 并不执行，只把一串 kernel launch 连同每个 kernel 读写的显存地址、张量形状记下来；
-#   回放（replay）时一条命令把它们原样再发一遍。所以：
-#     ① 地址固定：回放读写的是录制时那几块显存——新数据必须拷进同一块 buffer，换一个新张量 graph 是看不到的
-#     ② 形状固定：每种尺寸单独录一张图，运行时把 batch 补齐（padding）到最近的已录尺寸
-#        例：录了 num_tokens ∈ {1, 2, 4, 8, 16, …}，这一步 5 个 token → 补到 8，后 3 行是填充
-#     ③ 录制期间新分配的中间张量来自这张图的"私有内存池"（graph pool），回放时重复使用同样的位置；
-#        几张不会同时回放的图可以共用一个池（nano-vllm 从大到小录，所有 decode 图共用一个池）
+# 前置（只列本文件要用的三条要点。概念见 config.py 中 CUDAGraphMode 上方的【科普】②④；录哪些尺寸、录制顺序
+#   （从大到小录、录完再排回升序）、FULL 整图共用的内存池见 model_runner.py capture_cudagraph 上方的说明）：
+#   ① 地址固定：回放读写的是录制时那几块显存，新数据必须拷进同一块 buffer
+#   ② 形状固定：每种 num_tokens 单独录一张，运行时补齐到能装下它的最小已录尺寸（ForwardMode.decide）
+#   ③ 录制期间新分配的中间张量来自图的私有内存池（graph pool），回放时复用同样的位置；不会同时回放的图可以共用一个池
 #
 # ATOM 的两条录制路径（由 ModelRunner._piecewise_cg_active() 决定，读的是 --cudagraph-mode）
-#   手动整图（FULL，默认）：ModelRunner.capture_cudagraph 自己用 torch.cuda.graph 录整个 forward，
+#   手动整图（FULL，默认；原生下 --cudagraph-mode NONE 也走这条）：ModelRunner.capture_cudagraph 自己用 torch.cuda.graph 录整个 forward，
 #     存进 runner.graphs[(bs, max_q_len)]，所有图共用 runner.graph_pool——和 nano-vllm 一样，不经过本文件
 #   逐段（PIECEWISE / FULL_AND_PIECEWISE / AF_PIECEWISE，需要 --level 3）：编译后端在切分算子（通常是 attention；
 #     DeepSeek-V4 是压缩器 v4_attn_compress）处把模型切成若干段，backends.py 的 PiecewiseCompileInterpreter 把每个编译好的
@@ -33,7 +30,8 @@
 #     第 0 层切分算子（eager 运行，每步都由 CPU 发射；AF_PIECEWISE 下可以有自己的图，见 attn_ffn_piecewise.py）
 #       │ 它的输出就是下一段的输入。下一段录制时记住了这个地址，回放时它必须还在原地：
 #       │ __call__ 每次回放前逐个比对张量参数的地址（is_debugging_mode 恒为 True），对不上就报错；
-#       │ piecewise_core 的输出用 StableOutputs 拷进固定 slot 来满足这一点
+#       │ 设计上由 piecewise_core 把切分算子的输出拷进 StableOutputs 的固定 slot 来满足这一点，但 v0.1.8 没有构造它的地方
+#       │ （唯一的使用者 V4 的切分算子不返回值，见下面类表 StableOutputs 一行）
 #       ▼
 #     [段 1：第 0 层余下部分（o_proj、MLP…）+ 第 1 层切分算子之前的部分]   CUDAGraphWrapper#1 → replay
 #       ⋮

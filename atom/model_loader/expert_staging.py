@@ -41,9 +41,9 @@ runner.
 #    走不走暂存；flush_staged 把暂存的区域写回参数）
 #
 # 【导读】expert_staging.py：loader.py 文件头【要点②】的实现。前置：MoE 专家堆成 [E, ...] 见 loader.py 文件头【前置③】
-#   前置：pinned（页锁定）内存。普通（pageable）的 CPU 内存可能被操作系统换出，GPU 的 DMA 引擎不能直接读它，所以从 pageable 内存
-#     做 H2D 时，驱动要先把数据拷进一块内部的 pinned 中转区再传——每次拷贝都有这份固定开销；pinned 内存则可以直接 DMA。
-#     代价是分配 pinned 内存很慢（源码注释实测约 4 GB/s），而且占的是不可换出的物理内存
+#   前置：pinned（锁页）内存——GPU 能直接 DMA 读取、不必经驱动内部中转区的 CPU 内存，概念见 utils/__init__.py 中
+#     _PAGEABLE_H2D_LIMIT 上方的"科普·锁页内存与stream"。这里要用到它的代价：分配 pinned 内存很慢（源码注释实测约 4 GB/s），
+#     而且占的是不可换出的物理内存
 #   使用者：loading_core 构造一个 ExpertStagingPool（传入"参数全名 → 所属模块"的查找函数）；weight_dispatch 的 per expert 路径
 #     对可暂存的参数提交 stage 任务（在工作线程里并发执行），fused / merged 路径写参数之前先 decline；loading_core 收尾时调
 #     flush_pending。协议的实现方：FusedMoE（moe.py，第 7 批）。单元测试：tests/test_model_loader_staging.py

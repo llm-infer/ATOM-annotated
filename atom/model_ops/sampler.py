@@ -42,9 +42,8 @@
 #   例（V=5，沿用 sampling_params.py 的 logits=[3, 2, 1, 0.5, -1]，T=1 → p ≈ [0.624, 0.229, 0.084, 0.051, 0.011]）：
 #     抽到 E = [0.9, 0.2, 1.5, 0.05, 2.0] → p/E ≈ [0.69, 1.15, 0.06, 1.02, 0.01] → 选 1 号
 #     换一组 E 再抽，选中 0 号的频率趋于 0.624、1 号趋于 0.229……
-#   对比nano-vllm：layers/sampler.py 用的是同一技巧（softmax → probs.div_(exponential_) → argmax），
-#     但它每步为 [B, V] 的每个元素各抽一个 E，且只有温度；ATOM 默认整批共用一行 E（见 _temperature_sample），
-#     并多了 top-k / top-p、贪心行、投机解码验证
+#   对比nano-vllm：layers/sampler.py 用的是同一技巧（softmax → probs.div_(exponential_) → argmax），但每步为 [B, V] 的
+#     每个元素各抽一个 E；ATOM 默认整批共用一行 E（见 _temperature_sample）。其余差别见文件头末尾的"对比nano-vllm"
 #
 # 【科普】② 为什么本文件处处避开"在 Python 里读 GPU 上的值"
 #   前置：GPU 异步执行、stream 和同步点，见 engine_core.py 文件开头【3】
@@ -173,7 +172,8 @@ def get_per_token_exponential(vocab_size: int, device) -> torch.Tensor:
     #   并没有缓存，每步都是新的噪声。它真正带来的性质是：
     #   ① 每步只消耗 V 个随机数，与 batch 大小无关，随机数流的推进不受 batch 组成影响；
     #   ② 同一步里所有行读同一行 E，某一行的结果只取决于它自己的 logits、温度和这一步的 E，与它排第几行、batch 有几行无关
-    #   推理路径里没有调用 torch.manual_seed（grep 只在两个 _selftest 里找到），用的是 PyTorch 默认生成器的默认种子
+    #   推理路径里没有调用 torch.manual_seed（grep 只在两个 _selftest 里找到；rejection_sampler.py 只给合成接受率用的
+    #   独立 generator 设种子），用的是 PyTorch 默认生成器的默认种子
     #   代价：同一步里 logits 和温度都相同的两行（n>1 的兄弟序列）必然采到同一个 token，所以它们要用独立噪声
     return torch.empty((1, vocab_size), dtype=torch.float, device=device).exponential_(
         1

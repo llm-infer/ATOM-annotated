@@ -402,9 +402,10 @@ def _split_judge_func(node: fx.Node) -> bool:
 # 输出：(split_gm, [SplitItem…])：split_gm 是一个新的 GraphModule，它的 forward 依次调用 submod_0、submod_1……；
 #   列表按子图号排好序
 # 观察：ops 参数在函数体里没有被用到，切不切只看节点 target 上的 spliting_op 属性（_split_judge_func）。
-#   Config 在 level 3 下填的 splitting_ops（"aiter.unified_attention_with_output"、"aiter.mla_attention" 等，见 config.py
-#   set_splitting_ops_for_v1）与实际注册的切分算子名（如 aiter.unified_attention_with_output_base）也对不上——
-#   这个列表在 ATOM 里只是摆设，改它不会改变切图
+#   Config 在 level 3 下填的 splitting_ops（config.py set_splitting_ops_for_v1 的 4 项）里，原生的两项
+#   "aiter.unified_attention_with_output"、"aiter.mla_attention" 与实际注册的切分算子名（如 aiter.unified_attention_with_output_base）
+#   也对不上（只有 vLLM 插件的 atom_vllm_mha_attention / atom_vllm_mla_attention 两项名字一致）——这个列表在 ATOM 里只是摆设，
+#   改它不会改变切图；level 2 时它是 None，切图照样按 spliting_op 属性进行
 # 调用方：VllmBackend.__call__ 第③步
 #
 # 切分算法：按节点顺序扫一遍，给每个节点一个子图号 subgraph_id；遇到切分点，它独占一个号，前后的普通节点各自成段。

@@ -129,7 +129,7 @@ from atom.utils.tbo import (
 #        → 按support_model_arch_dict选模型类，构造并加载本rank的权重分片（model_loader/，5c）→ 【分支】草稿模型（第7批）
 #        → 常驻输入/输出缓冲（CpuGpuBuffer：锁页CPU + GPU各一份，CUDA Graph要求地址固定）、注意力元数据builder（5b、第6批）
 #        → warmup_model：一次最大的假prefill，测出激活峰值；@support_torch_compile的模型在这第一次调用时由Dynamo抓图、编译
-#        （utils/decorators.py，5e）。__init__内部的①~⑧步见ModelRunner类上方的生命周期图
+#        （utils/decorators.py，5e）。__init__内部的①~⑧步见ModelRunner类上方的框图
 #   ② 显存与KV（EngineCore →）
 #        get_num_blocks                   显存预算 → 能放多少个KV block（及各子池条目数）；EngineCore把它回填进自己的config
 #        allocate_kv_cache(num_blocks)    分配一块KV池，按各builder的声明切成区域，再把每层的视图绑到对应的attention模块
@@ -164,9 +164,11 @@ from atom.utils.tbo import (
 #   └─ ScheduledBatchOutput(req_ids, token_ids, draft_token_ids, is_deferred_out, num_rejected, num_bonus, logprobs)
 #        └─► rank 0的这份回到EngineCore → scheduler.postprocess（覆盖占位token、判停，scheduler.py）
 #
-# 阅读路线（按函数名定位；★ = 主干A级，【分支】= B级入口，括号里是讲透它的批次）
-#   第一遍建议：本文件头 → tokenIDProcessor上方的【科普】 → __init__ → warmup_model → get_num_blocks → allocate_kv_cache
+# 阅读路线（全文件只有这一份；类和各方法上方只留指针。按函数名定位；★ = 主干A级，【分支】= B级入口，括号里是讲透它的批次）
+#   第一遍建议：本文件头 → tokenIDProcessor上方的【科普】 → __init__（ModelRunner类上方的①~⑧框图；其中的
+#     _setup_device_and_distributed、allocate_forward_vars）→ warmup_model → get_num_blocks（显存预算条）→ allocate_kv_cache
 #     → forward → prepare_model → prepare_inputs → run_model → postprocess → capture_cudagraph
+#   第二遍：每步的输入buffer怎样安全复用——_init_forward_vars_ring → _init_h2d_publication → _gate_staging_reuse；标【分支】的都可跳过
 #   第0部分 模块级：★support_model_arch_dict、★max_schedulable_decode_bs、★TokenLocations、★tokenIDProcessor；
 #     【分支】mono_decode_installers（Mono融合decode，第9批）、_profile_runner_stage（profiler打标签，第10批）
 #   第1部分 构造与退出：★__init__、_build_and_load_model、_maybe_warmup、_setup_device_and_distributed、exit；
@@ -174,24 +176,32 @@ from atom.utils.tbo import (
 #   第2部分 预热与常驻缓冲：★warmup_model、warmup_max_tokens、allocate_forward_vars、_init_forward_vars_ring、
 #     _init_h2d_publication、_advance_forward_vars、_gate_staging_reuse、_mark_staging_h2d_enqueued、_record_forward_vars_event；
 #     【分支】dummy_execution（DP陪跑，第2、9批）、profile_dynamic_chunking / take_dynamic_chunking_fit（第9批）
-#   第3部分 显存预算与KV：★_estimate_cudagraph_overhead、get_num_blocks、_sub_pool_specs、_state_pool_names、
-#     _carve_paged_pool、_back_paged_pools、allocate_kv_cache、freeze_gc_heap；【分支】draft_shares_kv_pool（草稿的KV，第7批）
+#   第3部分 显存预算与KV：★_estimate_cudagraph_overhead、get_num_blocks、_kv_budget_extra_reserve、_sub_pool_specs、
+#     _state_pool_names、_carve_paged_pool、_back_paged_pools、allocate_kv_cache、freeze_gc_heap；
+#     【分支】draft_shares_kv_pool（草稿的KV，第7批）
 #   第4部分 每步准备输入：★prepare_model、prepare_sample、prepare_inputs；【分支】get_dp_padding（DP）、
 #     _maybe_create_tbo_slices / _local_tbo_eligibility（TBO，第9批）、_dspark_apply_q_bucket / _dspark_apply_ragged /
 #     _verifies_drafts（投机解码，第7批）
-#   第5部分 forward与输出：★run_model、postprocess、forward；【分支】_build_pcp_balanced_slices等（PCP，第9批）、
+#   第5部分 forward与输出：★run_model（含_padded_decode_inputs）、postprocess、forward；【分支】_build_pcp_balanced_slices等（PCP，第9批）、
 #     _setup_pp_shared_indexer / flush_pp_send（PP，第9批）、process_kvconnector_output / async_proc_aggregation /
 #     _record_kv_cache_ready（KV传输，第9批）、propose_draft_token_ids（第7批）
 #   第6部分 CUDA Graph：★capture_cudagraph、_piecewise_cg_active、_piecewise_skip_capture、_piecewise_per_token_bytes；
-#     【分支】_capture_attn_ffn_graphs、_dspark_capture_q_buckets、_maybe_calibrate_dspark_sps、start_capture_profiler
+#     【分支】_force_aiter_unreg_capture_for_piecewise、_capture_attn_ffn_graphs、_dspark_capture_q_buckets、
+#     _maybe_calibrate_dspark_sps、start_capture_profiler
 #   第7部分 【分支】RapidServeModelRunner：同一组GPU上的prefill/decode分离（第9批）
-#   前置概念（本文件不重复讲）：
-#     连续批处理、prefill计算受限/decode带宽受限、延迟输出概要、为什么一个rank一个进程 → engine_core.py文件开头【1】~【4】
-#     分页KV、block_table、slot_mapping → config.py文件开头的【科普】KV cache与分页（paged）KV
-#     CUDA Graph、torch.compile、piecewise → config.py中CUDAGraphMode上方的【科普】①~④
+#   前置概念（本文件不重复讲，用到的地方只写一句要点 + 指针）：
+#     连续批处理、prefill计算受限/decode带宽受限、延迟输出的原理、为什么一个rank一个进程 → engine_core.py文件开头【1】~【4】
+#       （延迟输出的GPU侧实现在本文件tokenIDProcessor上方的【科普】）
+#     GPU异步执行、stream、event与同步点 → engine_core.py文件开头【3】的"前置：GPU的异步执行与stream"
+#     锁页（pinned）内存 → utils/__init__.py _PAGEABLE_H2D_LIMIT上方的"科普·锁页内存与stream"；H2D发布协议 → utils/h2d.py文件头
+#     分页KV、block_table、slot_mapping → config.py文件开头的【科普】KV cache与分页（paged）KV；
+#       KV pool的字节布局 → attentions/pool_layout/__init__.py【科普】①~④；逐token下标 → attentions/token_layout/__init__.py【科普】
+#     CUDA Graph的概念 → config.py中CUDAGraphMode上方的【科普】①~④；torch.compile、切图、编译缓存 → utils/decorators.py文件头【科普】①~⑥
+#     eager / 回放的决策、AttentionMetaData各字段 → utils/forward_context.py；采样 → model_ops/sampler.py；
+#       权重加载与融合参数 → model_loader/loader.py文件头【前置①~③】
 #     ScheduledBatch每个字段从哪来、到worker上变成什么 → scheduler.py中ScheduledBatch类上方的字段表
 #
-# 对比nano-vllm（nano-vllm的model_runner.py注释版约600行，只支持Qwen3 + TP；本文件约5000行，多出来的部分逐项如下）：
+# 对比nano-vllm（nano-vllm的model_runner.py注释版约600行，只支持Qwen3 + TP；本文件不算注释约5000行，多出来的部分逐项如下）：
 #   ┌────────────┬──────────────────────────────────────┬──────────────────────────────────────────────────────────────────────┐
 #   │ 方面       │ nano-vllm                            │ ATOM（本文件）多出来的部分 → 解决什么                                │
 #   ├────────────┼──────────────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
@@ -227,8 +237,8 @@ from atom.utils.tbo import (
 #   │ 采样       │ 只有temperature（Gumbel-max）        │ top-k / top-p、logprobs、投机解码的拒绝采样                          │
 #   │            │                                      │ （sampler.py、rejection_sampler.py）                                 │
 #   ├────────────┼──────────────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
-#   │ CUDA Graph │ decode按bs阶梯[1,2,4,8,16,32,…,512]  │ 档位来自config（默认[1..8,16,32,…,512]）并按调度上限裁剪，           │
-#   │            │ 各录一张整图                         │ 键为(bs, q)；或PIECEWISE：torch.compile在注意力处切图（5e）          │
+#   │ CUDA Graph │ decode按bs阶梯[1,2,4,8]+16的倍数     │ 档位来自config（默认[1..8,16,32,…,512]）并按调度上限裁剪，           │
+#   │            │ （到min(max_num_seqs,512)）各录整图  │ 键为(bs, q)；或PIECEWISE：torch.compile在注意力处切图（5e）          │
 #   │            │                                      │ → 投机解码一个请求多个query token、编译融合                          │
 #   ├────────────┼──────────────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
 #   │ 投机解码   │ 无                                   │ drafter（MTP / EAGLE / DSpark）+ rejection_sampler（第7批）          │
@@ -311,7 +321,7 @@ mono_decode_installers = {
 # 调度器能排出的最大decode batch（请求数）
 #   调用方：capture_cudagraph——用它去掉永远用不到的捕获档位（测试：tests/test_cudagraph_capture_bounds.py）
 #   例：max_num_seqs=256、max_num_batched_tokens=512、MTP k=3（full_q_len=4）→ min(256, 512 // 4) = 128：
-#     声明的档位里比128大的（144、160、…、512）不会被录，省下录制时间和图内存池；不开MTP时 min(256, 512 // 1) = 256
+#     默认阶梯[1..8,16,32,48,64,128,256,512]里比128大的256、512不会被录，省下录制时间和图内存池；不开MTP时 min(256, 512 // 1) = 256
 def max_schedulable_decode_bs(
     max_num_seqs: int, max_num_batched_tokens: int, full_q_len: int
 ) -> int:
@@ -385,12 +395,11 @@ class TokenLocations(NamedTuple):
 #   本类是这个机制讲透的地方。概要（为什么要做、代价）见engine_core.py文件开头【3】；CPU一侧"先放占位token、下一步原地覆盖"
 #   见scheduler.py Scheduler.postprocess里的时间线①（不开投机）和②（投机解码）。这里讲GPU这一半怎么做
 # ═════════════════════════════════════════════════════════════════════════════════════════════════════════
-# 前置：GPU异步执行、stream、event、异步D2H（读本类必须知道的五点）
-#   ① 发射≠执行：CPU调用一个GPU算子只是把kernel排进一个stream（GPU上的FIFO命令队列）就返回，每次几µs；GPU按队列顺序执行。
-#      decode一步约1200个kernel（数字同engine_core.py【3】），CPU发射完要几ms，GPU执行完要10ms量级——只要CPU中途不等GPU，
-#      两边就各干各的
-#   ② 同步点：CPU要读GPU上的结果时必须等——.tolist()、.item()、不带non_blocking的.cpu()、torch.cuda.synchronize()、
-#      event.synchronize()都会让CPU停下，直到排在前面的GPU命令全部执行完
+# 前置：GPU异步执行、stream、event、异步D2H（读本类必须知道的五点；①②的完整讲解在engine_core.py文件开头【3】的
+#   "前置：GPU的异步执行与stream"，这里只列要点）
+#   ① 发射≠执行：CPU调用一个GPU算子只是把kernel排进一个stream（GPU上的FIFO命令队列）就返回；只要CPU中途不等GPU，两边各干各的
+#   ② 同步点：.tolist()、.item()、不带non_blocking的.cpu()、torch.cuda.synchronize()、event.synchronize()都会让CPU停下，
+#      直到排在前面的GPU命令全部执行完
 #   ③ event：排进stream里的一个"执行到这里了"的标记。ev.record(s)在stream s的当前位置放下标记；ev.synchronize()让CPU等到
 #      标记之前的命令都执行完；ev.wait(stream=s2)让另一个stream s2执行到这里时先停住、等标记到达（GPU上的等待，CPU不阻塞）
 #   ④ 异步D2H：x.to("cpu", non_blocking=True)本身也只是排进stream的一条拷贝命令，CPU立即拿到一个"还没写好"的CPU张量。
@@ -550,11 +559,15 @@ class tokenIDProcessor:
     # 下面全是"往GPU排命令"，CPU不阻塞：
     #   GPU默认stream：…[采样]ev(data_ready)[下一步的kernel …]          ← 不等拷贝，接着跑
     #   GPU副stream  ：         └等┘[D2H token][D2H logprob]ev(copy_done)
-    # 观察：gpu_tensor在默认stream上分配、在副stream上被读，这里没有调用gpu_tensor.record_stream(副stream)。不开投机时
-    #   prev_token_ids一直引用sampled_tokens，直到下一步先synchronize了这次拷贝才放手，没有问题；但开投机时postprocess随即把
-    #   prev_token_ids换成了next_token_ids，gpu_logprobs也只是postprocess的局部变量——它们在postprocess返回后就被释放，显存块
-    #   理论上可以在拷贝真正执行之前被默认stream上的新分配复用。实际中拷贝紧跟data_ready执行，而会写这块显存的kernel要排在
-    #   本步其余kernel之后，窗口极小（按代码推断，未在GPU上复现）
+    # 观察：gpu_tensor在默认stream上分配、在副stream上被读，这里（以及send_mtp_status_to_cpu_async）没有调用
+    #   record_stream(副stream)。PyTorch的缓存分配器只按"分配时所在的stream"管复用：张量的最后一个引用一释放，这块显存就能
+    #   立刻分给默认stream上的下一次分配，不管副stream上的拷贝执行了没有。逐个看：
+    #     sampled_tokens（不开投机）：prev_token_ids一直引用它，直到下一步recv_async_output先synchronize了这次拷贝 → 没问题
+    #     sampled_tokens（开投机）：postprocess随即把prev_token_ids换成next_token_ids，它只剩局部引用，postprocess返回即释放
+    #     gpu_logprobs：始终只是postprocess的局部变量（logprobs只在不开投机时出现：Sequence构造时拒绝"投机 + logprobs"）
+    #     num_rejected / num_bonus（send_mtp_status_to_cpu_async）：rejection_sample里新建的verdict的视图，同样是局部变量
+    #   后三种理论上可能在拷贝真正执行之前被默认stream上的新分配覆盖。实际中拷贝紧跟data_ready执行，而会写这块显存的kernel
+    #   要排在本步其余kernel之后，窗口极小（按代码推断，未在GPU上复现）
     def send_to_cpu_async(
         self,
         gpu_tensor: torch.Tensor,
@@ -1103,10 +1116,11 @@ class tokenIDProcessor:
         # 【译】forward要读多宽：被回放的decode图不管batch排了多少，读的都是固定的 `running_bs * tokens_per_seq`，而多数step里
         #   `bs` 落在两个已录档位之间——65个请求的batch回放的是128那张图。kernel把多出来的部分清零。
         # 解释：补出来的行没人写，MoE等算子却照样会读（decode_input_ids.py的说明），不清零就会带着上一次forward的id；0是合法的词表id
-        #   按默认档位[1..8, 16, 32, …, 512]，bs=65回放的是80那张图，需要清零的是第65~79行
+        #   按默认阶梯[1..8, 16, 32, 48, 64, 128, 256, 512]、不开投机：bs=65回放的是128那张图，需要清零的是第65~127行
         # 观察：capture_cudagraph结束时runner.capture_sizes已按升序排好，reversed之后是降序，next(...)取到的是"最大的、≥bs的档位"，
-        #   也就是整条阶梯的最大档，而不是注释所说的"被回放的那一档"。结果只是清零范围偏大（清到最大档×tokens_per_seq为止，
-        #   不超过input_ids缓冲），不影响正确性
+        #   也就是整条阶梯的最大档（上例是512，清到第511行），而不是注释所说的"被回放的那一档"。结果只是清零范围偏大（清到
+        #   最大档×tokens_per_seq为止；录图时已删掉超出token预算的档位，所以不超过input_ids缓冲），不影响正确性；而且DP下
+        #   running_bs取的是全组最大bs所在的档、可能比本rank自己的最小档大，按最大档清零反而把这种情况也盖住了
         fill_to = total_tokens_decode
         if not self.runner.enforce_eager:
             gbs = next(
@@ -1196,50 +1210,35 @@ def _profile_runner_stage(method):
 # =====================================================================================
 # ModelRunner：每张GPU一个进程里的"执行器"（第5批 5a，A级）
 #   职责：初始化分布式 → 加载权重 → 预热测激活峰值 → 算KV预算 → 分配KV并绑定到各层 → 每步准备输入、forward、采样、异步回传
-#   谁创建：AsyncIOProcManager为本stage的每个rank（共 tp_world_size × pcp 个）spawn一个worker进程，在其中构造
-#     ModelRunner(rank, config)；类由config.runner_qualname决定（RapidServe时是本文件末尾的RapidServeModelRunner），见async_proc.py
-#   谁调用：EngineCore用 runner_mgr.call_func("方法名", ...) 远程调用，命令经共享内存MessageQueue广播给每个rank，
-#     每个rank执行同一个方法，只有rank 0回包（四种调用方式对照表见async_proc.py；为什么必须SPMD见engine_core.py文件开头【4】）
+#   谁创建（AsyncIOProc按config.runner_qualname构造ModelRunner(rank, config)）、谁调用（EngineCore经runner_mgr.call_func
+#     远程调用，只用rank 0的返回值）、启动后各RPC的先后、全文件的阅读路线：都见文件头（"在架构里的位置""生命周期"
+#     "阅读路线"），这里不重复；RPC的四种调用方式见async_proc.py，为什么必须SPMD见engine_core.py文件开头【4】
 #
-# 生命周期（每个rank都走一遍；冒号前是RPC名，也就是方法名）：
-#   ┌─ __init__（本区段）────────────────────────────────────────────────────────────────┐
-#   │ ① 读配置：block_size、KV dtype、注意力家族（MHA/MLA/GDN/V4…）与对应的注意力后端             │
-#   │ ② _setup_device_and_distributed：绑定GPU，建NCCL world与TP/DP/PP/PCP/DCP等通信组            │
-#   │ ③ tokenIDProcessor（延迟输出与input_ids组装）、Sampler                                    │
-#   │ ④ 量化表层名重映射 → _build_and_load_model：构造模型 + load_model读权重（第5批5c）          │
-#   │ ⑤ 【分支】草稿模型与拒绝采样器（投机解码，第7批）                                           │
-#   │ ⑥ allocate_forward_vars + 注意力元数据builder：每步输入用的固定地址buffer                  │
-#   │ ⑦ 【分支】TBO / Mono包装；forward_vars环与H2D发布组                                        │
-#   │ ⑧ _maybe_warmup → warmup_model：一次满额的假prefill，让分配器记下激活峰值                  │
+# __init__内部的步骤（__init__里各段注释的①~⑧与下框一一对应；之后EngineCore依次RPC的get_num_blocks → allocate_kv_cache
+#   → capture_cudagraph → freeze_gc_heap，以及每步的forward，见文件头"生命周期"②~④）：
+#   ┌─ __init__ ───────────────────────────────────────────────────────────────────────────┐
+#   │ ① 读配置：block_size、KV dtype、注意力家族（MHA/MLA/GDN/V4…）与对应的注意力后端      │
+#   │ ② _setup_device_and_distributed：绑定GPU，建NCCL world与TP/DP/PP/PCP/DCP等通信组     │
+#   │ ③ tokenIDProcessor（延迟输出与input_ids组装）、Sampler                               │
+#   │ ④ 量化表层名重映射 → _build_and_load_model：构造模型 + load_model读权重（第5批5c）   │
+#   │ ⑤ 【分支】草稿模型与拒绝采样器（投机解码，第7批）                                    │
+#   │ ⑥ allocate_forward_vars + 注意力元数据builder：每步输入用的固定地址buffer            │
+#   │ ⑦ 【分支】TBO / Mono包装；forward_vars环与H2D发布组                                  │
+#   │ ⑧ _maybe_warmup → warmup_model：一次满额的假prefill，让分配器记下激活峰值            │
 #   └──────────────────────────────────────────────────────────────────────────────────────┘
-#        ▼ EngineCore.__init__依次RPC（engine_core.py __init__上方的启动流程图）
-#   get_num_blocks：显存预算 → 每类子池放多少条目（本区段，带显存预算条）
-#        ▼
-#   allocate_kv_cache(num_blocks)：一次分配整块KV字节池，按层切片绑定到注意力模块（本区段）
-#        ▼
-#   [profile_dynamic_chunking]（【分支】动态分块，第9批）→ capture_cudagraph（录图，见该方法）→ freeze_gc_heap
-#        ▼ 之后每一步
-#   forward(batch)：prepare_model / prepare_inputs → run_model → postprocess（采样 + 异步回传），见本文件后半
-#   DP>1且本rank这一步没活：dummy_execution（本区段）陪其他rank走完集合通信
-#
-# 本区段（__init__ 到 prepare_inputs 之前）的阅读顺序：
-#   __init__ → _setup_device_and_distributed → warmup_model → get_num_blocks（预算条）→ allocate_kv_cache
-#   → allocate_forward_vars / _init_forward_vars_ring / _init_h2d_publication（每步输入buffer怎样安全复用）
-#   标【分支】的（profiler、dummy、TBO、DSpark、PP、RapidServe）第一遍可以跳过
 #
 # 对比nano-vllm：
 #   nano-vllm的ModelRunner.__init__一口气做完 init_process_group → 建模型+load_model → warmup → allocate_kv_cache → capture_cudagraph，
 #     rank 0就是主进程，由LLMEngine直接调用
 #   ATOM的__init__只做到warmup为止；KV预算、KV分配、录图拆成三个RPC由EngineCore依次调用——block数要回传给EngineCore
 #     去建Scheduler（Config跨进程是值传递，见config.py文件开头），中间还要能插入PD分离的握手、动态分块的测量
-#   每个rank（包括rank 0）都是EngineCore之外的子进程；KV布局、每步元数据交给"注意力后端的builder"决定，runner只做调度与记账
 # =====================================================================================
 class ModelRunner:
 
     # 构造（在worker子进程里执行，耗时最长：建通信组、读权重、预热都在这里）
     #   rank：本worker在本stage里的编号，0 .. tp_world_size × pcp − 1（同一stage = 同一个EngineCore）
     #   config：EngineCore传来的Config（经pickle的副本，改它不影响其他进程，见config.py文件开头）
-    #   步骤与类上方生命周期框图的①~⑧对应；成员变量的用途写在各自上方
+    #   步骤与类上方框图的①~⑧对应；成员变量的用途写在各自上方
     def __init__(self, rank: int, config: Config):
         self.config = config
         # 【分支】多模态：视觉编码结果按请求缓存，chunked prefill时分段散射进输入embedding
@@ -1535,7 +1534,7 @@ class ModelRunner:
         self._init_forward_vars_ring()
         self._init_h2d_publication()
         # 每次forward的采样结果写完后在当前stream上record（postprocess）；tokenIDProcessor的异步D2H拷贝在
-        #   async_copy_stream上先wait这个event，保证拷走的是写完的token（延迟输出，engine_core.py文件开头【3】）
+        #   async_copy_stream上先wait这个event，保证拷走的是写完的token（延迟输出的GPU侧见本文件tokenIDProcessor上方【科普】）
         self.forward_done_event = torch.cuda.Event()
         # 【分支】EPLB（专家负载均衡，第7批eplb.py）：开启时把本runner登记为运行时owner，没开时什么也不做
         initialize_eplb_runtime(self)
@@ -2083,9 +2082,9 @@ class ModelRunner:
 
     # 预热forward要带多少个token：单步token预算max_num_batched_tokens（默认16384），PCP时每个PCP rank只拿到1/pcp
     #   调用方：warmup_model；dynamic_chunking_worker.py的启动扫描也用它当上限（第9批）
-    # 观察：不开--enable-dp-attention的DP（例如 -dp 2 -tp 4）还要再除以DP组大小，代码和提交说明都没给出理由；
-    #   而每个DP rank的调度器单步仍按完整的max_num_batched_tokens排batch（scheduler.py），若按这里测得的峰值定KV预算，
-    #   满额prefill时激活可能超出预留
+    # 观察：不开--enable-dp-attention的DP（例如 -dp 2 -tp 4）还要再除以DP组大小，代码里没有说明理由；而每个DP rank的调度器
+    #   单步仍按完整的max_num_batched_tokens排batch（Scheduler.__init__直接取config.max_num_batched_tokens），若按这里测得的
+    #   峰值定KV预算，满额prefill时激活可能超出预留（按代码推断，未在GPU上复现）
     def warmup_max_tokens(self) -> int:
         """Tokens one warmup forward carries: the activation peak KV sizing allows."""
         # 【译】一次预热forward携带的token数：即KV规模计算所允许的那个激活峰值。
@@ -2635,8 +2634,8 @@ class ModelRunner:
     #     FULL（默认--cudagraph-mode）   → 激活峰值 × 0.2（例：warmup峰值8GB → 1.6GB）；DSpark置信度调度每个q桶各录一套 → 再 × 桶数
     #     PIECEWISE类                   → 每token字节数 × Σ(要录的token数档位)，累加到约预算的15%为止：
     #       每token字节数 = hidden × dtype字节 × 层数 × 2.8（DP>1时再 × dp^0.6，见_piecewise_per_token_bytes）
-    #       例：DeepSeek-V3（hidden 7168、bf16、61层）：7168 × 2 × 61 × 2.8 ≈ 2.34MB/token；默认档位[1..8,16,32,48,64,128,256,512]、
-    #         不开投机（q=1）时 Σ = 36 + 1056 = 1092个token → ≈2.5GB；MTP k=3（q=4）时档位变成 bs×4，Σ = 4368 → ≈10GB
+    #       例：DeepSeek-V3（hidden 7168、bf16、61层）：7168 × 2 × 61 × 2.8 ≈ 2.45e6 B ≈ 2.33MiB/token；默认档位[1..8,16,32,48,64,128,256,512]、
+    #         不开投机（q=1）时 Σ = 36 + 1056 = 1092个token → ≈2.5GiB；MTP k=3（q=4）时档位变成 bs×4，Σ = 4368 → ≈10GiB
     #   低估是安全的：PIECEWISE录图时会按实际空闲显存逐档检查，放不下的档位直接跳过（_piecewise_skip_capture）
     #   对比nano-vllm：nano-vllm不预留这一块——KV按util填满后再录图，graph池从util之外的那部分显存里出
     def _estimate_cudagraph_overhead(self):
@@ -2711,7 +2710,7 @@ class ModelRunner:
             # Mirror the capture-loop DP+spec num_tokens cap (see capture_cudagraph)
             # so the reservation only counts buckets we actually capture.
             # 【译】与捕获循环里DP+投机时的num_tokens上限保持一致（见capture_cudagraph），让预留只计算真正会捕获的桶。
-            # 解释：ATOM_PIECEWISE_DP_MAX_TOKENS直接读os.environ（默认512），不在envs.py的登记表里
+            # 解释：上限ATOM_PIECEWISE_DP_MAX_TOKENS（默认512）就是_piecewise_skip_capture的闸1（它没登记在envs.py里，见那里的观察）
             if dp_size > 1 and hasattr(self, "drafter"):
                 _dp_cap = int(os.environ.get("ATOM_PIECEWISE_DP_MAX_TOKENS", "512"))
                 all_shapes = [s for s in all_shapes if s <= _dp_cap]
@@ -2977,8 +2976,9 @@ class ModelRunner:
         # 【译】各PP stage算出的block数不同；block id必须在每个stage的KV张量上都合法，所以归约到全局最小值。在发布任何东西之前
         #   把结果折回plan里：plan是所有条目数的唯一来源，它绝不能和池真正建出来的数量不一致。
         # 例：-pp 2时两个stage的层数、权重大小都不同，各自算出的block数不同，取较小的那个
-        # 观察：TP组内各rank也各自算了一遍，但这里只对PP做了归约；EngineCore只取TP rank 0的结果让所有rank按它分配，
-        #   靠的是TP各rank的显存占用对称（同卡上若有别的进程，非0号rank可能分配失败）
+        # 观察：只有PP>1时才归约。那时all_reduce不带group，用的是默认组（整个NCCL world），所以各stage的全部TP rank都参与了MIN；
+        #   PP=1时TP组内各rank各算各的、互不归约，EngineCore只取TP rank 0的结果让所有rank按它分配，靠的是TP各rank的显存
+        #   占用对称（同卡上若有别的进程只占了其中几张卡，非0号rank可能分配失败）
         num_kvcache_blocks = plan.paged_entries
         if config.pipeline_parallel_size > 1 and torch.distributed.is_initialized():
             t = torch.tensor(
@@ -3500,8 +3500,8 @@ class ModelRunner:
     #   返回：(要补的token数, 各DP rank的token数 [dp_size] 的CPU张量)；DP=1时 (0, None)
     #   例：dp=4，各rank本步token数 [3, 8, 5, 8] → rank 0返回 (5, [3,8,5,8])、rank 2返回 (3, …)
     #   num_tokens_across_dp由DPMetadata.num_tokens_across_dp在DP组的gloo（CPU）组上做一次all_reduce得到——这是一次跨DP的同步点
-    #   调用方：capture_cudagraph（PIECEWISE逐档录图时）、_capture_attn_ffn_graphs；正常服务的每一步改由ForwardMode.decide里的
-    #     打包all_gather一次拿齐（forward_context.py）
+    #   调用方：capture_cudagraph（每个捕获档位一次，FULL与PIECEWISE路径都调）、_capture_attn_ffn_graphs；正常服务的每一步
+    #     改由ForwardMode.decide里的打包all_gather一次拿齐（forward_context.py）
     def get_dp_padding(self, num_tokens: int) -> tuple[int, torch.Tensor | None]:
         dp_size = self.config.parallel_config.data_parallel_size
         dp_rank = self.config.parallel_config.data_parallel_rank
@@ -3863,15 +3863,12 @@ class ModelRunner:
         spec_decode_indices: tuple[np.ndarray, int] | None = None,
     ):
         # ======================== prepare_inputs：把CPU上的批元数据变成GPU张量 ========================
-        # 在一步里的位置（完整时间线见下面forward上方的图）：
+        # 在一步里的位置（完整步骤见下面forward上方的①~⑧，数据流图见文件头）：
         #   forward → prepare_model（定形状ForwardMode、采样参数、cu_seqlens_q、input_ids）→ 【本函数】注意力元数据 +
         #   设置ForwardContext → run_model → postprocess
-        # 前置：这些GPU张量都"住"在固定的缓冲区里。CpuGpuBuffer = 一块锁页内存（.np / .cpu）+ 一块同样大小的显存（.gpu），
-        #   启动时按max_num_batched_tokens / max_num_seqs一次分配好（allocate_forward_vars、backends.py CommonAttentionBuilder.__init__）。
-        #   每步CPU只往.np[:n]写numpy数组，再把前n个元素异步拷进.gpu（H2D，排在forward所在的stream上；GPU的异步执行与stream
-        #   见engine_core.py文件开头【3】的前置）。地址每步不变——这正是后面CUDA Graph回放不用再拷一遍的前提。
-        #   ATOM_H2D_BACKEND=packed（默认）时，同一"发布组"的多段先拼进一块锁页内存、一次拷完，再由kernel分发到各自的地址
-        #   （utils/h2d.py；envs.py里ATOM_H2D_BACKEND上方的科普）
+        # 前置：这些GPU张量都住在启动时一次分配好的CpuGpuBuffer里（allocate_forward_vars、backends.py CommonAttentionBuilder.__init__）：
+        #   每步CPU只写.np[:n]、再异步H2D到.gpu[:n]，地址每步不变——这正是CUDA Graph回放不用再拷一遍的前提（三条前置见
+        #   allocate_forward_vars上方①~③；按组发布、packed打包见_init_h2d_publication上方③与utils/h2d.py文件头）
         # 本函数做三件事：
         #   ① 投机解码的验证步：算出哪些logits行用来验证草稿（spec_decode_metadata，【分支】第7批）
         #   ② attn_metadata_builder.build：由注意力后端（MHA / MLA / GDN / V4……，第6~8批）把批里每序列、每token的元数据写成GPU张量
@@ -4120,14 +4117,10 @@ class ModelRunner:
 
     # prepare_model：一步forward的"准备阶段"总入口（forward调用），按顺序做：
     #   ① _dspark_apply_q_bucket：DSpark按置信度把本步验证长度缩到某个q档（【分支】第7批；不开DSpark时返回None）
-    #   ② ForwardMode.decide：定下本步的形状和执行方式（forward_context.py，规范位置）——
-    #      DP>1时先做本步唯一一次跨DP集合通信（DP组gloo上的一次打包all_gather，交换各rank的token数、bs、是否prefill等），然后
-    #        running_bs = capture_sizes阶梯上 >= 全组最大bs 的最小一档（超过最大档就等于原值）
-    #        use_cudagraph = 非prefill 且 全组都在decode 且 未enforce_eager 且 后端不拒绝 且 落在阶梯上
-    #      例（阶梯[1..8, 16, 32, 48, 64, 128, 256, 512]）：bs=5 → 5；bs=9 → 16；bs=65 → 128（补63行）；
-    #        bs=600（--max-num-seqs调到600以上时才会出现）→ 不在阶梯上，running_bs=600、走eager
-    #      例（DP=2）：rank0有3条decode、rank1有5条 → 全组最大5 → 两个rank的running_bs都是5，rank0补2行
-    #      --enforce-eager时capture_sizes保持[0]（__init__），任何bs都不在阶梯上 → 永远eager，单DP时running_bs = bs
+    #   ② ForwardMode.decide：定下本步的形状和执行方式（规范讲解、流程图和例A~G见forward_context.py ForwardMode.decide）。要点：
+    #      DP>1时先做本步唯一一次跨DP集合通信（DP组gloo上的一次打包all_gather，交换各rank的token数、bs、是否prefill等）；
+    #      running_bs = capture_sizes阶梯上 >= 全组最大bs 的最小一档（默认阶梯下bs=9 → 16、bs=65 → 128）；超过最大档，或
+    #      --enforce-eager时capture_sizes=[0]，就不在阶梯上 → 取原值、走eager；use_cudagraph还要求全组都在decode、后端不拒绝
     #   ③ prepare_sample：采样参数
     #   ④ cu_seqlens_q和input_ids：cu_seqlens_q必须先于input_ids，fill_deferred_decode_ids要靠它找到每个请求的区间
     #   ⑤ prepare_inputs：注意力元数据 + ForwardContext
@@ -5173,19 +5166,10 @@ class ModelRunner:
     #   ⑦ postprocess：采样 / 验证 → 异步D2H → ScheduledBatchOutput
     #   ⑧ reset_forward_context；记录本组buffer的完成event；告诉KV connector哪些prefill的KV已写完（【分支】第9批）
     #
-    # 延迟输出下的时间线（默认开启，条件见tokenIDProcessor.__init__；原理见engine_core.py文件开头【3】）：
-    #   CPU（rank 0）：
-    #     ─[forward(N)：①②准备N | ④发射N的kernel | ⑦发射采样N，等N−1的D2H拷完，排N的D2H，返回N−1的token]
-    #     ─[EngineCore：postprocess(N−1) | schedule(N+1)]
-    #     ─[forward(N+1)：①②准备N+1 | ④发射N+1 | ⑦等N的D2H拷完 ...]
-    #   GPU计算stream：  ═══ N−1 ═══][═══════════════ forward N ═══════════════][═══════════════ forward N+1 ════
-    #   async_copy_stream：          [D2H N−1]                                  [D2H N]
-    #   被GPU掩盖的CPU时间：postprocess(N−1)、schedule(N+1)，以及forward(N+1)的准备阶段（ForwardMode.decide、注意力元数据、
-    #     H2D排队、kernel发射）——它们都发生在GPU执行第N步的期间。之所以能提前准备，是因为第N+1步的input_ids直接从GPU上的
-    #     prev_token_ids取（fill_deferred_decode_ids），不需要CPU先拿到第N步的token，GPU队列里始终有活
+    # 延迟输出（默认开启）：⑦交回的是上一步的token，第N+1步的input_ids直接取GPU上第N步的采样结果，于是postprocess(N−1)、
+    #   schedule(N+1)和forward(N+1)的准备阶段都被GPU执行第N步的时间盖住——时间线、例子和量级见本文件tokenIDProcessor上方【科普】
     #   CPU在主路径上等GPU的地方：⑦里等上一步的D2H（event.synchronize；等完时第N步已在GPU队列里）；①的闸门等上一步的H2D
     #     （decode稳态下早已完成）；投机解码时还要取上一步的草稿和接受数（同样是上一步、早已在拷的）。不延迟时则在⑦等本步的.tolist()
-    #   量级（engine_core.py【3】）：decode一步GPU 10ms量级、CPU的post + sched + 准备几ms → 不延迟时这几ms里GPU空转，延迟后被盖住
     # 对比nano-vllm：nano-vllm的run() = prepare → run_model → sampler → .tolist() → reset_context，一步完全同步；
     #   ATOM多了buffer轮换与H2D发布协议（①③）、DP形状同步（②）、投机解码草稿（⑤）、PP与chunked prefill中间块的提前返回（⑥）、
     #   延迟输出（⑦）
@@ -5673,7 +5657,7 @@ class ModelRunner:
         return resolve_q_buckets(sizes, full_q)
 
     # PIECEWISE graph显存的估算斜率，读取方：_estimate_cudagraph_overhead（get_num_blocks算KV预算时先扣掉graph的显存）
-    #   例（hidden=7168、bf16、61层、单DP）：7168 × 2 × 61 × 2.8 ≈ 2.45e6字节 ≈ 2.3MiB/token；dp=8时再 × 3.48
+    #   例（hidden=7168、bf16、61层、单DP）：7168 × 2 × 61 × 2.8 ≈ 2.45e6字节 ≈ 2.33MiB/token；dp=8时再 × 3.48
     def _piecewise_per_token_bytes(self) -> float:
         """Estimated GPU bytes a captured PIECEWISE graph retains per token.
 
@@ -5708,7 +5692,8 @@ class ModelRunner:
     #     一个rank跳过、另一个不跳，两边的通信就对不上号
     #   例（显存闸，hidden=7168、num_tokens=512、单DP）：need = 600 × 7168 × 512 × 1.25 + 4GiB ≈ 2.56GiB + 4GiB ≈ 6.56GiB，
     #     按整GiB比较（>> 30）：空闲显存不足6GiB就跳过这档
-    #   观察：ATOM_PIECEWISE_DP_MAX_TOKENS（默认512）直接读os.environ，没有登记在envs.py里
+    #   观察：ATOM_PIECEWISE_DP_MAX_TOKENS（默认512）直接读os.environ，没有登记在envs.py里（_estimate_cudagraph_overhead读的
+    #     ATOM_PIECEWISE_FINE_TOKENS也一样）
     def _piecewise_skip_capture(self, num_tokens: int) -> bool:
         """Whether to skip capturing a PIECEWISE bucket of ``num_tokens`` tokens.
 
@@ -7158,8 +7143,8 @@ class RapidServeModelRunner(ModelRunner):
     # 和基类forward的区别：不走postprocess / tokenIDProcessor（没有延迟输出、没有草稿模型），采样后直接.tolist()同步拿结果；
     #   prefill进程强制eager、从不录图，capture_sizes保持[0]，（DP=1时）ForwardMode.decide给出的running_bs就等于bs，logits正好bs行
     # 观察：prepare_model返回的needs_independent_noise（这里接成_needs_independent_noise）没有传给sampler。按sampler.py
-    #   _temperature_sample的说明，不传时整批共用同一行缓存的指数噪声，SamplingParams.n>1的兄弟序列（logits相同）在temperature
-    #   采样下会采出相同的首token；基类postprocess是传了的
+    #   _temperature_sample的说明，不传时整批共用同一行指数噪声，SamplingParams.n>1的兄弟序列（logits相同）在不开top-k / top-p的
+    #   温度采样下会采出相同的首token（开了过滤走aiter采样算子 / torch.multinomial，本来就逐行独立）；基类postprocess是传了的
     @torch.inference_mode()
     def prefill_forward(self, batch: ScheduledBatch) -> list[int]:
         """Run a prefill forward pass on a dynamically selected CU-masked stream.

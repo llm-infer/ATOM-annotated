@@ -131,7 +131,8 @@ and a declaration is free to sit apart from the arithmetic over it.
 #            所有逐 token 数据"：MHA 的 K/V + fp8 scale、MLA 的潜在向量 + DSA 索引 key（③）、EAGLE3 草稿模型
 #            的 KV（spec_decode/draft_kv.py 用同名条目类 "kv" 加进来）、V4 的压缩 KV + 索引器 key（④）
 #     STATE：随"同时在跑的请求数"增长、与序列长度无关——线性注意力（GDN / KDA / Mamba）的递归状态、
-#            V4 的滑动窗口与压缩器环形缓冲；每条请求一份（投机解码时 1 + k 份，留给回滚）
+#            V4 的滑动窗口与压缩器环形缓冲；每条请求一份（GDN 投机解码时 1 + k 份，留给回滚；V4 不论投机与否都是
+#            1 份，草稿的余量并进窗口长度 win_with_spec）
 #   为什么共用一个 block id：调度器 / BlockManager 每条请求只维护一张 block_table（第4批）；这些逐 token 的
 #     缓存都是"每多 block_size 个 token 就多一块"，同步增长、同步释放，于是让它们共用一个编号空间，
 #     把它们的 entry_bytes 加起来当作"一个 block 的价格"，就只需要一个 num_blocks（sub_pool_spec.merge_specs）。
@@ -144,6 +145,8 @@ and a declaration is free to sit apart from the arithmetic over it.
 #       STATE 条目 = 36 层 × 548,864 个数 × 2B ≈ 37.7 MiB / 请求（第4批 §4 已核实）
 #       预算 60 GiB → STATE 先扣 256 × 37.7 MiB ≈ 9.42 GiB → 剩 ≈ 50.6 GiB → 138,112 个 block ≈ 221 万 token
 #       开 MTP k=1（每请求 2 个状态槽）→ STATE 翻倍到 ≈ 18.8 GiB，block 降到 112,384 个——这就是 STATE 的代价
+#       （model_runner.py get_num_blocks 上方③用同一个模型、max_num_seqs=512 举例，STATE 同样 ≈ 18.8 GB：
+#        STATE 只看 max_num_seqs × 每请求槽位数，与预算多大无关）
 #   一个条目里装几种张量（"字段"，entry_arena.EntryField）、它们怎么排：
 #     PAGE 用"层在外"（LayerMajorArena）：一层的所有 block 连续，kernel 按层绑定；
 #     STATE 用"条目在外"（EntryMajorArena）：一条请求的全部状态是一段连续字节，便于整份拷贝做 checkpoint、

@@ -1436,7 +1436,8 @@ class EngineCore:
 
 # DPEngineCoreProc：数据并行（data_parallel_size > 1）时每个DP rank的EngineCore
 #   每个DP rank有自己的调度器和请求，但forward内部可能有跨DP rank的集合通信，例如：
-#     - 每步all_reduce各rank的token数（DPMetadata.num_tokens_across_dp，forward_context.py）
+#     - 每步一次CPU（gloo）all_gather，交换各rank的token数、bs、是否在prefill等（ForwardMode.decide里的sync_dp_metadata，
+#       forward_context.py；DPMetadata.num_tokens_across_dp的那次all_reduce只用在录CUDA Graph等拿不到这张表的地方）
 #     - MoE层在 dp×tp 张卡上的all_gather / all-to-all（第7批）
 #     - 调度器里的PrefillDelayer在schedule()中做跨DP的all_reduce（第3批）
 #   集合通信要求组里每个成员都以同样的次数、同样的顺序调用，否则先到的rank会永远等下去。

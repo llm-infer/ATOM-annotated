@@ -87,7 +87,8 @@
 #       最后一个之后都还有计算；对 decoder 模型总成立：前面有 embedding，后面有 norm）。
 #       37 个稠密子图按顺序编号 0~36（graph_index），各自交给 Inductor 编译一次，外面包一层 PiecewiseBackend。
 #       哪些算子算切分点：标了 spliting_op 的都算，例如线性注意力（GDN）的 linear_attention_with_output_base、
-#       DeepSeek-V4 的 v4_attention_with_output；没标的黑盒算子（如 maybe_dual_stream_forward）留在稠密子图里，当一个普通节点。
+#       DeepSeek-V4 的 v4_attention_with_output（非 PIECEWISE 时）/ v4_attn_compress（PIECEWISE 类模式时，见 cuda_graph.py 文件头）；
+#       没标的黑盒算子（如 maybe_dual_stream_forward）留在稠密子图里，当一个普通节点。
 #       切分算法（节点怎么分到子图号）见 backends.py split_graph 上方的注释。
 #
 #     切开之后，每个稠密子图外面包什么，由 --cudagraph-mode 决定（backends.py PiecewiseCompileInterpreter.call_module）：
@@ -142,7 +143,8 @@
 #         层在 __init__ 里把自己登记进去（例：paged_attention.py 用层名 prefix，缺省为 MHA_<层号> / MLA_<层号>）。
 #     为什么不把 module 或 KV cache 直接当参数：
 #       - module 不是张量，进不了算子的 schema；
-#       - KV cache 和元数据 buffer 如果是参数，就要进 guard，functionalization 还会给"被原地修改的参数"插防御性拷贝；
+#       - KV cache 和元数据 buffer 如果是参数，就要进 guard，functionalization 还会给"被原地修改的参数"插防御性拷贝
+#         （functionalization：AOT 编译前把原地修改改写成"算出新张量、再拷回原处"的一步，方便 Inductor 做优化）；
 #       - 依赖每步元数据（get_forward_context()）的 Python 逻辑留在黑盒里，每步现场执行，不会被②冻结。
 #     两类黑盒算子：标了 spliting_op 的（attention，即③的切分点）和没标的（module_dispatch_ops.py 的双 stream MoE、
 #       V4 索引器 top-k，它们留在稠密子图里，FULL / PIECEWISE 录图时随所在子图一起被录进去）。

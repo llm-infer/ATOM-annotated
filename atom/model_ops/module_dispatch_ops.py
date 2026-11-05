@@ -83,8 +83,8 @@ from atom.utils.forward_context import get_current_cudagraph_runtime_mode
 #
 # 【科普】双 stream MoE：DeepSeek 式 MoE 层 = 共享专家（每个 token 都过的普通 MLP）+ 路由专家（gate 选 top-k 个专家）
 #   （MoE 入门见 model_engine/arg_utils.py 中 MoE 组字段上方的【科普】MoE与EP）。两条分支读同一份 hidden_states，最后才相加，彼此独立。
-#   stream 是 GPU 上的一条命令队列：同一条 stream 里的 kernel 按顺序执行，不同 stream 的 kernel 可以同时跑
-#   （arg_utils.py enable_tbo 上方的【科普】也用到它）。于是可以把共享专家放到另一条 stream（alt_stream）上：
+#   stream 的要点：同一条 stream 里的 kernel 按顺序执行，不同 stream 之间可以并发（概念见 engine_core.py 文件开头【3】的
+#   "前置：GPU的异步执行与stream"）。于是可以把共享专家放到另一条 stream（alt_stream）上：
 #
 #     单 stream：  主 stream：[共享专家 MLP][gate → top-k → fused MoE（路由专家）][相加]
 #     双 stream：  主 stream：[gate → top-k → fused MoE（路由专家）]──────┐ 等待 alt → [相加]
