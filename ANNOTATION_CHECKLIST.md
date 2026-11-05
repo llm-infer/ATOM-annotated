@@ -132,61 +132,61 @@
 
 ### 5a ModelRunner 与 ForwardContext
 
-- [ ] **A** `atom/model_engine/model_runner.py`（4978 行）
-- [ ] **A** `atom/utils/forward_context.py`（1332 行）
-- [ ] **B** `atom/utils/h2d.py`（486 行）
-- [ ] **B** `atom/utils/packed_h2d.py`（92 行）
-- [ ] **B** `atom/model_ops/decode_input_ids.py`（194 行）
+- [x] **A** `atom/model_engine/model_runner.py`（4978 行）
+- [x] **A** `atom/utils/forward_context.py`（1332 行）
+- [x] **B** `atom/utils/h2d.py`（486 行）
+- [x] **B** `atom/utils/packed_h2d.py`（92 行）
+- [x] **B** `atom/model_ops/decode_input_ids.py`（194 行）
 
 ### 5b KV pool 内存布局与 token 索引
 
-- [ ] **B** `atom/model_ops/attentions/pool_layout/__init__.py`（47 行）
-- [ ] **B** `atom/model_ops/attentions/pool_layout/entry_arena.py`（584 行）
-- [ ] **B** `atom/model_ops/attentions/pool_layout/mha_page_unit_geometry.py`（193 行）
-- [ ] **B** `atom/model_ops/attentions/pool_layout/page_unit_geometry.py`（250 行）
-- [ ] **B** `atom/model_ops/attentions/pool_layout/paged_state_copy.py`（387 行）
-- [ ] **B** `atom/model_ops/attentions/pool_layout/pool_rows.py`（100 行）
-- [ ] **B** `atom/model_ops/attentions/pool_layout/sub_pool_spec.py`（246 行）
-- [ ] **B** `atom/model_ops/attentions/pool_layout/v41_pool_geometry.py`（411 行）
-- [ ] **B** `atom/model_ops/attentions/pool_layout/v4_pool_fields.py`（132 行）
-- [ ] **B** `atom/model_ops/attentions/pool_layout/v4_pool_geometry.py`（667 行）
-- [ ] **B** `atom/model_ops/attentions/token_layout/__init__.py`（30 行）
-- [ ] **B** `atom/model_ops/attentions/token_layout/batch_ids.py`（75 行）
-- [ ] **B** `atom/model_ops/attentions/token_layout/decode.py`（39 行）
-- [ ] **B** `atom/model_ops/attentions/token_layout/gather.py`（49 行）
-- [ ] **B** `atom/model_ops/attentions/token_layout/prefill.py`（34 行）
-- [ ] **B** `atom/model_ops/attentions/token_layout/slots.py`（70 行）
+- [x] **B** `atom/model_ops/attentions/pool_layout/__init__.py`（47 行）
+- [x] **B** `atom/model_ops/attentions/pool_layout/entry_arena.py`（584 行）
+- [x] **B** `atom/model_ops/attentions/pool_layout/mha_page_unit_geometry.py`（193 行）
+- [x] **B** `atom/model_ops/attentions/pool_layout/page_unit_geometry.py`（250 行）
+- [x] **B** `atom/model_ops/attentions/pool_layout/paged_state_copy.py`（387 行）
+- [x] **B** `atom/model_ops/attentions/pool_layout/pool_rows.py`（100 行）
+- [x] **B** `atom/model_ops/attentions/pool_layout/sub_pool_spec.py`（246 行）
+- [x] **B** `atom/model_ops/attentions/pool_layout/v41_pool_geometry.py`（411 行）
+- [x] **B** `atom/model_ops/attentions/pool_layout/v4_pool_fields.py`（132 行）
+- [x] **B** `atom/model_ops/attentions/pool_layout/v4_pool_geometry.py`（667 行）
+- [x] **B** `atom/model_ops/attentions/token_layout/__init__.py`（30 行）
+- [x] **B** `atom/model_ops/attentions/token_layout/batch_ids.py`（75 行）
+- [x] **B** `atom/model_ops/attentions/token_layout/decode.py`（39 行）
+- [x] **B** `atom/model_ops/attentions/token_layout/gather.py`（49 行）
+- [x] **B** `atom/model_ops/attentions/token_layout/prefill.py`（34 行）
+- [x] **B** `atom/model_ops/attentions/token_layout/slots.py`（70 行）
 
 ### 5c 权重加载
 
-- [ ] **A** `atom/model_loader/loader.py`（499 行）
-- [ ] **A** `atom/model_loader/loading_core.py`（467 行）
-- [ ] **A** `atom/model_loader/weight_iterator.py`（378 行）
-- [ ] **B** `atom/model_loader/expert_staging.py`（386 行）
-- [ ] **B** `atom/model_loader/online_quant_streaming.py`（515 行）
-- [ ] **B** `atom/model_loader/weight_dispatch.py`（301 行）
-- [ ] **B** `atom/model_loader/weight_names.py`（274 行）
-- [ ] **B** `atom/model_loader/weight_utils.py`（203 行）
-- [ ] **C** `atom/model_loader/deepseek_v41.py`（18 行）
+- [x] **A** `atom/model_loader/loader.py`（499 行）
+- [x] **A** `atom/model_loader/loading_core.py`（467 行）
+- [x] **A** `atom/model_loader/weight_iterator.py`（378 行）
+- [x] **B** `atom/model_loader/expert_staging.py`（386 行）
+- [x] **B** `atom/model_loader/online_quant_streaming.py`（515 行）
+- [x] **B** `atom/model_loader/weight_dispatch.py`（301 行）
+- [x] **B** `atom/model_loader/weight_names.py`（274 行）
+- [x] **B** `atom/model_loader/weight_utils.py`（203 行）
+- [x] **C** `atom/model_loader/deepseek_v41.py`（18 行）
 
 ### 5d 采样
 
-- [ ] **A** `atom/model_ops/sampler.py`（371 行）
-- [ ] **B** `atom/model_ops/lm_head_argmax.py`（87 行）
+- [x] **A** `atom/model_ops/sampler.py`（371 行）
+- [x] **B** `atom/model_ops/lm_head_argmax.py`（87 行）
 
 ### 5e CUDA Graph 与 torch.compile
 
-- [ ] **A** `atom/utils/decorators.py`（591 行）
-- [ ] **A** `atom/utils/backends.py`（775 行）
-- [ ] **A** `atom/utils/cuda_piecewise_backend.py`（115 行）
-- [ ] **B** `atom/utils/graph_holders.py`（57 行）
-- [ ] **B** `atom/utils/custom_register.py`（42 行）
-- [ ] **B** `atom/model_ops/module_dispatch_ops.py`（270 行）
-- [ ] **B** `atom/utils/cuda_graph.py`（470 行）
-- [ ] **B** `atom/utils/attn_ffn_piecewise.py`（317 行）
-- [ ] **C** `atom/utils/compiler_inferface.py`（765 行）
-- [ ] **C** `atom/utils/graph_marker.py`（44 行）
-- [ ] **C** `atom/utils/graph_marker_instrumentation.py`（460 行）
+- [x] **A** `atom/utils/decorators.py`（591 行）
+- [x] **A** `atom/utils/backends.py`（775 行）
+- [x] **A** `atom/utils/cuda_piecewise_backend.py`（115 行）
+- [x] **B** `atom/utils/graph_holders.py`（57 行）
+- [x] **B** `atom/utils/custom_register.py`（42 行）
+- [x] **B** `atom/model_ops/module_dispatch_ops.py`（270 行）
+- [x] **B** `atom/utils/cuda_graph.py`（470 行）
+- [x] **B** `atom/utils/attn_ffn_piecewise.py`（317 行）
+- [x] **C** `atom/utils/compiler_inferface.py`（765 行）
+- [x] **C** `atom/utils/graph_marker.py`（44 行）
+- [x] **C** `atom/utils/graph_marker_instrumentation.py`（460 行）
 
 ## 第 6 批：基础算子、量化、注意力与 dense 模型（34 个文件，16,983 行）
 

@@ -447,3 +447,12 @@ C 级示例：
 - **`can_append` 偏保守**：按 `len + max(n, lookahead)` 估算，比 `may_append` 实际分配多估 `max(n, la) − la` 个位置（不开 MTP 时 1 个，k=3 时 2 个）。→ 第 3 批调度器的抢占判断
 - **Qwen3-Next 的 GDN 状态**：状态 dtype 为 torch_dtype（bf16），每请求 36 层 × 548,864 个数 ≈ 37.7 MiB，约等于 1608 个 token 的全注意力 KV。→ 第 8 批
 - 疑点（以"观察："写在注释中，读对应批次时再核对）：`reconcile_orphan_load_slots` 在同一请求多次停放时，迟到的报告可能提前释放较新的、仍在写入的槽位（→ 第 9 批）；`block_table_convert` 被 MiniMax-M3 以 token 数调用、kernel 却按页号比较（→ 第 8 批）。
+
+### 来自第 5 批
+
+- **规范位置**：GPU 异步执行 / stream / event → `engine_core.py` 文件开头"前置：GPU的异步执行与stream"；锁页内存 → `utils/__init__.py`；H2D 发布环 → `utils/h2d.py`；延迟输出的 GPU 侧 → `model_runner.py` tokenIDProcessor 上方【科普】；KV 显存预算 → `model_runner.py` get_num_blocks 上方的预算条；CUDA Graph 捕获实现 → `model_runner.py` capture_cudagraph（概念仍在 `config.py` CUDAGraphMode 上方）；torch.compile / 切图 / 编译缓存 → `utils/decorators.py` 文件头【科普】①~⑥；KV pool 字节布局 → `attentions/pool_layout/__init__.py`；逐 token 下标 → `attentions/token_layout/__init__.py`；eager/回放决策与 AttentionMetaData → `utils/forward_context.py`；GPU 采样 → `model_ops/sampler.py`；权重加载与 TP/融合参数 → `model_loader/loader.py` 文件头。
+- **`capture_sizes` 的顺序**：`capture_cudagraph` 开头按降序录制，结尾 `capture_sizes.sort()` 又改回升序；因此 tokenIDProcessor 里 `next(g for g in reversed(capture_sizes) if g >= bs)` 取到的是最大的 ≥bs 档（只多清零，不影响结果）。录图前 `capture_sizes == [0]`。
+- **显存预算例子**（70B、80 层、8 个 KV 头、FP8 KV、192GB、util 0.9）：每 token 约 165KB（含 FP8 每 token 每头的 fp32 scale），每 block 2,703,360 B，KV 约 87.36GB → 34,698 个 block ≈ 55.5 万 token；同例 nano-vllm 的公式得 92.8GB，差额来自 CUDA Graph 池估计、2% 余量、状态池、connector 缓冲及与空闲显存取 min。
+- **DP 下各 rank 的 token 数**来自 `ForwardMode.decide` 里那一次 gloo all_gather（而不是每步单独 all_reduce）。
+- **采样噪声**：默认整批共用一行 `(1, V)` 指数噪声（每次调用重新生成，名字里的 cached 并无缓存），只有 n>1 扇出时 `needs_independent_noise=True` 才逐行独立；RapidServe 的 `prefill_forward` 没传这个参数（以"观察："记录）。
+- **权重分发的打包匹配**（`weight_dispatch.py`）是按插入顺序的纯子串匹配，和 `QuantizationConfig.remap_layer_name` 的点号前缀匹配不同；list 形式的 `gate_up_proj` 会被更早的 `up_proj` 抢先命中。
