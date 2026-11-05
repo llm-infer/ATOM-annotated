@@ -1682,7 +1682,8 @@ def step_pad_rows(num_rows: int) -> torch.Tensor | None:
 # Thread-local storage for TBO dual-thread execution
 # 【译】TBO 双线程执行用的线程局部存储
 # 【分支】TBO（第9批）：两个微批在两个 Python 线程里交替跑模型，每个线程要看到自己微批的 ForwardContext；
-#   utils/tbo/ubatching.py 在线程里设 _forward_context_local.ctx，退出时清掉。threading.local() 的属性每个线程各一份
+#   utils/tbo/ubatching.py 在每个微批线程里设 _forward_context_local.ctx，utils/tbo/ubatch_wrapper.py 跑完后清掉。
+#   Python 语法：threading.local() 的属性每个线程各有一份，互不可见
 
 _forward_context_local = threading.local()
 

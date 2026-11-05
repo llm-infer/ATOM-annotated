@@ -121,7 +121,7 @@ class SubPoolSpec:
     # 【译】仅 STATE 用。entries_per_req 是一个在途请求持有的条目数——1 份已提交状态；为每个投机 token 保留
     #   一个回滚槽位时是 1 + num_spec；滑动窗口类则是窗口占的 block 数。extra_entries 是加在整个类上的
     #   固定余量，在"每请求"那一项之外。它用来覆盖什么由声明它的后端决定。
-    # 例：GDN 不开 MTP 时 entries_per_req = 1，MTP k=3 时 = 4（gdn_attn.py slots_per_req）；
+    # 例：GDN 不开 MTP 时 entries_per_req = 1，MTP k=3 时 = 4（gdn_attn.py slots_per_req；开 ReplaySSM 时恒为 1）；
     #   v0.1.8 中没有后端传非 0 的 extra_entries（kimi_mla_gdn_attn.py 只是原样转发 GDN 的 0）
     entries_per_req: int = 0
     extra_entries: int = 0
