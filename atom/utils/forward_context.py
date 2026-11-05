@@ -160,9 +160,10 @@ def _compute_chunked_local_num_tokens(
 #   对比nano-vllm：nano-vllm 只有 TP 没有 DP，没有对应结构；这个类沿用自 vLLM forward_context.py 的同名类
 # 字段（都在 CPU 上）：
 #   max_tokens_across_dp_cpu  0 维 int32 张量：全组最大 token 数
-#   cu_tokens_across_dp_cpu   [dp_size] int32：各 rank token 数的（含本项）前缀和，上例为 [13, 83, 84, 124]
-#   max_tokens_across_dp      同一个最大值的 Python int。行尾英文：预先算好的 int，为了兼容 cudagraph——
-#                             在 forward 里对张量调 .item() 会触发同步，录图 / 编译时也不允许
+#   cu_tokens_across_dp_cpu   [dp_size] int64（torch.cumsum 对整数输入默认升到 int64）：各 rank token 数的（含本项）
+#                             前缀和，上例为 [13, 83, 84, 124]
+#   max_tokens_across_dp      同一个最大值的 Python int（make 里先 .item() 好）。行尾英文：为兼容 cudagraph 预先算好的 int——
+#                             使用方直接拿常量，不必在 forward 里再从张量取值（.item() 在 torch.compile 抓图时会造成图中断）
 #   local_sizes               只在 chunked_sizes 的 with 块里有效
 @dataclass
 class DPMetadata:

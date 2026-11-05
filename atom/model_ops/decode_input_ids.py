@@ -64,7 +64,7 @@ each request's own span keeps that unexpressible.
 #     测试 tests/test_decode_input_ids.py 用下面的 CPU 参考实现验证性质
 #   前置：延迟输出（engine_core.py 文件头【3】）——第 N 步 forward 只等待并返回第 N-1 步的 token，第 N 步自己采到的
 #     sampled_token_ids 留在 GPU 上（另由 async_copy_stream 异步拷回），下一步才取。所以 CPU 准备第 N+1 步输入时，
-#     还没有第 N 步的 token：调度器写进序列 / scheduled_tokens 的只是占位（eos id，见 scheduler.py postprocess 的占位说明）
+#     还没有第 N 步的 token：调度器写进序列 / scheduled_tokens 的只是占位（eos id，见 scheduler.py 文件头【前置②】）
 #   对比nano-vllm：nano-vllm 在 postprocess 里同步把 token 拷回 CPU、append 进序列，prepare_decode 再用 seq.last_token 建
 #     input_ids 并 H2D——CPU 必须等 GPU 算完才能准备下一步。ATOM 让 CPU 准备下一步时根本不需要知道 token 的值：
 #     input_ids 由这个 kernel 在 GPU 上从 prev_token_ids 拼出来，排在上一步采样 kernel 之后（同一条 stream）

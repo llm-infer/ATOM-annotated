@@ -74,6 +74,7 @@ Nothing is re-exported.
 #     slot_mapping         48 … 63 │ 128 … 131             144 … 151             槽位，slots.slot_mapping
 #                          （pos 0~15 → block 3；16~19 → block 8）（pos 32~39 → 逻辑 block 2 → block 9）
 #     batch_id_per_q       0 × 20                          1 × 8                 batch_ids.build_batch_ids；若 pad_to = 32，尾部补 4 个 −1
+#                          （由需要它的 builder 经 publish_batch_ids 生成，如 aiter_mla.py 的稀疏 prefill / decode）
 #     batch_id_per_k       0 × 20                          1 × 40                build_batch_ids_device（长 60，在 device 上；只在有前缀命中或 TBO 时建）
 #   ② 下一步普通 decode（每条序列 1 个 token；slot 由 builder 内联算，不在本包）：
 #     A 送 pos 20（context 21）→ 逻辑 block 1 → block 8 → slot 8 × 16 + 4 = 132

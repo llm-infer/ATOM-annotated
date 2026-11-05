@@ -65,7 +65,8 @@ def build_batch_ids(
     # 输入：seqlens [B] = 每条序列的 token 数；pad_to = 档位宽度（None 表示不补）；out = 可选的预分配 int32 缓冲
     # 输出：[pad_to 或 sum(seqlens)] 的 int32 数组。例：seqlens = [20, 8]、pad_to = 32 → [0 × 20, 1 × 8, −1 × 4]
     # 调用方：backends.py CommonAttentionBuilder.publish_batch_ids（写进 forward_vars["batch_id_per_q_token"] 并上传；
-    #   aiter_attention.py、aiter_mla.py 的 decode / prefill 路径调它）、deepseek_v4_attn.py（多处，含 TBO 的各 ubatch）、
+    #   它的调用方是 aiter_attention.py prepare_decode 的稀疏路径、aiter_mla.py 的 prepare_prefill / prepare_decode /
+    #   build_for_cudagraph_capture）、deepseek_v4_attn.py（多处，含 TBO 的各 ubatch）、
     #   deepseek_v41/metadata.py、qwen4_exp_attn.py、models/deepseek_v41/bounded_replay.py
     # 读 −1 的 kernel 侧：例如 attention_mla.py、dcp_ops.py 里"`-1` marks a CUDAGraph pad token"处
     total = int(seqlens.sum())
