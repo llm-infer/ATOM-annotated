@@ -6504,6 +6504,49 @@ class ModelRunner:
         )
 
 
+# ═════════════════════════════════════════════════════════════════════════════════════════════════════════
+# 【分支】RapidServeModelRunner：同一组GPU上的prefill/decode分离（--enable-rapidserve），B级，见第9批
+# ═════════════════════════════════════════════════════════════════════════════════════════════════════════
+# 是什么：RapidServe把prefill和decode拆成两个EngineCore进程（PrefillEngineCore / DecodeEngineCore），跑在同一组GPU上；两边的
+#   TP rank r在同一张卡上，各有一个本类的实例（Config.__post_init__在enable_rapidserve时把runner_qualname换成本类）。
+#   为什么要拆（一次几百ms的prefill会让所有decode停一步，ITL出尖刺）见engine_core_mgr.py DisaggCoreManager上方的【科普】；
+#   两个进程之间的通道、两轮启动握手、一个请求的时间线见engine_core.py文件末尾"【分支】PD分离（同GPU的RapidServe…）"一段的图。
+#   这里只讲runner这一层改了什么
+# 前置①CUDA/HIP IPC（完整讲解见model_engine/ipc_utils.py文件头的【科普】）：一个进程里的显存指针在别的进程里无效；
+#   hipIpcGetMemHandle把一块显存变成几十字节的句柄，同一张物理GPU上的另一个进程hipIpcOpenMemHandle之后，得到指向同一块物理
+#   显存的张量，不拷贝数据。RapidServe用它让decode进程直接使用prefill进程的权重和KV池。例（ipc_utils.py的数字）：70B模型bf16、
+#   TP=8，每张卡约17.5GB权重——共享后整卡只有一份；不共享就是两份，KV预算要再少17.5GB
+# 前置②CU与CU mask（scheduler.py _optimal_cu_fraction里的注释、engine_core.py"代价①"）：CU（Compute Unit）是AMD GPU的计算单元
+#   （相当于NVIDIA的SM），MI300X每卡304个；kernel的线程块由硬件派到各个CU上执行。hipExtStreamCreateWithCUMask能创建一个
+#   "只准用某些CU"的stream：比例0.5时prefill的stream只用CU [0, 152)、decode的用[152, 304)，一次长prefill就占不满整卡
+#
+# 同一个类跑在两个进程里，按config.disagg_is_decode分叉（DisaggCoreManager给decode那份config设True）：
+#   ┌──────────────────────────┬───────────────────────────────────────────────┬──────────────────────────────────────────────────┐
+#   │ 覆盖点                   │ prefill进程（disagg_is_decode=False）         │ decode进程（True）                               │
+#   ├──────────────────────────┼───────────────────────────────────────────────┼──────────────────────────────────────────────────┤
+#   │ __init__                 │ self.forward = self.prefill_forward           │ （不变）                                         │
+#   ├──────────────────────────┼───────────────────────────────────────────────┼──────────────────────────────────────────────────┤
+#   │ _build_and_load_model    │ 基类：真实加载权重                            │ 参数建在meta设备上（0字节），之后                │
+#   │                          │                                               │ import_model_weight_ipc_handles换成prefill的权重 │
+#   ├──────────────────────────┼───────────────────────────────────────────────┼──────────────────────────────────────────────────┤
+#   │ _maybe_warmup            │ 基类warmup（经self.forward走prefill_forward） │ 跳过：还没有真实权重                             │
+#   ├──────────────────────────┼───────────────────────────────────────────────┼──────────────────────────────────────────────────┤
+#   │ _kv_budget_extra_reserve │ KV预算多扣 4 × 2% = 8%                        │ （用不到：get_num_blocks直接返回）               │
+#   ├──────────────────────────┼───────────────────────────────────────────────┼──────────────────────────────────────────────────┤
+#   │ get_num_blocks           │ 基类                                          │ 返回0个block（KV池来自prefill）                  │
+#   ├──────────────────────────┼───────────────────────────────────────────────┼──────────────────────────────────────────────────┤
+#   │ allocate_kv_cache        │ 基类：分配真实的KV池                          │ 跳过；之后import_kv_cache_ipc_handle             │
+#   │                          │                                               │ → _bind_kv_cache_to_modules                      │
+#   ├──────────────────────────┼───────────────────────────────────────────────┼──────────────────────────────────────────────────┤
+#   │ IPC导出 / 导入           │ export_model_weight_ipc_handles               │ import_model_weight_ipc_handles                  │
+#   │                          │ export_kv_cache_ipc_handle                    │ import_kv_cache_ipc_handle                       │
+#   ├──────────────────────────┼───────────────────────────────────────────────┼──────────────────────────────────────────────────┤
+#   │ stream池                 │ create_prefill_stream_pool                    │ create_decode_stream_pool                        │
+#   ├──────────────────────────┼───────────────────────────────────────────────┼──────────────────────────────────────────────────┤
+#   │ 每一步                   │ prefill_forward：强制eager，                  │ forward：模型在decode stream上跑，               │
+#   │                          │ 同步返回每个请求的首token                     │ 采样和D2H在默认stream上                          │
+#   └──────────────────────────┴───────────────────────────────────────────────┴──────────────────────────────────────────────────┘
+#   调用方：上表的方法都由engine_core.py的PrefillEngineCore / DecodeEngineCore经call_func驱动（各方法上方写了具体是哪一处）
 class RapidServeModelRunner(ModelRunner):
     """ModelRunner for intra-GPU prefill/decode disaggregation.
 
@@ -6511,6 +6554,11 @@ class RapidServeModelRunner(ModelRunner):
     differs between them keys off config.disagg_is_decode.
     """
 
+    # 【译】用于单GPU内prefill/decode分离的ModelRunner。
+    #
+    #   同一个类同时运行在prefill和decode两个进程里；两边行为不同的地方以config.disagg_is_decode为准。
+    # 先换forward、再调基类__init__：基类__init__末尾的warmup_model会调self.forward，prefill进程里它因此走prefill_forward
+    #   self.forward = ...是实例属性，会遮住同名的类方法（查self.forward时先找实例的__dict__），EngineCore的"forward"RPC同理
     def __init__(self, rank, config):
         if not config.disagg_is_decode:
             self.forward = self.prefill_forward
@@ -6519,6 +6567,9 @@ class RapidServeModelRunner(ModelRunner):
 
         # Session ID derived from the disagg IPC address so IPC handoff temp
         # files from different engine runs never collide.
+        # 【译】会话ID由disagg的IPC地址导出，这样不同次引擎运行的IPC交接临时文件永远不会撞名。
+        # 解释：disagg_kvcache_ipc_addr是DisaggCoreManager用uuid4生成的ipc路径，prefill、decode两份config里是同一个值，
+        #   所以两边算出同一个会话ID；取md5的前12个十六进制字符只是为了让文件名短一些
         self._disagg_session_id = hashlib.md5(
             config.disagg_kvcache_ipc_addr.encode()
         ).hexdigest()[:12]
@@ -6534,6 +6585,13 @@ class RapidServeModelRunner(ModelRunner):
         the whole model. Used by decode in disagg, which fills params from
         prefill via IPC.
         """
+        # 【译】构造模型时把所有 `nn.Parameter` 都放到meta设备上（不持久分配GPU权重），但默认device保持不变，所以显式针对CUDA的
+        #   初始化代码（例如aiter的RoPE）和buffer照常工作。每个参数先在真实设备上短暂创建，再被换成meta张量，所以瞬时峰值是
+        #   一个参数而不是整个模型。用于disagg里的decode，它的参数之后经IPC从prefill填进来。
+        # 解释：做法是临时替换（monkey-patch）nn.Module.register_parameter：每注册一个参数，就立刻换成同形状、同dtype、同
+        #   requires_grad的meta张量；@contextmanager + try/finally保证退出with时一定恢复原函数
+        #   meta设备：只记shape和dtype、不分配内存的虚拟设备（ipc_utils.py文件头的【前置】）。例：一个[8192, 8192]的bf16权重
+        #   在GPU上占128MiB，构造时只瞬时占这128MiB，换成meta后为0
         orig_register = torch.nn.Module.register_parameter
 
         def register_parameter(self, name, param):
@@ -6553,7 +6611,9 @@ class RapidServeModelRunner(ModelRunner):
     # ------------------------------------------------------------------
     # Base ModelRunner override points
     # ------------------------------------------------------------------
+    # 【译】基类ModelRunner的覆盖点
 
+    # 构造并加载模型（覆盖基类）：prefill照常加载；decode只搭"空架子"、不调用load_model
     def _build_and_load_model(self, model_class):
         config = self.config
         if not config.disagg_is_decode:
@@ -6564,6 +6624,8 @@ class RapidServeModelRunner(ModelRunner):
         # bytes (avoids the transient 2x-weights peak that OOMs at TP=4);
         # import_model_weight_ipc_handles() materializes params from prefill,
         # and RoPE caches are recomputed locally.
+        # 【译】decode经CUDA IPC导入prefill的权重，自己不占权重显存。在meta设备上构造，构造过程就不分配任何GPU字节（避免瞬时出现
+        #   两倍权重的峰值——TP=4时会OOM）；import_model_weight_ipc_handles()再用prefill的参数把它们实体化，RoPE缓存则在本地重新计算。
         with self._init_weight_params_on_meta():
             self.model = model_class(config)
         torch.set_default_device(None)
@@ -6571,19 +6633,29 @@ class RapidServeModelRunner(ModelRunner):
     def _maybe_warmup(self):
         # Decode owns no GPU memory yet (weights/kvcache imported from prefill
         # later), so warmup would run against meta-device tensors — skip it.
+        # 【译】decode此时还没有任何GPU显存（权重/kvcache之后才从prefill导入），warmup会对着meta设备上的张量跑——所以跳过。
+        # 解释：于是decode进程的激活峰值从没被测过，它之后的这部分显存靠prefill一侧多留的余量兜底（见下一个方法）
         if self.config.disagg_is_decode:
             return
         super()._maybe_warmup()
 
+    # 只有prefill进程会走到这里（decode的get_num_blocks提前返回了）：基类get_num_blocks从KV预算里额外扣掉这个数
+    # 例：192GB的卡 → safety_margin = 3.84GB，这里再多扣 4 × 3.84 = 15.36GB（基类本来已扣过一份2%）
+    # 为什么要多留：prefill算KV预算时，decode进程之后还要分配的东西都还不存在——它自己的激活（warmup被跳过，峰值没人测过）、
+    #   CUDA Graph内存池（prefill强制eager，基类_estimate_cudagraph_overhead对它返回0）、RCCL等缓冲，只能用固定比例兜底
     def _kv_budget_extra_reserve(self, total_bytes: int) -> int:
         # Two processes share the GPU in disagg mode; reserve extra headroom so
         # NCCL/system allocs (e.g. the 512MB NCCL barrier buffer) don't OOM.
+        # 【译】分离模式下两个进程共享GPU；多预留一些余量，免得NCCL/系统的分配（例如512MB的NCCL barrier缓冲）OOM。
         safety_margin = int(total_bytes * 0.02)
         return 4 * safety_margin
 
+    # decode进程：不做显存估算，返回0个block（真正的block数之后随KV句柄从prefill传来，DecodeEngineCore回填）
+    #   state_runtime：状态快照的传输描述（state_runtime.py，第4批），EngineCore照常读取；PAGE方式的状态checkpoint不支持RapidServe
     def get_num_blocks(self) -> dict[str, object]:
         # Decode in disagg mode owns no GPU memory — kvcache is imported from
         # prefill.
+        # 【译】分离模式下decode不拥有GPU显存——kvcache是从prefill导入的。
         if self.config.disagg_is_decode:
             transfer = self.attn_metadata_builder.state_transfer()
             if transfer.copies:
@@ -6597,13 +6669,24 @@ class RapidServeModelRunner(ModelRunner):
             }
         return super().get_num_blocks()
 
+    # decode进程跳过分配（返回True：wait_out=True的RPC必须有非None返回值，否则EngineCore会一直等，见async_proc.py）
     def allocate_kv_cache(self, num_kvcache_blocks):
         # Decode in disagg mode: kvcache is imported from prefill, not allocated.
+        # 【译】分离模式下的decode：kvcache从prefill导入，不在这里分配。
         if self.config.disagg_is_decode:
             logger.info("decode skipping kv cache allocation")
             return True
         return super().allocate_kv_cache(num_kvcache_blocks)
 
+    # decode进程每一步的forward（覆盖基类；prefill进程的self.forward已被换成prefill_forward，不会走到这里）
+    # 调用方：DecodeEngineCore的step（call_func("forward", batch)）
+    #   默认stream  ：…[上一步postprocess：采样、prev_token_ids]ev(_done_event)               ┌等_model_fwd_event┐[postprocess：采样 → D2H]
+    #   decode stream：                                └等_done_event┘[H2D][补token kernel][模型forward / graph回放]ev(_model_fwd_event)
+    #   ① _done_event：decode stream先等默认stream上已排的活——本步的补token kernel要读上一步postprocess写出的prev_token_ids
+    #   ② _model_fwd_event：默认stream等模型forward做完，采样才能读logits
+    #   batch.cu_stream_fraction：调度器按共享内存里两边的负载选的比例（0.5或None），见scheduler.py _optimal_cu_fraction
+    #   与基类forward相比没有：PP / 中间chunk分支、drafter.compute_draft_kv（只有DSpark实现了它）、_record_kv_cache_ready——
+    #     decode进程只跑decode批
     @_profile_runner_stage
     @torch.inference_mode()
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
@@ -6612,6 +6695,8 @@ class RapidServeModelRunner(ModelRunner):
         # GPU; postprocess (sampling + async CPU copy) stays on the default
         # stream. The stream pool is created by DecodeEngineCore via
         # create_decode_stream_pool().
+        # 【译】decode在一个动态选择的（可选按CU屏蔽的）stream上跑模型forward，以免在共享的GPU上与prefill争抢；postprocess（采样 +
+        #   异步拷回CPU）留在默认stream上。stream池由DecodeEngineCore经 create_decode_stream_pool() 创建。
         stream = self._decode_streams[batch.cu_stream_fraction]
         self._done_event.record()
         stream.wait_event(self._done_event)
@@ -6632,6 +6717,8 @@ class RapidServeModelRunner(ModelRunner):
         torch.cuda.current_stream().wait_event(self._model_fwd_event)
 
         # postprocess (sampling + async CPU copy) always runs on default stream.
+        # 【译】postprocess（采样 + 异步拷回CPU）总是在默认stream上运行。
+        # 解释：decode进程照常开着延迟输出（不是PP、也不是connector式的PD producer），tokenIDProcessor的D2H在它自己的副stream上
         fwd_output = self.postprocess(
             batch,
             logits,
@@ -6658,7 +6745,22 @@ class RapidServeModelRunner(ModelRunner):
     # Rank 0 waits until all N files exist, then returns the list of paths to
     # the engine.  On the import side every rank reads its own file (index=self.rank).
     # ------------------------------------------------------------------
+    # 【译】disagg的IPC辅助函数（感知TP）
+    #
+    #   TP>1时，AsyncIOProcManager把每个RPC广播给所有rank，但只有rank 0的返回值能到达引擎（其他rank的输出socket接的是None）。
+    #   因此交换IPC句柄时，我们用"每个rank一个临时文件"的会合方式：每个rank把本地的句柄pickle进
+    #     /tmp/atom_disagg_<tag>_rank<N>.pkl
+    #   rank 0等到N个文件都存在后，把路径列表返回给引擎。导入一侧，每个rank读自己的那个文件（index=self.rank）。
+    # 解释：实际文件名还带会话ID：<tempfile.gettempdir()>/atom_disagg_<会话ID>_<tag>_rank<N>.pkl（gettempdir通常是/tmp，设了
+    #   TMPDIR时随之变化）。为什么不能直接把句柄当RPC返回值：每张卡的句柄各不相同，而只有rank 0的返回值回得去
+    #   以TP=2导出权重为例：
+    #     PrefillEngineCore ──call_func("export_model_weight_ipc_handles")──► 广播给rank 0、rank 1
+    #       rank 0：导出 → 写 …_weights_rank0.pkl → 轮询直到rank0、rank1两个文件都在 → 返回[路径0, 路径1]
+    #       rank 1：导出 → 写 …_weights_rank1.pkl → 返回None（被丢弃）
+    #     PrefillEngineCore ──[路径0, 路径1]经ZMQ──► DecodeEngineCore ──call_func("import_model_weight_ipc_handles", 路径列表)
+    #       decode的rank r：读paths[r]、删掉文件、hipIpcOpenMemHandle → 用的是同一张卡上prefill rank r的那份显存
 
+    # 本rank、某个tag（"weights" / "kvcache"）的临时文件路径
     def _disagg_rank_file_path(self, tag: str, rank: int) -> str:
         import tempfile
 
@@ -6675,6 +6777,11 @@ class RapidServeModelRunner(ModelRunner):
         write concurrently when they receive the broadcast RPC, so rank 0
         must never delete sibling files.
         """
+        # 【译】把 *payload* pickle进一个按会话唯一、每个rank一个的临时文件。
+        #
+        #   使用由disagg IPC地址导出的会话ID，这样不同次引擎运行的文件永远不会撞名。这里不删除：所有rank在收到广播的RPC时
+        #   并发地写文件，所以rank 0绝不能删除兄弟rank的文件。
+        # 解释：文件由导入一侧读完后删除（import_model_weight_ipc_handles / import_kv_cache_ipc_handle里的os.remove）
         import pickle
 
         path = self._disagg_rank_file_path(tag, self.rank)
@@ -6686,11 +6793,15 @@ class RapidServeModelRunner(ModelRunner):
         """Rank 0: poll until all world_size rank files exist, return paths.
         Other ranks: return None immediately (rank 0 is the sole publisher).
         """
+        # 【译】rank 0：轮询直到world_size个rank的文件都存在，返回路径。其他rank：立即返回None（rank 0是唯一的发布者）。
+        # 观察：判断"到齐"用的是os.path.exists，而文件在open(path, "wb")那一刻就存在了，pickle.dump可能还没写完；返回的路径要经ZMQ
+        #   转到decode进程、再由另一次RPC去读，正常情况下早已写完，但没有"写完再改名"之类的原子保证（按代码推断）
         import time
 
         if self.rank != 0:
             return None
         paths = [self._disagg_rank_file_path(tag, r) for r in range(self.tp_world_size)]
+        # 【译】（行尾注释）2分钟超时
         deadline = time.monotonic() + 120  # 2 min timeout
         while time.monotonic() < deadline:
             if all(os.path.exists(p) for p in paths):
@@ -6701,6 +6812,7 @@ class RapidServeModelRunner(ModelRunner):
             + str([p for p in paths if not os.path.exists(p)])
         )
 
+    # 启动握手第1轮（prefill一侧）：调用方PrefillEngineCore._post_model_load_hook（权重加载完、KV预算之前）
     def export_model_weight_ipc_handles(self) -> list[str] | None:
         """Export all model parameters as CUDA IPC handles (prefill process only).
 
@@ -6709,6 +6821,10 @@ class RapidServeModelRunner(ModelRunner):
         Decode calls import_model_weight_ipc_handles(paths) to replace its own
         weight tensors with zero-copy views into prefill's allocation.
         """
+        # 【译】把模型的所有参数导出为CUDA IPC句柄（只在prefill进程里）。
+        #
+        #   感知TP：每个rank把自己的句柄写进一个临时文件。rank 0等齐所有rank的文件后返回路径列表；其他rank返回None。
+        #   decode调用 import_model_weight_ipc_handles(paths)，把它自己的权重张量换成指向prefill那块分配的零拷贝视图。
         from atom.model_engine.ipc_utils import export_model_weight_handles
 
         logger.info(f"ModelRunner rank {self.rank}: export_model_weight_ipc_handles")
@@ -6719,14 +6835,20 @@ class RapidServeModelRunner(ModelRunner):
             logger.info(
                 f"ModelRunner rank 0: all {self.tp_world_size} weight files ready"
             )
+        # 【译】（行尾注释）只有rank 0不为None
         return paths  # non-None only for rank 0
 
+    # 启动握手第1轮（decode一侧）：调用方DecodeEngineCore._post_model_load_hook；参数paths是prefill的rank 0返回、经ZMQ转来的路径列表
     def import_model_weight_ipc_handles(self, paths: list[str]) -> bool:
         """Replace model parameters with views into prefill's GPU allocation.
 
         TP-aware: each rank reads its own handles file (index=self.rank) and
         deletes it after import.  Returns True as sentinel for wait_out=True.
         """
+        # 【译】把模型参数换成指向prefill那块GPU分配的视图。
+        #
+        #   感知TP：每个rank读自己的句柄文件（index=self.rank），导入后删除它。返回True，作为wait_out=True的哨兵。
+        # 解释：返回值必须非None——AsyncIOProc对返回None的方法不回包，wait_out=True的调用方会一直等（async_proc.py）
         import gc
         import pickle
 
@@ -6738,9 +6860,12 @@ class RapidServeModelRunner(ModelRunner):
             handles = pickle.load(f)
         os.remove(path)
         import_model_weights(self.model, handles)
+        # 回收构造期的临时对象、把缓存分配器里的空闲块还给驱动，好让随后prefill测空闲显存（KV预算）时看得到
+        #   （DecodeEngineCore那边回ACK之前还会sleep(2)）
         gc.collect()
         torch.cuda.empty_cache()
         # Surface any tensor prefill didn't export (would crash later in forward).
+        # 【译】把prefill没导出的张量暴露出来（否则之后会在forward里崩溃）。
         leftover = [n for n, p in self.model.named_parameters() if p.is_meta] + [
             n
             for n, b in self.model.named_buffers()
@@ -6751,17 +6876,24 @@ class RapidServeModelRunner(ModelRunner):
                 f"ModelRunner rank {self.rank}: {len(leftover)} tensors still on "
                 f"meta after IPC import (not materialized): {leftover[:10]}"
             )
+        # 解释：日志说"own weights freed"，其实decode的参数从一开始就在meta上、从未分配过权重（见_build_and_load_model）
         logger.info(
             f"ModelRunner rank {self.rank}: weight IPC import complete — own weights freed"
         )
         return True
 
+    # 启动握手第2轮（prefill一侧）：调用方PrefillEngineCore._send_ready_signal（allocate_kv_cache之后、发READY之前）
     def export_kv_cache_ipc_handle(self) -> list[str] | None:
         """Export self.kv_cache — the whole paged pool — as a CUDA IPC handle.
 
         TP-aware: each rank writes its handles to a temp file.  Rank 0 waits for
         all ranks and returns the list of paths; other ranks return None.
         """
+        # 【译】把self.kv_cache——整个分页KV池——导出为一个CUDA IPC句柄。
+        #
+        #   感知TP：每个rank把自己的句柄写进临时文件。rank 0等齐所有rank后返回路径列表；其他rank返回None。
+        # 解释：self.kv_cache是allocate_kv_cache里_back_paged_pools返回的那一整块uint8缓冲（各builder的区域、量化scale、索引器缓存、
+        #   草稿模型的兄弟池都在里面），所以一个句柄就带走了全部分页池；每请求状态池不在其中
         from atom.model_engine.ipc_utils import export_kv_cache_handle
 
         logger.info(f"ModelRunner rank {self.rank}: export_kv_cache_ipc_handle")
@@ -6774,6 +6906,8 @@ class RapidServeModelRunner(ModelRunner):
             )
         return paths  # non-None only for rank 0
 
+    # 启动握手第2轮（decode一侧）：调用方DecodeEngineCore.__init__；num_kvcache_blocks随句柄一起从prefill传来
+    #   之后DecodeEngineCore把这个block数回填进自己的config，再capture_cudagraph（KV池已是真的）
     def import_kv_cache_ipc_handle(
         self, paths: list[str], num_kvcache_blocks: int
     ) -> bool:
@@ -6783,6 +6917,12 @@ class RapidServeModelRunner(ModelRunner):
         deletes it after import.  Also imports kv_scale when present (fp8).
         Returns True as sentinel for wait_out=True.
         """
+        # 【译】把prefill的那块GPU分配作为kvcache导入本（decode）进程。
+        #
+        #   感知TP：每个rank读自己的句柄文件（index=self.rank），导入后删除它。存在kv_scale（fp8）时也一并导入。
+        #   返回True，作为wait_out=True的哨兵。
+        # 解释：现在kv_scale不再单独导入——它是同一块池里的一个区域，随整块缓冲一起过来，由_bind_kv_cache_to_modules按同样的
+        #   声明切出来（ipc_utils.py export_kv_cache_handle的docstring）
         import pickle
 
         from atom.model_engine.ipc_utils import import_kv_cache
@@ -6790,6 +6930,8 @@ class RapidServeModelRunner(ModelRunner):
         # The count travels with the handle and reaches the builder through
         # `_bind_kv_cache_to_modules` -> `allocate_kv_cache_tensors` below; this
         # side never ran sizing, so there is nothing else it could come from.
+        # 【译】block数随句柄一起传过来，经下面的 `_bind_kv_cache_to_modules` -> `allocate_kv_cache_tensors` 到达builder；
+        #   这一侧从没跑过显存估算，所以它没有别的来源。
         path = paths[self.rank]
         logger.info(
             f"ModelRunner rank {self.rank}: reading kvcache handles from {path}"
@@ -6806,6 +6948,9 @@ class RapidServeModelRunner(ModelRunner):
         logger.info(f"ModelRunner rank {self.rank}: import_kv_cache_ipc_handle done")
         return True
 
+    # 把导入的KV池切成各builder的区域，并把每层的视图绑到attention模块上——走的是和基类allocate_kv_cache同一套
+    #   _back_paged_pools + build_kv_cache_tensor，所以两个进程对同一块字节的切法必然一致
+    # 调用方：import_kv_cache_ipc_handle
     def _bind_kv_cache_to_modules(self, num_kvcache_blocks: int):
         """Bind an IPC-imported KV pool to every attention module.
 
@@ -6822,6 +6967,18 @@ class RapidServeModelRunner(ModelRunner):
         attributes it publishes do not exist. Refused up front rather than met
         as an `AttributeError` on whichever layer binds first.
         """
+        # 【译】把经IPC导入的KV池绑定到每个注意力模块上。
+        #
+        #   P/D这一对里的decode一侧拿到的是池的句柄，所以它永远走不到 `allocate_kv_cache` 里的绑定循环。它绝不能做的，是用
+        #   *第二种方式*去绑定：这里以前把各个视图重新手写了一遍，V是4维的，而每个builder声明的都是5维。没有任何东西能发现
+        #   这个问题——两者每个字节都一致，只在读者据以分支的形状上不同。所以这里跑的是同一个循环、同一个钩子，一直做到给
+        #   各个池落实存储为止。
+        #
+        #   只处理分页池。每请求的STATE类按 `pool_plan` 定大小，而这里它是空的——随句柄传过来的只有block数，别的什么都没有——
+        #   所以 `allocate_per_req_cache` 无法运行，它发布的那些属性也不存在。在开头就拒绝，而不是在第一个绑定的层上撞见
+        #   `AttributeError`。
+        # 解释：和基类allocate_kv_cache相比，这里没有allocate_per_req_cache（状态池，被拒绝）、没有登记KV connector的传输张量
+        #   （set_kv_cache_data只传了kv_cache_data），也没有最后的barrier
         stateful = self._state_pool_names()
         if stateful:
             raise NotImplementedError(
@@ -6842,6 +6999,8 @@ class RapidServeModelRunner(ModelRunner):
                 # Same dispatch as the allocating path's loop: a draft with a
                 # pool of its own binds through its own builder, and its pool
                 # is now a region of the same imported buffer.
+                # 【译】和分配路径里那个循环的分派方式相同：有自己的池的草稿模型通过它自己的builder绑定，它的池现在是同一块
+                #   导入缓冲里的一个区域。
                 bound = None
                 if model_name == "draft" and hasattr(self, "draft_kv_builder"):
                     bound = self.draft_kv_builder.build_kv_cache_tensor(module)
@@ -6851,6 +7010,7 @@ class RapidServeModelRunner(ModelRunner):
                     # The same key the allocating path uses. Keyed by the walk's
                     # ordinal here until now, which agreed with it only while
                     # the first bound module was layer 0.
+                    # 【译】与分配路径使用同一个键。直到现在这里都用遍历的序号做键，只有在第一个被绑定的模块是第0层时两者才一致。
                     kv_cache_data[f"layer_{module.layer_num}"] = bound
 
         from atom.utils.forward_context import set_kv_cache_data
@@ -6860,6 +7020,7 @@ class RapidServeModelRunner(ModelRunner):
     # ------------------------------------------------------------------
     # CU-masked stream pools + prefill forward
     # ------------------------------------------------------------------
+    # 【译】按CU屏蔽的stream池 + prefill的forward
 
     @staticmethod
     def _stream_with_cu_mask(mask_bits: list[int]) -> torch.cuda.ExternalStream:
@@ -6868,6 +7029,11 @@ class RapidServeModelRunner(ModelRunner):
         mask_bits is a list of uint32 words; bit i of word w represents
         CU (w*32 + i).  Uses hipExtStreamCreateWithCUMask (ROCm only).
         """
+        # 【译】创建一个只能使用mask_bits所描述的那些CU的HIP stream。
+        #
+        #   mask_bits是uint32字的列表；第w个字的第i位代表CU (w*32 + i)。使用 hipExtStreamCreateWithCUMask（仅ROCm）。
+        # 解释：PyTorch没有封装这个HIP扩展接口，所以用ctypes直接调libamdhip64.so：先声明返回值和参数类型，再把Python列表转成
+        #   C的uint32数组；得到的裸stream指针用torch.cuda.ExternalStream包成PyTorch能用的stream（PyTorch不负责销毁它）
         hip = ctypes.CDLL("libamdhip64.so")
         hip.hipExtStreamCreateWithCUMask.restype = ctypes.c_int
         hip.hipExtStreamCreateWithCUMask.argtypes = [
@@ -6891,6 +7057,15 @@ class RapidServeModelRunner(ModelRunner):
         For upper=True  (decode):  CUs [split, total).
         split = round(total * fraction).
         """
+        # 【译】返回给定比例对应的CU mask位。
+        #
+        #   upper=False（prefill）：CU [0, split)。
+        #   upper=True （decode）： CU [split, total)。
+        #   split = round(total * fraction)。
+        # 例：MI300X total=304（multi_processor_count）、fraction=0.5 → split=152，num_words=(304+31)//32=10
+        #   prefill：字0~3 = 0xFFFFFFFF（CU 0~127），字4 = 0x00FFFFFF（CU 128~151），字5~9 = 0
+        #   decode ：字0~3 = 0，字4 = 0xFF000000（CU 152~159），字5~8 = 0xFFFFFFFF（CU 160~287），字9 = 0x0000FFFF（CU 288~303）
+        #   split被夹在[1, total-1]里，保证两边至少各有1个CU
         total = torch.cuda.get_device_properties(
             torch.cuda.current_device()
         ).multi_processor_count
@@ -6909,8 +7084,13 @@ class RapidServeModelRunner(ModelRunner):
         return words
 
     # CU fractions for which we pre-create masked streams.
+    # 【译】预先为其创建屏蔽stream的CU比例。
+    # 解释：与scheduler.py的_optimal_cu_fraction对应——它只会返回0.5或None，所以stream池里只有这两个键
+    #   ClassVar：类型标注里声明这是类变量（所有实例共享），不是每个实例的字段
     _CU_POOL_FRACTIONS: ClassVar[list[float]] = [0.5]
 
+    # 调用方：PrefillEngineCore._init_disagg（call_func，wait_out=True，所以返回True）
+    # 结果：self._prefill_streams = {0.5: 只用CU[0, split)的stream, None: 普通的全CU stream}（非受约束模式下只有None）
     def create_prefill_stream_pool(self) -> bool:
         """Create a pool of CUDA streams for disaggregated prefill.
 
@@ -6921,18 +7101,26 @@ class RapidServeModelRunner(ModelRunner):
         _optimal_cu_fraction().  In unconstrained mode, only the plain
         full-CU stream (None key) is created.
         """
+        # 【译】为分离式prefill创建一个CUDA stream池。
+        #
+        #   在IPC导入之后由 PrefillEngineCore._init_disagg() 调用一次。受约束模式下，为 _CU_POOL_FRACTIONS 里的每个比例预建一个
+        #   按CU屏蔽的stream，外加一个全CU的后备stream（键为None）；prefill_forward() 每次迭代经 _optimal_cu_fraction() 动态选择
+        #   stream。非受约束模式下只创建普通的全CU stream（键为None）。
+        # 解释：准确地说，比例由PrefillScheduler调_optimal_cu_fraction算好、放进batch.cu_stream_fraction，prefill_forward按它查表
         self._prefill_streams = {}
         if getattr(self.config, "disagg_constrained", False):
             for f in self._CU_POOL_FRACTIONS:
                 mask = self._cu_mask_for_fraction(f, upper=False)
                 self._prefill_streams[f] = self._stream_with_cu_mask(mask)
         # Full-CU fallback (no mask) — always present, sole entry in unconstrained mode
+        # 【译】全CU的后备stream（不屏蔽）——总是存在，在非受约束模式下是唯一的一项。
         self._prefill_streams[None] = torch.cuda.Stream()
         logger.info(
             f"Prefill stream pool created: fractions={list(self._prefill_streams.keys())}"
         )
         return True
 
+    # 调用方：DecodeEngineCore._init_disagg；另外建两个event给forward做两条stream之间的先后约束
     def create_decode_stream_pool(self) -> bool:
         """Create a pool of CUDA streams for disaggregated decode.
 
@@ -6942,12 +7130,17 @@ class RapidServeModelRunner(ModelRunner):
         iteration.  In unconstrained mode, only the plain full-CU stream
         (None key) is created.
         """
+        # 【译】为分离式decode创建一个CUDA stream池。
+        #
+        #   由 DecodeEngineCore._init_disagg() 调用一次。受约束模式下与prefill的池互补：比例为F时，decode得到CU [F*total, total)。
+        #   forward() 每次迭代动态选择stream。非受约束模式下只创建普通的全CU stream（键为None）。
         self._decode_streams = {}
         if getattr(self.config, "disagg_constrained", False):
             for f in self._CU_POOL_FRACTIONS:
                 mask = self._cu_mask_for_fraction(f, upper=True)
                 self._decode_streams[f] = self._stream_with_cu_mask(mask)
         # Full-CU fallback (no mask) — always present, sole entry in unconstrained mode
+        # 【译】全CU的后备stream（不屏蔽）——总是存在，在非受约束模式下是唯一的一项。
         self._decode_streams[None] = torch.cuda.Stream()
         self._model_fwd_event = torch.cuda.Event()
         self._done_event = torch.cuda.Event()
@@ -6956,6 +7149,14 @@ class RapidServeModelRunner(ModelRunner):
         )
         return True
 
+    # prefill进程每一步的forward（__init__里已绑成self.forward）；调用方：PrefillEngineCore._process_engine_step
+    #   （call_func("prefill_forward", batch)，以及基类warmup经self.forward）
+    # 输入：batch——PrefillScheduler排的prefill批（它从不切chunk）；输出：每个请求的首token，Python list[int]，按batch行序
+    # 和基类forward的区别：不走postprocess / tokenIDProcessor（没有延迟输出、没有草稿模型），采样后直接.tolist()同步拿结果；
+    #   prefill进程强制eager、从不录图，capture_sizes保持[0]，（DP=1时）ForwardMode.decide给出的running_bs就等于bs，logits正好bs行
+    # 观察：prepare_model返回的needs_independent_noise（这里接成_needs_independent_noise）没有传给sampler。按sampler.py
+    #   _temperature_sample的说明，不传时整批共用同一行缓存的指数噪声，SamplingParams.n>1的兄弟序列（logits相同）在temperature
+    #   采样下会采出相同的首token；基类postprocess是传了的
     @torch.inference_mode()
     def prefill_forward(self, batch: ScheduledBatch) -> list[int]:
         """Run a prefill forward pass on a dynamically selected CU-masked stream.
@@ -6967,6 +7168,12 @@ class RapidServeModelRunner(ModelRunner):
         the decode process can append them before the first decode step,
         matching the num_tokens state that non-disagg postprocess would produce.
         """
+        # 【译】在一个动态选择的、按CU屏蔽的stream上跑一次prefill forward。
+        #
+        #   为所有prompt token写入KV，为每个序列采样出第一个生成的token，然后在返回之前同步，让decode的默认stream能看到全部KV写入。
+        #   返回采样出的token ID列表（每个序列一个，按batch顺序）——它们被放进PrefillDone，让decode进程能在第一次decode之前把它们
+        #   追加上，与非分离模式下postprocess产生的num_tokens状态一致。
+        # 还没建stream池时（基类__init__里的warmup）用当前stream
         prefill_streams = getattr(self, "_prefill_streams", None)
         if prefill_streams is not None:
             stream = self._prefill_streams[batch.cu_stream_fraction]
@@ -6986,10 +7193,15 @@ class RapidServeModelRunner(ModelRunner):
             self._mark_staging_h2d_enqueued()
             logits, _ = self.run_model(input_ids, batch)
             # Sample the first generated token from each sequence's last logit
+            # 【译】从每个序列最后一个位置的logit采样出第一个生成的token
+            # logits [bs, V]（compute_logits只取每个序列的最后一个token）→ sampled [bs]；.tolist()是同步点
             sampled = self.sampler(logits, temperatures, top_ks, top_ps, all_greedy)
             sampled_cpu = sampled.view(-1).tolist()
             self._record_forward_vars_event()
         # Synchronize so decode's default stream sees all KV writes.
+        # 【译】同步，让decode的默认stream能看到全部KV写入。
+        # 解释：event不能跨进程等待，decode那边没法"等prefill的stream"；所以prefill在CPU上等自己的stream全部执行完再返回，
+        #   随后PrefillEngineCore才发PrefillDone——decode收到消息时，这批请求的KV已经写进共享的KV池
         stream.synchronize()
         self._record_kv_cache_ready(batch)
         reset_forward_context()
