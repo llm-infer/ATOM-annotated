@@ -6558,8 +6558,10 @@ class RapidServeModelRunner(ModelRunner):
     # 【译】用于单GPU内prefill/decode分离的ModelRunner。
     #
     #   同一个类同时运行在prefill和decode两个进程里；两边行为不同的地方以config.disagg_is_decode为准。
-    # 先换forward、再调基类__init__：基类__init__末尾的warmup_model会调self.forward，prefill进程里它因此走prefill_forward
-    #   self.forward = ...是实例属性，会遮住同名的类方法（查self.forward时先找实例的__dict__），EngineCore的"forward"RPC同理
+    # 先换forward、再调基类__init__：基类__init__里的warmup_model会调self.forward，prefill进程里它因此走prefill_forward
+    #   self.forward = ...是实例属性，会遮住同名的类方法（查self.forward时先找实例的__dict__），所以凡是按名字调forward的地方
+    #   （warmup_model、dummy_execution、call_func("forward")）在prefill进程里拿到的都是prefill_forward；
+    #   PrefillEngineCore自己每步则直接call_func("prefill_forward")
     def __init__(self, rank, config):
         if not config.disagg_is_decode:
             self.forward = self.prefill_forward

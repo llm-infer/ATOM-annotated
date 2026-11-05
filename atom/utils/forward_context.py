@@ -896,7 +896,8 @@ class Context:
     # positions：本步每个 token 的位置 [scheduled_tokens] int64（mRoPE 模型为 [3, N]）；
     #   prefill = 已缓存前缀长度 + 块内偏移；decode = context_len - q + j（j = 0..q-1，不投机时就是 context_len - 1，
     #   token_layout/decode.py decode_positions）。RoPE 和部分注意力后端读它
-    # is_dummy_run：DP 锁步的陪跑 batch（engine_core.py DPEngineCoreProc 上方），注意力据此跳过写 KV 等副作用
+    # is_dummy_run：DP 锁步的陪跑 batch（engine_core.py DPEngineCoreProc 上方）；注意力据此直接跳过计算
+    #   （attention_mha.py 返回 torch.empty_like(q)），只为陪同伴走完各层的集合通信
     positions: torch.Tensor
     is_prefill: bool = False
     is_dummy_run: bool = False
