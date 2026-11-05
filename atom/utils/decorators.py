@@ -91,11 +91,12 @@
 #       切分算法（节点怎么分到子图号）见 backends.py split_graph 上方的注释。
 #
 #     切开之后，每个稠密子图外面包什么，由 --cudagraph-mode 决定（backends.py PiecewiseCompileInterpreter.call_module）：
-#       FULL（命令行默认）：只包 PiecewiseBackend，不单独录图；ModelRunner.capture_cudagraph 再把整步 forward
-#         （37 个编译子图 + 36 次 attention）录成一张整图，每个 capture size 一张
+#       FULL（命令行默认；原生模式下 NONE 也走这条）：只包 PiecewiseBackend，不单独录图；ModelRunner.capture_cudagraph
+#         再把 decode 的整步 forward（37 个编译子图 + 36 次 attention）录成一张整图，每个 capture size 一张
 #       PIECEWISE / FULL_AND_PIECEWISE / AF_PIECEWISE：每个稠密子图再包一个 CUDAGraphWrapper(PIECEWISE)，各录各的小图，
 #         attention 在两张小图之间 eager 运行。例：默认 15 个 capture size（1~8、16、32、48、64、128、256、512）
 #         × 37 个子图 = 最多 555 张小图（capture_cudagraph 会先去掉 token 预算达不到的档位）
+#       不论哪种模式，prefill 和超过最大 capture size 的 decode 都不走图回放：直接按顺序执行这串子图（编译过的稠密子图 + eager 的 attention）
 #     为什么 attention 留在图外：attention 每步依赖的元数据都在变（每条序列的长度、block_table、prefill 和 decode 走不同 kernel），
 #       Inductor 看不懂 AITER kernel、无从优化，按每步元数据选 kernel 的 Python 逻辑也不能被②冻结；
 #       切开后，attention 在 Python 里现场读 forward_context 选 kernel，其余"形状只随 token 数变"的稠密部分照样编译、录图。

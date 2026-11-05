@@ -52,6 +52,7 @@ Currently registered:
 #     minimax_m3/model.py 用 `from atom.model_ops import module_dispatch_ops  # noqa: F401` 的方式只为触发注册而导入它
 #   观察：上面 docstring 的列表漏了本文件最后注册的 torch.ops.aiter.tbo_all_reduce（它不带 layer_name，是 TBO 的 all_reduce 包装）；
 #     docstring 说"方法列在每个算子的 docstring 里"，实际写在各算子上方的注释里
+#   对比nano-vllm：nano-vllm 只支持 Qwen3 dense 模型、不编译整个模型，没有 MoE，也不需要这类黑盒算子
 
 import torch
 

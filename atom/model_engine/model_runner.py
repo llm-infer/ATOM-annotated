@@ -109,8 +109,151 @@ from atom.utils.tbo import (
     maybe_create_ubatch_slices,
 )
 
+# ═════════════════════════════════════════════════════════════════════════════════════════════════════════
+# 本文件：ModelRunner——每个GPU进程里的"执行器"（第5批主干，A级）
+#   把EngineCore发来的一个ScheduledBatch变成GPU上的一次forward：准备输入 → forward → 采样 → 异步回传
+# ═════════════════════════════════════════════════════════════════════════════════════════════════════════
+# 在架构里的位置
+#   openai_server → LLMEngine → CoreManager ═ZMQ═> EngineCore（每个DP rank一个进程：调度器 + busy_loop，engine_core.py）
+#     ──AsyncIOProcManager（async_proc.py）经共享内存广播──> ModelRunner × (tp_world_size × PCP) 个worker进程（本文件）
+#   每个worker进程（async_proc.py的AsyncIOProc）构造一个runner：类名取自config.runner_qualname，默认就是下面的ModelRunner；
+#     开--enable-rapidserve时Config.__post_init__把它换成本文件末尾的RapidServeModelRunner。
+#     进程数不乘PP：PP的每个stage是独立的EngineCore，各有自己的一组runner（第9批）
+#   SPMD（Single Program Multiple Data）：EngineCore每步只调度一次，把同一个ScheduledBatch发给所有rank；每个rank跑完全相同的
+#     forward，只是手里的权重分片、KV分片不同。层内的all-reduce要求所有rank同时到场，少调一次就全体卡死（原理见engine_core.py
+#     文件开头【4】）。只有TP rank 0的返回值回到EngineCore，其余rank的返回值被丢弃（async_proc.py）
+#
+# 生命周期（按时间顺序；"EngineCore →"表示EngineCore经runner_mgr.call_func(方法名)在所有rank上调用、只用rank 0的返回值；
+#   EngineCore一侧的调用顺序见engine_core.py EngineCore.__init__上方的启动流程图）
+#   ① 构造（AsyncIOProc里）：ModelRunner.__init__——绑GPU、建TP/DP/PP/PCP进程组 → tokenIDProcessor（本文件下方）、Sampler
+#        → 按support_model_arch_dict选模型类，构造并加载本rank的权重分片（model_loader/，5c）→ 【分支】草稿模型（第7批）
+#        → 常驻输入/输出缓冲（CpuGpuBuffer：锁页CPU + GPU各一份，CUDA Graph要求地址固定）、注意力元数据builder（5b、第6批）
+#        → warmup_model：一次最大的假prefill，测出激活峰值；@support_torch_compile的模型在这第一次调用时由Dynamo抓图、编译
+#        （utils/decorators.py，5e）。__init__内部的①~⑧步见ModelRunner类上方的生命周期图
+#   ② 显存与KV（EngineCore →）
+#        get_num_blocks                   显存预算 → 能放多少个KV block（及各子池条目数）；EngineCore把它回填进自己的config
+#        allocate_kv_cache(num_blocks)    分配一块KV池，按各builder的声明切成区域，再把每层的视图绑到对应的attention模块
+#        【分支】profile_dynamic_chunking  PP动态分块的启动测量（第9批）
+#        capture_cudagraph                按捕获档位录CUDA Graph（enforce_eager时不调用）→ 返回(耗时, 档位, 录图新增的显存字节数)
+#        freeze_gc_heap                   gc.freeze启动期对象（utils/gc_utils.py）
+#   ③ 每一步（EngineCore →）：forward(batch)；DP>1时没活的rank调dummy_execution陪跑（见engine_core.py DPEngineCoreProc）
+#   ④ 退出（EngineCore →）：exit
+#
+# 一步forward的数据流（GPU侧的全流程；形状以"decode、bs=2、不开投机"为例：N=本步token数=2，H=hidden，V=词表大小）
+#   EngineCore: call_func("forward", batch, wait_out=True)
+#     │
+#     ▼ forward(batch)
+#   ├─ _advance_forward_vars、_gate_staging_reuse  选一组staging缓冲；确认上一次用它的H2D已经执行完，才往锁页缓冲里写
+#   ├─ prepare_model(batch)
+#   │    ├ ForwardMode.decide                  定下本步的形状：eager / FULL整图 / PIECEWISE，running_bs（bs向上取到捕获档位），
+#   │    │                                     DP下跨rank对齐（utils/forward_context.py）
+#   │    ├ prepare_sample                      temperatures [bs]、top_k / top_p（整批相同时只传标量）
+#   │    ├ tokenIDProcessor.prepare_input_ids  batch.scheduled_tokens → input_ids [N] int32；上一步还在GPU上的采样结果由kernel补进来
+#   │    └ prepare_inputs                      attn_metadata_builder.build：positions [N]、slot_mapping [N]、block_tables、cu_seqlens…
+#   │                                          → set_forward_context（各层attention从全局forward context取元数据，同nano-vllm的set_context）
+#   ├─ run_model(input_ids, batch)
+#   │    ├ eager（prefill，或decode超出捕获档位）：model(input_ids, positions) → hidden [N, H] → compute_logits → logits [bs, V]
+#   │    ├ PIECEWISE：直接调model，注意力之间的稠密段由各自的CUDAGraphWrapper回放，注意力本身在段间eager执行
+#   │    └ FULL：graphs[(running_bs, q)].replay() → forward_vars["outputs"] [N, H]（logits也可能录在图里）
+#   ├─ postprocess(...)
+#   │    ├ sampler（投机解码时是rejection_sampler）→ sampled_tokens [bs]（投机时[bs, k+1]），仍在GPU上
+#   │    ├ TP>1：把rank 0的采样结果broadcast给所有rank（延迟输出下每个rank的下一步输入都取自自己GPU上的这份结果，必须一致）
+#   │    ├ forward_done_event.record()
+#   │    ├ tokenIDProcessor.prepare_sampled_ids  取出上一步的token（等它的异步D2H）；对本步结果发起异步D2H（不等）
+#   │    └ 【分支】propose_draft_token_ids → tokenIDProcessor.prepare_draft_ids（草稿token也延迟一步回传，第7批）
+#   └─ ScheduledBatchOutput(req_ids, token_ids, draft_token_ids, is_deferred_out, num_rejected, num_bonus, logprobs)
+#        └─► rank 0的这份回到EngineCore → scheduler.postprocess（覆盖占位token、判停，scheduler.py）
+#
+# 阅读路线（按函数名定位；★ = 主干A级，【分支】= B级入口，括号里是讲透它的批次）
+#   第一遍建议：本文件头 → tokenIDProcessor上方的【科普】 → __init__ → warmup_model → get_num_blocks → allocate_kv_cache
+#     → forward → prepare_model → prepare_inputs → run_model → postprocess → capture_cudagraph
+#   第0部分 模块级：★support_model_arch_dict、★max_schedulable_decode_bs、★TokenLocations、★tokenIDProcessor；
+#     【分支】mono_decode_installers（Mono融合decode，第9批）、_profile_runner_stage（profiler打标签，第10批）
+#   第1部分 构造与退出：★__init__、_build_and_load_model、_maybe_warmup、_setup_device_and_distributed、exit；
+#     【分支】start_profiler / stop_profiler（第10批）、release_multimodal_requests（多模态，第8批）
+#   第2部分 预热与常驻缓冲：★warmup_model、warmup_max_tokens、allocate_forward_vars、_init_forward_vars_ring、
+#     _init_h2d_publication、_advance_forward_vars、_gate_staging_reuse、_mark_staging_h2d_enqueued、_record_forward_vars_event；
+#     【分支】dummy_execution（DP陪跑，第2、9批）、profile_dynamic_chunking / take_dynamic_chunking_fit（第9批）
+#   第3部分 显存预算与KV：★_estimate_cudagraph_overhead、get_num_blocks、_sub_pool_specs、_state_pool_names、
+#     _carve_paged_pool、_back_paged_pools、allocate_kv_cache、freeze_gc_heap；【分支】draft_shares_kv_pool（草稿的KV，第7批）
+#   第4部分 每步准备输入：★prepare_model、prepare_sample、prepare_inputs；【分支】get_dp_padding（DP）、
+#     _maybe_create_tbo_slices / _local_tbo_eligibility（TBO，第9批）、_dspark_apply_q_bucket / _dspark_apply_ragged /
+#     _verifies_drafts（投机解码，第7批）
+#   第5部分 forward与输出：★run_model、postprocess、forward；【分支】_build_pcp_balanced_slices等（PCP，第9批）、
+#     _setup_pp_shared_indexer / flush_pp_send（PP，第9批）、process_kvconnector_output / async_proc_aggregation /
+#     _record_kv_cache_ready（KV传输，第9批）、propose_draft_token_ids（第7批）
+#   第6部分 CUDA Graph：★capture_cudagraph、_piecewise_cg_active、_piecewise_skip_capture、_piecewise_per_token_bytes；
+#     【分支】_capture_attn_ffn_graphs、_dspark_capture_q_buckets、_maybe_calibrate_dspark_sps、start_capture_profiler
+#   第7部分 【分支】RapidServeModelRunner：同一组GPU上的prefill/decode分离（第9批）
+#   前置概念（本文件不重复讲）：
+#     连续批处理、prefill计算受限/decode带宽受限、延迟输出概要、为什么一个rank一个进程 → engine_core.py文件开头【1】~【4】
+#     分页KV、block_table、slot_mapping → config.py文件开头的【科普】KV cache与分页（paged）KV
+#     CUDA Graph、torch.compile、piecewise → config.py中CUDAGraphMode上方的【科普】①~④
+#     ScheduledBatch每个字段从哪来、到worker上变成什么 → scheduler.py中ScheduledBatch类上方的字段表
+#
+# 对比nano-vllm（nano-vllm的model_runner.py注释版约600行，只支持Qwen3 + TP；本文件约5000行，多出来的部分逐项如下）：
+#   ┌────────────┬──────────────────────────────────────┬──────────────────────────────────────────────────────────────────────┐
+#   │ 方面       │ nano-vllm                            │ ATOM（本文件）多出来的部分 → 解决什么                                │
+#   ├────────────┼──────────────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
+#   │ 进程与指令 │ rank 0就在主进程里；ModelRunner      │ 每个rank都是独立进程，广播与RPC挪到async_proc.py，本类只剩           │
+#   │            │ 自带loop、read_shm / write_shm广播   │ 被调用的方法 → 调度、postprocess不和rank 0的kernel发射抢             │
+#   │            │                                      │ 同一个GIL（engine_core.py【4】）                                     │
+#   ├────────────┼──────────────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
+#   │ 并行       │ 只有TP                               │ TP / DP / PP / PCP / DCP / EP（_setup_device_and_distributed）；DP下 │
+#   │            │                                      │ ForwardMode.decide跨rank对齐形状、空闲rank跑dummy_execution          │
+#   │            │                                      │ → 放得下、跑得动更大的MoE / 长上下文模型                             │
+#   ├────────────┼──────────────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
+#   │ 模型       │ 直接import Qwen3ForCausalLM          │ support_model_arch_dict登记26个架构，启动时按config.json选类         │
+#   │            │                                      │ → 一个引擎跑多种模型                                                 │
+#   ├────────────┼──────────────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
+#   │ 权重加载   │ utils/loader.py：遍历safetensors，   │ model_loader/（5c）：同样的名字映射，外加量化格式、专家权重、        │
+#   │            │ 按packed_modules_mapping写进融合参数 │ 在线量化等 → FP8 / MXFP4等checkpoint与MoE                            │
+#   ├────────────┼──────────────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
+#   │ 显存预算   │ total×util − used − peak + current   │ 另扣非PyTorch显存（RCCL缓冲等）、CUDA Graph池估计、2%余量、          │
+#   │            │                                      │ connector缓冲，再按实际空闲显存截断（get_num_blocks）                │
+#   │            │                                      │ → 多进程共卡、多种池并存时不OOM                                      │
+#   ├────────────┼──────────────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
+#   │ KV布局     │ 一个[2, L, NB, BS, H, D]张量，       │ 一块uint8大缓冲，按各注意力builder声明的子池切成区域                 │
+#   │            │ 按层切视图挂到attention上            │ （_carve_paged_pool，5b），外加每请求状态池                          │
+#   │            │                                      │ → MLA、DSA索引、GDN状态等布局各不相同                                │
+#   ├────────────┼──────────────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
+#   │ 输入准备   │ prepare_prefill / prepare_decode     │ 调度器预先拼好scheduled_tokens；常驻锁页CpuGpuBuffer + H2D发布；     │
+#   │            │ 每步用Python列表新建张量再H2D        │ 元数据由注意力builder生成 → 少分配、少同步，CUDA Graph               │
+#   │            │                                      │ 要的固定地址天然满足，PP的在途批不互相覆盖                           │
+#   ├────────────┼──────────────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
+#   │ 输出回传   │ run()里sampler(...).tolist()         │ tokenIDProcessor延迟输出：token留在GPU上直接当下一步输入，           │
+#   │            │ 同步拿到本步token                    │ CPU晚一步才拿到 → CPU的调度和postprocess被GPU时间盖住                │
+#   ├────────────┼──────────────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
+#   │ 采样       │ 只有temperature（Gumbel-max）        │ top-k / top-p、logprobs、投机解码的拒绝采样                          │
+#   │            │                                      │ （sampler.py、rejection_sampler.py）                                 │
+#   ├────────────┼──────────────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
+#   │ CUDA Graph │ decode按bs阶梯[1,2,4,8,16,32,…,512]  │ 档位来自config（默认[1..8,16,32,…,512]）并按调度上限裁剪，           │
+#   │            │ 各录一张整图                         │ 键为(bs, q)；或PIECEWISE：torch.compile在注意力处切图（5e）          │
+#   │            │                                      │ → 投机解码一个请求多个query token、编译融合                          │
+#   ├────────────┼──────────────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
+#   │ 投机解码   │ 无                                   │ drafter（MTP / EAGLE / DSpark）+ rejection_sampler（第7批）          │
+#   ├────────────┼──────────────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
+#   │ 其他       │ 无                                   │ 【分支】TBO、PP、PCP、RapidServe、KV connector（PD分离 / offload）、 │
+#   │            │                                      │ EPLB、profiler、多模态、Mono融合decode                               │
+#   └────────────┴──────────────────────────────────────┴──────────────────────────────────────────────────────────────────────┘
+
 logger = logging.getLogger("atom")
 
+# support_model_arch_dict：模型注册表——HF config.json里"architectures"列表的第一个字符串 → ATOM里实现它的模型类
+#   查表的地方：ModelRunner.__init__里 resolve_obj_by_qualname(support_model_arch_dict[hf_config.architectures[0]])；
+#     没登记的架构在那里直接抛KeyError
+#   值是"模块路径.类名"字符串：resolve_obj_by_qualname（utils/__init__.py）按最后一个"."拆开，importlib导入模块再取类——
+#     启动时只导入真正用到的那一个模型文件，而不是把所有模型（及它们各自依赖的kernel模块）都import一遍
+#   例：DeepSeek-V3的config.json写着"architectures": ["DeepseekV3ForCausalLM"] → atom.models.deepseek_v2.DeepseekV2ForCausalLM
+#   多对一：结构相同或是子集的架构共用一个实现。DeepSeek V3 / V3.2都映射到deepseek_v2.DeepseekV2ForCausalLM（V3.2多出的DSA
+#     稀疏索引器由hf_config里有没有index_topk决定，utils/selector.py的has_mla_indexer）；GLM-5（GlmMoeDsaForCausalLM）是同一
+#     文件里的子类。多模态的"...ForConditionalGeneration"有的映射到只跑文本的包装类（如Mistral3TextOnly），有的会构建视觉塔
+#     （Qwen3.5、Kimi-K3），见config.py的get_hf_config
+#   怎么加一个模型：见 /add-model（.claude/commands/add-model.md）——先看能否复用已有实现 → 写模型类（forward、compute_logits、
+#     packed_modules_mapping等）→ 在这里登记 → 按需登记插件（plugin/register.py）→ 精度验证
+#   观察：add-model.md第3步的示例把值写成元组("new_model", "NewModelForCausalLM")，但这里的值必须是"模块路径.类名"字符串
+#     （resolve_obj_by_qualname对它调用rsplit，元组会抛AttributeError），照抄示例会在启动时失败
+#   对比nano-vllm：nano-vllm在model_runner.py里直接import并构造Qwen3ForCausalLM，只有这一种模型
 support_model_arch_dict = {
     "Qwen3ForCausalLM": "atom.models.qwen3.Qwen3ForCausalLM",
     "Qwen3MoeForCausalLM": "atom.models.qwen3_moe.Qwen3MoeForCausalLM",
@@ -149,6 +292,12 @@ support_model_arch_dict = {
 # armed its hooks on the unwrapped layers, and may add per-step buffers to the
 # metadata builder before they are bound. Architectures not listed here route
 # mono decode inside their own model class instead.
+# 【译】通过包装已加载的模型来做Mono decode：installer在草稿模型把它的钩子挂到（未包装的）各层之后才运行，并且可以在
+#   每步用的缓冲被绑定之前，往元数据builder里加入它们。不在这里列出的架构，改在它们自己的模型类内部路由mono decode。
+# 【分支】Mono融合decode（第9批）：把一层decode融合成持久化的GPU kernel，TP的all-reduce也在kernel里完成
+#   调用方：ModelRunner.__init__——在drafter.arm_aux_capture之后、_init_forward_vars_ring / _init_h2d_publication之前执行
+#     self.model = install_mono_decode(self.model, config, drafter, attn_metadata_builder)
+#   这里只有DeepSeek-V4.1和Kimi-K3；MiniMax-M3、GLM-5.2在各自的模型类里路由（见CLAUDE.md里Mono decode那一条）
 mono_decode_installers = {
     "DeepseekV41ForCausalLM": (
         "atom.models.deepseek_v41.mono.dispatch.install_mono_decode"
@@ -159,6 +308,10 @@ mono_decode_installers = {
 }
 
 
+# 调度器能排出的最大decode batch（请求数）
+#   调用方：capture_cudagraph——用它去掉永远用不到的捕获档位（测试：tests/test_cudagraph_capture_bounds.py）
+#   例：max_num_seqs=256、max_num_batched_tokens=512、MTP k=3（full_q_len=4）→ min(256, 512 // 4) = 128：
+#     声明的档位里比128大的（144、160、…、512）不会被录，省下录制时间和图内存池；不开MTP时 min(256, 512 // 1) = 256
 def max_schedulable_decode_bs(
     max_num_seqs: int, max_num_batched_tokens: int, full_q_len: int
 ) -> int:
@@ -175,14 +328,29 @@ def max_schedulable_decode_bs(
     would never hand it. Must stay in step with `schedule_decode`'s
     `tokens_per_decode_seq`.
     """
+    # 【译】调度器能接纳的最大decode batch。
+    #
+    #   `Scheduler.schedule_decode` 在两个上限之一处停下：`max_num_seqs` 条序列，或 `max_num_batched_tokens` 个token。
+    #   它预先给每条decode序列按完整的投机宽度 `full_q_len`（== ``mtp_k + 1``）计费，不管这一步之后实际回放多长的query，
+    #   所以除以 `full_q_len` 是精确的、不是保守估计——而且它对每个更小的q分桶同样是上限。
+    #
+    #   放在本模块里，是为了让CUDAGraph捕获能拒绝构建调度器永远不会交给它的分桶。必须与 `schedule_decode` 的
+    #   `tokens_per_decode_seq` 保持一致。
+    # 解释：scheduler.py里 tokens_per_decode_seq = spec_width + 1，一旦 num_decode_tokens + tokens_per_decode_seq >
+    #   max_num_batched_tokens 就不再往decode批里加请求
     return min(max_num_seqs, max_num_batched_tokens // full_q_len)
 
 
 # Re-exported under the old private name: this module is where the predicate
 # used to live and where callers (and tests) still import it from.
+# 【译】以旧的私有名字重新导出：这个判断函数以前就定义在本模块里，调用方（以及测试）仍然从这里import它。
+# 解释：kv_config_has_producer（kv_transfer/disaggregation）判断kv_transfer_config是否让本实例当PD分离的producer（prefill一侧）；
+#   本文件里的读者是tokenIDProcessor.__init__（is_pd_producer），测试是tests/test_mtp_deferred_status_queue.py
 _kv_config_has_producer = kv_config_has_producer
 
 
+# TokenLocations：一个decode batch里每个请求的"锚点token"（本步输入窗口的第一个token，即它上一步采样出来的那个）从哪来
+#   由tokenIDProcessor.get_token_locations生成，prepare_input_ids据此填decode_src（见下面tokenIDProcessor上方【科普】的例子）
 class TokenLocations(NamedTuple):
     """How each request in this decode batch gets its anchor token.
 
@@ -196,13 +364,102 @@ class TokenLocations(NamedTuple):
     naming them makes that a typo the reader can see.
     """
 
+    # 【译】这个decode batch里的每个请求怎样拿到它的锚点token。
+    #
+    #   `deferred_curr[k]` 是当前batch里的一个位置，`deferred_prev[k]` 是这个请求在上一次forward里所在的行，
+    #   所以它采样出的id可以直接从 `prev_token_ids` 里读，不需要D2H同步。`new_curr` 存放的是调度器已经把id放在主机上的那些位置。
+    #   三者合起来恰好把整个batch覆盖一次。
+    #
+    #   三个同类型数组组成的元组很容易按错误的顺序解包；给它们起名字，就把这种错误变成读者看得见的笔误。
+    # NamedTuple：带字段名的元组，locs.deferred_curr与locs[0]是同一个东西，仍可按位置解包
+    # 例：上一次forward是prefill [7, 3]（两个新请求），本步decode的req_ids=[12, 7, 3]（12在那次prefill之前就在decode）
+    #   → deferred_curr=[1, 2]、deferred_prev=[0, 1]（7、3的锚点在GPU上prev_token_ids的第0、1行）；
+    #     new_curr=[0]（12的锚点在上一次forward时已经回到CPU、写进了scheduled_tokens）
     deferred_curr: np.ndarray
     deferred_prev: np.ndarray
     new_curr: np.ndarray
 
 
+# ═════════════════════════════════════════════════════════════════════════════════════════════════════════
+# 【科普】延迟输出（deferred output）的GPU侧：tokenIDProcessor
+#   本类是这个机制讲透的地方。概要（为什么要做、代价）见engine_core.py文件开头【3】；CPU一侧"先放占位token、下一步原地覆盖"
+#   见scheduler.py Scheduler.postprocess里的时间线①（不开投机）和②（投机解码）。这里讲GPU这一半怎么做
+# ═════════════════════════════════════════════════════════════════════════════════════════════════════════
+# 前置：GPU异步执行、stream、event、异步D2H（读本类必须知道的五点）
+#   ① 发射≠执行：CPU调用一个GPU算子只是把kernel排进一个stream（GPU上的FIFO命令队列）就返回，每次几µs；GPU按队列顺序执行。
+#      decode一步约1200个kernel（数字同engine_core.py【3】），CPU发射完要几ms，GPU执行完要10ms量级——只要CPU中途不等GPU，
+#      两边就各干各的
+#   ② 同步点：CPU要读GPU上的结果时必须等——.tolist()、.item()、不带non_blocking的.cpu()、torch.cuda.synchronize()、
+#      event.synchronize()都会让CPU停下，直到排在前面的GPU命令全部执行完
+#   ③ event：排进stream里的一个"执行到这里了"的标记。ev.record(s)在stream s的当前位置放下标记；ev.synchronize()让CPU等到
+#      标记之前的命令都执行完；ev.wait(stream=s2)让另一个stream s2执行到这里时先停住、等标记到达（GPU上的等待，CPU不阻塞）
+#   ④ 异步D2H：x.to("cpu", non_blocking=True)本身也只是排进stream的一条拷贝命令，CPU立即拿到一个"还没写好"的CPU张量。
+#      目标须是锁页（pinned）内存，DMA引擎才能不经CPU直接写进去（PyTorch在non_blocking的GPU→CPU拷贝里会把目标分配成锁页
+#      内存）；读它之前必须先等记录在这次拷贝之后的event。bs=256的采样结果只有256个int32 = 1KB，拷贝本身是微秒级
+#   ⑤ 为什么拷贝放在单独的async_copy_stream上：同一个stream严格串行，拷贝若排在默认stream上，下一步forward的kernel就得排在
+#      它后面；放在副stream上，副stream只"等"本步的forward_done_event（③的ev.wait），默认stream接着跑下一步，拷贝与计算并行
+#
+# 本类做两件事，一"出"一"进"：
+#   出（prepare_sampled_ids，postprocess采样后调用）：对本步的sampled_tokens（GPU）只发起异步D2H、不等；改为取出*上一步*发起的
+#     那次D2H的结果交给EngineCore（这时它通常早已拷完）。所以forward(第N步)返回的是第N-1步的token
+#   进（prepare_input_ids，prepare_model准备输入时调用）：decode请求本步的输入token就是它上一步刚采样出来的那个，CPU此时还没有它
+#     （scheduled_tokens里那一格只是占位，值为eos_token_id）；fill_deferred_decode_ids kernel（model_ops/decode_input_ids.py）在
+#     GPU上直接从prev_token_ids（上一步的sampled_tokens，一直留在GPU上）把它抄进input_ids——token从"被采样"到"成为下一步
+#     输入"全程不经过CPU
+#
+# 例：eos_token_id=2（占位记作2*）；S的prompt=[15,27,99]；T的prompt=[5,6,7,8]，在S做完prefill之后到达
+#   （一步要么全是prefill、要么全是decode，prefill优先，见engine_core.py【2】）
+#   ┌──────┬──────────────┬────────────────────────────────┬─────────┬────────────────────────────┬────────────────────────────┐
+#   │ step │ 本步batch    │ GPU上最终的input_ids           │ GPU采样 │ forward返回（属于上一步）  │ postprocess之后的token_ids │
+#   ├──────┼──────────────┼────────────────────────────────┼─────────┼────────────────────────────┼────────────────────────────┤
+#   │ N-1  │ prefill [S]  │ [15,27,99]（全部来自CPU）      │ S→40    │ {}（假设之前没有在途结果） │ S=[15,27,99,2*]            │
+#   ├──────┼──────────────┼────────────────────────────────┼─────────┼────────────────────────────┼────────────────────────────┤
+#   │ N    │ prefill [T]  │ [5,6,7,8]                      │ T→70    │ {S:(40,)}                  │ S=[15,27,99,40]            │
+#   │      │              │                                │         │                            │ T=[5,6,7,8,2*]             │
+#   ├──────┼──────────────┼────────────────────────────────┼─────────┼────────────────────────────┼────────────────────────────┤
+#   │ N+1  │ decode [S,T] │ CPU暂存[40, 2*]；kernel把第1格 │ S→41    │ {T:(70,)}                  │ S=[15,27,99,40,2*]         │
+#   │      │              │ 换成prev_token_ids[0]=70       │ T→71    │                            │ T=[5,6,7,8,70,2*]          │
+#   │      │              │ → [40, 70]                     │         │                            │                            │
+#   ├──────┼──────────────┼────────────────────────────────┼─────────┼────────────────────────────┼────────────────────────────┤
+#   │ N+2  │ decode [S,T] │ CPU暂存[2*, 2*]；kernel按      │ …       │ {S:(41,), T:(71,)}         │ S=[…,40,41,2*]             │
+#   │      │              │ decode_src=[0, 1]两格都换      │         │                            │ T=[…,70,71,2*]             │
+#   │      │              │ → [41, 71]                     │         │                            │                            │
+#   └──────┴──────────────┴────────────────────────────────┴─────────┴────────────────────────────┴────────────────────────────┘
+#   第N+1步的"进"：上一次forward（第N步）里只有T → T被延迟（锚点在GPU上prev_token_ids的第0行）；S不在其中 → S是"新"的
+#     （它的40已在第N步回到CPU、被scheduler写进了token_ids）。get_token_locations给出decode_src=[-1, 0]，kernel只改第1格
+#   时间线（同一个例子的第N、N+1步；ev = event，D2H(N-1) = 第N-1步采样结果的那次拷贝）：
+#     runner CPU    : prep N | launch N | rec ev(N) | wait D2H(N-1) | send D2H(N) | return {S:(40,)} ············ | prep N+1 | launch N+1 | …
+#     EngineCore CPU:                                                                  post(N-1) → sched(N+1) → bcast |
+#     GPU 默认stream: …fwd N-1 →40]ev(N-1)[══════════════ fwd N（prefill T →70）════════════════════]ev(N)[fill][═══ fwd N+1 …
+#     GPU 副stream  :                     [D2H 40]                                                         [D2H 70]
+#     wait D2H(N-1)最晚在GPU做完第N-1步、拷完40时返回——这时第N步早已排进队列，GPU不会因为这次等待而空闲
+#   掩盖了哪段CPU时间：forward(N)返回之后、到forward(N+1)发射完kernel之前的全部CPU工作——EngineCore的postprocess(N-1)、
+#     schedule(N+1)、把batch广播给各rank，以及runner的prepare(N+1)——都发生在GPU执行第N步的时候
+#   示意数字：decode一步GPU 10ms，上述CPU工作共3ms
+#     不延迟（nano-vllm：run()里sampler(...).tolist()同步等结果，GPU空等CPU）：13ms/步，GPU利用率 10/13 ≈ 77%
+#     延迟：3ms藏进10ms里 → 约10ms/步，吞吐高约30%。前提是这段CPU时间短于GPU一步的时间，否则瓶颈变成CPU
+#
+# TP>1时的一致性：nano-vllm的下一步输入由rank 0经共享内存广播给所有rank，天然一致；这里每个rank的下一步输入都来自它自己GPU上的
+#   sampled_tokens，所以postprocess先把rank 0的采样结果broadcast给所有TP rank（随机采样时各rank各采各的可能不同），再交给本类
+# 启用条件（__init__里的is_deferred_out，默认开）：不是PP，且不是"要交接递归状态的PD producer"
+#   PP：采样发生在最后一个stage的GPU上，token却要喂给第一个stage，上一步的结果不在本GPU上，没法"直接在GPU上抄"（按代码推断）
+#   要交接递归状态的PD producer：见__init__里的注释和engine_core.py【3】
+#   关掉时走"非延迟"分支：prepare_sampled_ids直接.tolist()同步返回本步结果，prepare_input_ids直接用scheduled_tokens
+# 【分支】投机解码（第7批）：同样晚一步回传的还有草稿token（prepare_draft_ids）和每行的(num_rejected, num_bonus)
+#   （send_mtp_status_to_cpu_async）。本类的四条FIFO都是"每个产出输出的forward放一项、下一个产出输出的forward取一项"：
+#     token_ids_cpu与logprobs_cpu（prepare_sampled_ids）、draft_token_ids_cpu（prepare_draft_ids）、pending_mtp_status_copies
+#   其中MTP状态在下一步的prepare_input_ids里就要取（CPU上的注意力builder要按num_rejected回退context_lens），这次等待只需等到
+#   第N步的验证结束——forward_done_event在草稿模型的propose之前就record了，此时GPU队列里通常还排着第N步的草稿kernel
+# 代价：请求结束要晚一步才发现、多算一步，token_ids末尾平时挂着占位（scheduler.py时间线①）
+# 对比nano-vllm：nano-vllm的run()采样后直接.tolist()，下一步prepare_decode再从seq.last_token取输入、H2D；
+#   ATOM把token留在GPU上直接当下一步输入，CPU晚一步才拿到它
 class tokenIDProcessor:
 
+    # 输入：runner——所属的ModelRunner（用它的config、device、attn_family，运行时还读它的forward_vars、capture_sizes、
+    #     h2d_groups、attn_metadata_builder）；max_num_batched_tokens——一步最多的token数，决定缓冲大小；
+    #   use_spec / num_spec_tokens——本rank是否带草稿模型、草稿宽度k（ModelRunner.__init__：开了speculative_config且是PP最后一个
+    #     stage时才为True）
+    # 调用方：ModelRunner.__init__（构造一次，存为self.tokenID_processor）
     def __init__(
         self,
         runner: "ModelRunner",
@@ -211,27 +468,47 @@ class tokenIDProcessor:
         num_spec_tokens: int = 0,
     ):
         """Asynchronously copy the sampled_token_ids tensor to the host."""
+        # 【译】把sampled_token_ids张量异步拷回主机。
+        # 解释：这句docstring只概括了"出"的一半；"进"（prepare_input_ids在GPU上补齐下一步的input_ids）见类上方【科普】
+        # kv_transfer_config：PD分离 / KV offload的配置dict（第9批），没配时为{}
         kv_cfg = getattr(runner.config, "kv_transfer_config", {}) or {}
+        # PP>1：采样在最后一个stage上，本stage拿不到GPU上的上一步结果 → 关掉延迟输出（见类上方【科普】"启用条件"）
         self.is_pipeline_parallel = (
             getattr(runner.config, "pipeline_parallel_size", 1) > 1
         )
         # The scheduler never speculates for a P/D producer, though the runner
         # keeps its drafter loaded: every decode it runs is q=1.
+        # 【译】调度器从不为P/D的producer做投机，尽管runner仍加载着它的草稿模型：它跑的每次decode都是q=1。
+        # 解释：is_pd_producer的其他读者：ModelRunner.dummy_execution（producer的dummy不带草稿列）、_verifies_drafts、
+        #   _producer_graph_shapes
         self.is_pd_producer = _kv_config_has_producer(kv_cfg)
         # P/D hands off prompt-end state plus the first sampled token. Deferred
         # output makes the producer decode once more to surface that token, so
         # the consumer applies T0 to a state that already has it. Only a
         # recurrent state notices -- a paged write lands at T0's own position,
         # so repeating it is idempotent.
+        # 【译】P/D交接的是prompt末尾的状态加上第一个采样出的token。延迟输出让producer要多做一次decode才能把这个token取回CPU，
+        #   于是consumer会把T0施加到一个已经包含了它的状态上。只有递归状态会察觉——分页KV的写入落在T0自己的位置上，
+        #   重复写一次是幂等的。
+        # 解释：递归状态（GDN等线性注意力每个请求一个定长矩阵S，每个token原地更新一次）被T0更新两次，之后的输出全错；
+        #   带图的讲解见engine_core.py文件开头【3】的"哪些部署关掉它"
         hands_off_recurrent_state = (
             self.is_pd_producer and runner.attn_family.has_recurrent_state
         )
+        # 延迟输出的总开关（默认True）。读者：本类各方法、ModelRunner.postprocess（是否broadcast、是否走草稿的异步路径）、
+        #   ScheduledBatchOutput.is_deferred_out → Scheduler.postprocess（是否放占位、原地覆盖）
         self.is_deferred_out = (
             not self.is_pipeline_parallel and not hands_off_recurrent_state
         )
 
         self.runner = runner
         device = runner.device
+        # input_ids：int32 [max_num_batched_tokens + 1]，.np/.cpu是锁页的CPU一半，.gpu是GPU一半（CpuGpuBuffer，utils/__init__.py）
+        #   多1个元素：草稿模型要读左移一位的input_ids.gpu[1 : N+1]（postprocess、spec_decode/eagle_proposer.py），N取满时也不越界
+        #   publication_group="input_ids"：它的H2D经utils/h2d.py的发布组执行；有forward_vars环（PP）时，
+        #     ModelRunner._advance_forward_vars每步把self.input_ids换成当前环槽里的那一份
+        #   这块地址常驻不变：FULL CUDA Graph录图时读的就是forward_vars["input_ids"].gpu，回放前只改它的内容
+        #   对比nano-vllm：nano-vllm每步torch.tensor(..., pin_memory=True).cuda(non_blocking=True)新建一个int64张量
         self.input_ids = CpuGpuBuffer(
             max_num_batched_tokens + 1,
             dtype=torch.int32,
@@ -241,6 +518,10 @@ class tokenIDProcessor:
         # One per request, not per token: where each request's anchor comes
         # from. Sized by tokens -- a batch can never hold more requests. The
         # matching prefix sum is `forward_vars["cu_seqlens_q"]`.
+        # 【译】每个请求一项而不是每个token一项：记录每个请求的锚点从哪来。按token数定大小——一个batch里的请求数不可能比它多。
+        #   与之配套的前缀和是 `forward_vars["cu_seqlens_q"]`。
+        # 解释：decode_src[i] = 第i个请求在上一次forward里的行号（从prev_token_ids / draft_token_ids的这一行取），
+        #   新来的请求填NEW_SEQUENCE（-1）；和input_ids同属"input_ids"发布组，一起H2D
         self.decode_src = CpuGpuBuffer(
             max_num_batched_tokens,
             dtype=torch.int32,
@@ -250,12 +531,29 @@ class tokenIDProcessor:
         self.use_spec = use_spec
         self.num_spec_tokens = num_spec_tokens
 
+        # 专门做D2H的副stream（见类上方前置⑤）；DSpark的验证也借用它（spec_decode/dspark_verify.py）
         self.async_copy_stream = torch.cuda.Stream(runner.device)
+        # 全0的int32 [max_num_batched_tokens]（GPU）：不做投机时postprocess拿它的前bs个当num_reject_tokens和next_token_locs
+        #   （每行都取第0列），省得每步新建
         self.default_num_rejected_tokens = torch.zeros(
             max_num_batched_tokens, dtype=torch.int32, device=device
         )
+        # 初始化下面这些跨步状态（字段说明见clean）
         self.clean()
 
+    # "出"的发送端：对本步的采样结果发起异步D2H（不等），把(CPU张量, 拷完的event)排进cpu_tensor_handle队列（即self.token_ids_cpu）
+    # 输入：gpu_tensor——sampled_tokens，GPU，[bs]（投机解码时[bs, k+1]）；cpu_tensor_handle——要排进的FIFO；
+    #   data_ready——postprocess刚在默认stream上record的forward_done_event（"采样做完了"的位置）；
+    #   copy_done——可传入复用的event，否则每次新建；gpu_logprobs——要logprobs时[bs]
+    # 调用方：prepare_sampled_ids（延迟输出分支）
+    # 下面全是"往GPU排命令"，CPU不阻塞：
+    #   GPU默认stream：…[采样]ev(data_ready)[下一步的kernel …]          ← 不等拷贝，接着跑
+    #   GPU副stream  ：         └等┘[D2H token][D2H logprob]ev(copy_done)
+    # 观察：gpu_tensor在默认stream上分配、在副stream上被读，这里没有调用gpu_tensor.record_stream(副stream)。不开投机时
+    #   prev_token_ids一直引用sampled_tokens，直到下一步先synchronize了这次拷贝才放手，没有问题；但开投机时postprocess随即把
+    #   prev_token_ids换成了next_token_ids，gpu_logprobs也只是postprocess的局部变量——它们在postprocess返回后就被释放，显存块
+    #   理论上可以在拷贝真正执行之前被默认stream上的新分配复用。实际中拷贝紧跟data_ready执行，而会写这块显存的kernel要排在
+    #   本步其余kernel之后，窗口极小（按代码推断，未在GPU上复现）
     def send_to_cpu_async(
         self,
         gpu_tensor: torch.Tensor,
@@ -265,18 +563,26 @@ class tokenIDProcessor:
         gpu_logprobs: torch.Tensor | None = None,
     ):
         copy_done = copy_done or torch.cuda.Event()
+        # with torch.cuda.stream(s)：块内发出的GPU命令都排到副stream s上
         with torch.cuda.stream(self.async_copy_stream):
+            # 副stream先等默认stream执行到data_ready：保证拷走的是采样完成后的值（前置③，GPU侧等待）
             data_ready.wait(stream=self.async_copy_stream)
+            # 立即返回一个锁页的CPU张量；在copy_done之前它的内容未定义（前置④）
             cpu_tensor = gpu_tensor.to("cpu", non_blocking=True)
             cpu_logprobs = (
                 gpu_logprobs.to("cpu", non_blocking=True)
                 if gpu_logprobs is not None
                 else None
             )
+            # 在两次拷贝之后放下标记：等到它，就说明两份数据都拷完了
             copy_done.record(self.async_copy_stream)
         cpu_tensor_handle.append((cpu_tensor, copy_done))
+        # logprobs队列与token队列一一对应（没要logprobs时放None），共用同一个copy_done
         self.logprobs_cpu.append(cpu_logprobs)
 
+    # "出"的接收端：取出最早的一项（FIFO：pop(0)），在它的copy_done上synchronize——token这一路唯一让CPU等GPU的地方
+    #   等的是上一步的拷贝：此时CPU已经发射完本步的kernel，GPU要么还在跑上一步的尾巴、要么已在跑本步，队列里总有活，不会空闲
+    # 队列为空（第一次调用、或clean之后）时返回空张量。调用方：prepare_sampled_ids
     def recv_async_output(self, cpu_tensor_handle) -> torch.Tensor:
         if not cpu_tensor_handle:
             return torch.empty(0, dtype=torch.int32, device="cpu")
@@ -288,6 +594,9 @@ class tokenIDProcessor:
         """Pop and return the earliest logprobs from the async copy queue.
         Must be called after recv_async_output (which synchronizes the event).
         """
+        # 【译】从异步拷贝队列里弹出最早的那份logprobs并返回。
+        #   必须在recv_async_output之后调用（后者已经对event做了synchronize）。
+        # 解释：两条队列共用一个copy_done，所以这里不再synchronize；返回[bs]个float，没要logprobs时返回None
         if not self.logprobs_cpu:
             return None
         logprob_tensor = self.logprobs_cpu.pop(0)
@@ -295,6 +604,10 @@ class tokenIDProcessor:
             return logprob_tensor.tolist()
         return None
 
+    # 【分支】投机解码（第7批）：草稿token的异步D2H，与send_to_cpu_async同理
+    # 输入：gpu_tensor——本步草稿模型propose出的草稿，GPU，[bs, k]；调用方：prepare_draft_ids
+    # 和send_to_cpu_async的区别：草稿是在forward_done_event之后才算出来的，所以不等那个event，而是wait_stream(默认stream)——
+    #   副stream等默认stream上"到此刻为止已排进去的所有命令"（含草稿kernel）都执行完
     def send_to_cpu_async_draft(self, gpu_tensor: torch.Tensor):
         default_stream = torch.cuda.current_stream()
         with torch.cuda.stream(self.async_copy_stream):
@@ -310,8 +623,13 @@ class tokenIDProcessor:
         # exists to buy. If a future change ever puts a replay closer than one
         # forward away, the wait belongs immediately before THAT replay, not
         # here.
+        # 【译】这里没有反向等待。`gpu_tensor` 是某次草稿pass被录进CUDA Graph的输出，地址固定，下一次回放会改写它——但那次回放
+        #   在默认stream上排在一整次目标模型forward之后，而这次拷贝只有几KB。让默认stream反过来等这次拷贝，会让它每步都为拷贝
+        #   停顿一下，而这正是副stream要换来的重叠。如果将来某个改动让一次回放离得比一次forward还近，等待应该加在紧挨着那次
+        #   回放之前，而不是这里。
         self.draft_token_ids_cpu.append((cpu_tensor, event))
 
+    # 取出上一步的草稿（numpy，[上一步bs, k]），队列为空时返回空数组；调用方：prepare_draft_ids
     def recv_async_output_draft(self) -> np.ndarray:
         if not self.draft_token_ids_cpu:
             return np.array([], dtype=np.int32)
@@ -319,6 +637,10 @@ class tokenIDProcessor:
         event.synchronize()
         return token_ids.numpy()
 
+    # 【分支】投机解码（第7批）：把本步每行的验证结论(num_rejected, num_bonus)异步拷回CPU
+    # 输入：num_rejected——[bs] int32，每行被拒绝的草稿数；num_bonus——[bs]，每行下一个锚点所在的列（= 被接受的草稿数，即
+    #   postprocess里的next_token_locs）；data_ready——forward_done_event
+    # 调用方：postprocess（延迟输出 + 有草稿模型时）；取出方：recv_mtp_status_async（下一步的prepare_input_ids）
     def send_mtp_status_to_cpu_async(
         self,
         num_rejected: torch.Tensor,
@@ -333,6 +655,13 @@ class tokenIDProcessor:
         # It is clear that only rejected number is not sufficient for all status tracking, bonus number is also needed.
         # Single Event for both copies (vs. per-tensor send_to_cpu_async) so the
         # consumer pops one queue entry and synchronizes once instead of twice.
+        # 【译】对MTP来说，被拒绝数和bonus数是两种略有不同的信息。以mtp=1为例：
+        #     prefill之后的第一次decode：0个被拒，0个bonus
+        #     上一步草稿被接受的decode：0个被拒，1个bonus
+        #     上一步草稿被拒绝的decode：1个被拒，0个bonus
+        #   显然只有被拒绝数不足以追踪所有状态，还需要bonus数。
+        #   两次拷贝共用一个Event（而不是每个张量各调一次send_to_cpu_async），这样消费者只弹出一项、只synchronize一次而不是两次。
+        # 解释：只看被拒数，"prefill后第一次"和"全部接受"都是0；只看bonus数，"prefill后第一次"和"被拒"都是0——两个合起来才分得开
         copy_done = torch.cuda.Event()
         with torch.cuda.stream(self.async_copy_stream):
             data_ready.wait(stream=self.async_copy_stream)
@@ -343,6 +672,7 @@ class tokenIDProcessor:
             (cpu_num_rejected, cpu_num_bonus, copy_done)
         )
 
+    # 取出上一个产出输出的forward的(num_rejected, num_bonus)（numpy，按那一步batch的行序），队列为空时返回(None, None)
     def recv_mtp_status_async(
         self,
     ) -> tuple[np.ndarray | None, np.ndarray | None]:
@@ -354,35 +684,53 @@ class tokenIDProcessor:
         copy_done.synchronize()
         return cpu_num_rejected.numpy(), cpu_num_bonus.numpy()
 
+    # 清空所有跨步状态（构造时；warmup_model结束后——warmup的假prefill也走了postprocess，不清掉的话第一次真实forward会把
+    #   假batch的token当成结果返回；RL释放/恢复显存后，rollout/memory_manager.py）
     def clean(self):
+        # 在途的token D2H：[(CPU张量, copy_done event)]；logprobs与它一一对应（没要时为None）
         self.token_ids_cpu: list[torch.Tensor] = []
         self.logprobs_cpu: list[torch.Tensor | None] = []
 
+        # 上一次产出输出的forward的batch（get_token_locations按它的req_ids找行号）和它的采样结果（GPU，[bs]或[bs, k+1]；
+        #   开投机时由postprocess换成每行的下一个锚点[bs]）——下一步fill_deferred_decode_ids直接读它
         self.prev_batch: ScheduledBatch | None = None
         self.prev_token_ids: torch.Tensor | None = None
 
+        # 上一步每个请求的输入宽度：1 = 没有草稿；prepare_draft_ids产出草稿后变成k+1，此后补token的kernel才去读draft_token_ids
         self.pre_num_decode_token_per_seq = 1
+        # 【分支】投机解码：上一步propose出的草稿（GPU，[bs, k]，下一步kernel读）与它的在途D2H队列
         self.draft_token_ids: torch.Tensor | None = None
         self.draft_token_ids_cpu: list[torch.Tensor] = []
         # Queue of (cpu_num_rejected, cpu_num_bonus, copy_done_event) — async
         # D2H copies fired by send_mtp_status_to_cpu_async, drained by
         # recv_mtp_status_async after the event syncs.
+        # 【译】(cpu_num_rejected, cpu_num_bonus, copy_done_event) 的队列——由send_mtp_status_to_cpu_async发起的异步D2H拷贝，
+        #   由recv_mtp_status_async在event同步之后取出。
         self.pending_mtp_status_copies: list[
             tuple[torch.Tensor, torch.Tensor, torch.cuda.Event]
         ] = []
+        # 本步batch里每个请求的(被拒数, 锚点列)，按本步行序（prepare_input_ids里从上一步的结论重排过来）；
+        #   读者：各注意力builder（aiter_attention.py / aiter_mla.py等按num_rejected回退context_lens，gdn_attn.py读num_bonus）
         self.num_rejected: np.ndarray | None = None
         self.num_bonus: np.ndarray | None = None
 
+    # 投机解码时sampled_tokens每行k+1个，被拒位置之后填-1（rejection_sampler.py的哨兵）；这里把每行截到第一个-1之前
+    # 例（k=3）：[[61,62,70,-1], [80,-1,-1,-1], [90,91,92,93]] → [(61,62,70), (80,), (90,91,92,93)]
+    # 输入：token_ids——二维Python列表；输出：每行一个tuple
     @staticmethod
     def _batch_process_token_ids(token_ids: list) -> list[tuple[int, ...]]:
         """Batch process token_ids: vectorized -1 truncation using numpy."""
+        # 【译】批量处理token_ids：用numpy做向量化的-1截断。
         arr = np.array(token_ids, dtype=np.int64)
         mask = arr == -1
         if not mask.any():
             # No -1 sentinel in any row, convert each row to tuple directly
+            # 【译】所有行都没有-1哨兵，直接把每行转成tuple（最常见的"全部接受"走这条快路）
             return [tuple(row) for row in arr.tolist()]
         # Per-row: find first -1, truncate
         # Use argmax on mask; rows without -1 get 0, disambiguate with ~mask.any(axis=1)
+        # 【译】逐行：找到第一个-1并截断。
+        #   对mask用argmax（返回第一个True的下标）；没有-1的行也得到0，用~mask.any(axis=1)来区分。
         has_sentinel = mask.any(axis=1)
         first_neg = mask.argmax(axis=1)
         result = []
@@ -394,6 +742,15 @@ class tokenIDProcessor:
                 result.append(tuple(row))
         return result
 
+    # "出"：采样之后由ModelRunner.postprocess调用（每个产出输出的forward一次）
+    # 输入：batch——本步的ScheduledBatch；sampled_token_ids——本步采样结果，GPU，[bs]（投机解码时[bs, k+1]，被拒位置为-1）；
+    #   sync_event——postprocess刚record的forward_done_event；sampled_logprobs——要logprobs时[bs]
+    # 输出：({seq_id: (token, ...)} 外加键-1, {seq_id: logprob} 或 None)
+    #   延迟输出时这两个dict属于*上一步*的batch（prev_batch），第一次调用时为空；非延迟时属于本步batch
+    #   键-1：值0/1标记是否延迟输出，但没有人读这个值（postprocess按 k != -1 把它滤掉，是否延迟另有ScheduledBatchOutput.is_deferred_out）；
+    #     它实际起的作用是盖掉DP陪跑的dummy batch那一行——dummy请求的seq.id就是-1（见ModelRunner.dummy_execution的docstring），
+    #     dummy的"采样结果"落在键-1上、随即被这个标记覆盖，于是不会被当成某个真实请求的输出
+    # 例：类上方【科普】表格的第N步——prev_batch=[S]，取出S的40，返回({S:(40,), -1:1}, None)；记下prev_batch=[T]、prev_token_ids=[70]
     def prepare_sampled_ids(
         self,
         batch: ScheduledBatch,
@@ -401,14 +758,18 @@ class tokenIDProcessor:
         sync_event: torch.cuda.Event,
         sampled_logprobs: torch.Tensor | None = None,
     ) -> tuple[dict[int, tuple[int, ...]], dict[int, float] | None]:
+        # 非延迟（PP、要交接递归状态的PD producer）：同nano-vllm，同步拿本步的结果、按本步batch返回
         if not self.is_deferred_out:
+            # 同步点：CPU在这里等GPU把本步的forward和采样全部跑完
             token_ids = sampled_token_ids.tolist()
             req_ids = batch.req_ids
+            # 二维（投机解码，每行k+1个、-1截断）还是一维（每行1个）
             if token_ids and isinstance(token_ids[0], list):
                 processed = self._batch_process_token_ids(token_ids)
             else:
                 processed = [(tid,) for tid in token_ids]
             ret = dict(zip(req_ids, processed))
+            # 【译】（行尾注释）is_deferred_out标志（这个值没人读，见上面"键-1"）
             ret[-1] = 0  # is_deferred_out flag
             logprobs_map = None
             if sampled_logprobs is not None:
@@ -418,8 +779,10 @@ class tokenIDProcessor:
                 }
             return ret, logprobs_map
 
+        # ① 取出上一步的结果：等上一步发起的D2H拷完（本步的kernel此时已经发射，GPU不会因此空闲）；第一次调用时为空
         token_ids = self.recv_async_output(self.token_ids_cpu)
         logprobs = self.recv_logprobs()
+        # ② 对本步的结果发起异步D2H，下一次调用时再取
         self.send_to_cpu_async(
             sampled_token_ids,
             self.token_ids_cpu,
@@ -428,9 +791,12 @@ class tokenIDProcessor:
         )
         token_id_dict = {}
         logprobs_map = None
+        # prev_req_ids：上一步的req_ids；prepare_draft_ids也靠它判断"有没有上一步"
         self.prev_req_ids = None
+        # ③ 按上一步batch的req_ids把结果组装成dict：同一个请求在两步里的行号可能不同，所以按seq_id而不是按行号交给调度器
         if self.prev_batch is not None:
             self.prev_req_ids = self.prev_batch.req_ids
+            # 已经拷完的CPU张量 → Python列表，这里不会再触发GPU同步
             token_ids_list = (
                 token_ids.tolist() if hasattr(token_ids, "tolist") else token_ids
             )
@@ -446,14 +812,24 @@ class tokenIDProcessor:
                 }
         else:
             # first time, no previous tokens
+            # 【译】第一次调用，还没有上一步的token
+            # 解释：这里赋给token_ids的{}之后没人再用，返回的token_id_dict保持为空
             token_ids = {}
             logprobs_map = None
 
+        # ④ 记下本步：下一步prepare_input_ids据prev_batch找每个请求在本步的行号，fill_deferred_decode_ids从prev_token_ids取token
+        #   （开投机解码时postprocess随后把prev_token_ids换成每行的下一个锚点next_token_ids，[bs]）
         self.prev_batch = batch
         self.prev_token_ids = sampled_token_ids
         token_id_dict[-1] = 1
         return token_id_dict, logprobs_map
 
+    # 给本步decode batch的每个请求分类：上一次产出输出的forward里也有它（deferred：锚点在GPU上prev_token_ids的某一行）
+    #   还是没有（new：锚点已经在CPU的scheduled_tokens里）
+    # 输入：batch——本步的decode batch；输出：TokenLocations（三个np.intp数组，见上面TokenLocations）
+    # 调用方：prepare_input_ids的延迟输出分支（此时prev_batch一定不为None）
+    # 例（类上方【科普】的第N+1步）：prev_batch.req_ids=[T]，batch.req_ids=[S, T]
+    #   → deferred_curr=[1]、deferred_prev=[0]、new_curr=[0]；第N+2步两个都是deferred：[0, 1]、[0, 1]、[]
     def get_token_locations(self, batch: ScheduledBatch) -> TokenLocations:
         prev_req_ids = self.prev_batch.req_ids
         cur_req_ids = batch.req_ids
@@ -464,10 +840,15 @@ class tokenIDProcessor:
         # reuses one id, so without this the next dummy matches it and reads a
         # request that never existed out of `prev_token_ids`/`draft_token_ids`.
         # Real ids are non-negative and never matched it either way.
+        # 【译】伪造的batch不会把任何东西带到下一步——而且DP同步用的dummy反复使用同一个id，若没有这个判断，下一个dummy就会
+        #   与它匹配上，从 `prev_token_ids`/`draft_token_ids` 里读出一个从未存在过的请求。真实的id都是非负的，无论如何都不会
+        #   与它匹配。
+        # 解释：上一步是假batch（DP陪跑的dummy_execution、warmup）时，本步所有请求一律按"新"处理
         if self.prev_batch.is_dummy_run:
             none = np.empty(0, dtype=np.intp)
             return TokenLocations(none, none, np.arange(num_cur, dtype=np.intp))
 
+        # seq_id → 它在上一步batch里的行号
         prev_id_to_idx = dict(zip(prev_req_ids, range(num_prev)))
 
         deferred_curr = np.empty(num_cur, dtype=np.intp)
@@ -494,11 +875,16 @@ class tokenIDProcessor:
         # `new_curr` are what the caller addresses the batch through, so a gap
         # or an overlap would leave a request reading whatever was staged for
         # it -- silently, and only in whatever batch shape produced the gap.
+        # 【译】每个请求必须恰好被分类一次：调用方正是通过 `deferred_curr` 和 `new_curr` 来访问batch的，若有遗漏或重叠，
+        #   某个请求就会读到给它暂存的随便什么东西——悄无声息，而且只在产生这种遗漏的那种batch形状下出现。
         assert (
             n_deferred + n_new == num_cur
         ), f"{n_deferred} deferred + {n_new} new != {num_cur} requests"
         return TokenLocations(deferred_curr, deferred_prev, new_curr)
 
+    # 把锁页缓冲input_ids.np的前count个异步H2D到GPU，返回GPU上的切片 [count]
+    #   group为None：直接CpuGpuBuffer.copy_to_gpu；否则只登记本组各成员这次要发多少（decode_src记None = 本次不发），由组一次性发布
+    #   （默认ATOM_H2D_BACKEND=packed时这个组是token_inputs：采样参数、cu_seqlens_q、input_ids等打包成一次H2D，见utils/packed_h2d.py）
     def _publish_input_ids(self, count, group):
         if group is None:
             return self.input_ids.copy_to_gpu(count)
@@ -507,6 +893,18 @@ class tokenIDProcessor:
         group.publish(group.counts)
         return self.input_ids.gpu[:count]
 
+    # "进"：为本步准备input_ids，返回GPU张量 int32 [本步token数]；调用方：ModelRunner.prepare_model
+    # 输入：batch；max_seqlen_q——本步每个请求最多几个token（不开投机为1，MTP为k+1；DP下是全组的最大值）；
+    #   publication_group——把多个H2D打包成一次的发布组（默认的packed模式下是token_inputs），为None时用本类自己的"input_ids"组
+    # @h2d_producer("input_ids", runner="runner")：进入函数体前先检查self.runner当前环槽的"input_ids"组可写（上一次用这块锁页缓冲的
+    #   H2D已执行完，见ModelRunner._gate_staging_reuse），否则直接报错——防止改到还没拷走的数据（utils/h2d.py）
+    # 按代码顺序的四条路径：
+    #   ① prefill批：scheduled_tokens原样写进去（prompt token全在CPU上）
+    #   ② 非延迟输出的decode：同样原样写（CPU已经同步拿到了上一步的真实token）
+    #   ③ 延迟输出、但还没有prev_batch：PD consumer的第一次decode（KV从远端prefill实例传来，本地没跑过prefill），原样写
+    #   ④ 延迟输出的decode（主路径）：先原样写（被延迟的请求那几格是占位），H2D之后由fill_deferred_decode_ids在GPU上把占位换成
+    #      prev_token_ids（投机解码时每个请求的窗口是[锚点, 草稿1..草稿k]，被延迟请求的草稿同样来自GPU上的draft_token_ids）
+    # 对比nano-vllm：prepare_decode逐条取seq.last_token（CPU上的真实值）拼成列表再H2D；这里token可能还只在GPU上
     @h2d_producer("input_ids", runner="runner")
     def prepare_input_ids(
         self,
@@ -521,6 +919,13 @@ class tokenIDProcessor:
         from the previous engine iteration, in which case those tokens on the
         GPU need to be copied into the corresponding slots into input_ids.
         """
+        # 【译】为当前batch准备input IDs。
+        #
+        #   仔细处理 `prev_sampled_token_ids`：它可能是从上一次引擎迭代缓存下来的，这时需要把GPU上的这些token拷进input_ids里
+        #   对应的槽位。
+        # 解释：docstring里的prev_sampled_token_ids就是本类的prev_token_ids
+        # 【译】（行尾注释）每个请求的token
+        # 解释：实际是所有请求的窗口首尾相接的一维数组 int32 [total_tokens_num]（scheduler.py ScheduledBatch.scheduled_tokens）
         scheduled_tokens = batch.scheduled_tokens  # tokens per req
         total_tokens_prefill = batch.total_tokens_num_prefill
         total_tokens_decode = batch.total_tokens_num_decode
@@ -531,18 +936,26 @@ class tokenIDProcessor:
         # it is a middle chunk), and the status it popped belongs to the batch
         # whose deferred tokens the NEXT output-producing step will surface.
         # Draining it here would hand that step `num_rejected=None`.
+        # 【译】MTP状态队列在postprocess里填入、在这里取出，所以跳过了postprocess的那一步不能取：batch不产出输出时（里面的每个
+        #   prefill都是中间chunk），`forward()` 在postprocess之前就返回了，而它若弹出状态，那份状态属于"下一个产出输出的step才会
+        #   交出其延迟token"的那个batch。在这里取掉，会让那一步拿到 `num_rejected=None`。
+        # 解释：不开投机时队列一直是空的，这里返回(None, None)；开投机时这是一个同步点（等上一步的验证结论拷完，见类上方【科普】）
         if batch.produces_output():
             self.prev_rejected_num, self.prev_bonus_num = self.recv_mtp_status_async()
 
         # TODO: remove this when we support mixed prefill and decode in one batch
+        # 【译】TODO：等支持一个batch里混合prefill和decode之后去掉这个分支。
+        # ① prefill批（基础调度器一步只做prefill或只做decode，见engine_core.py【2】）
         if total_reqs_prefill > 0:
             # Decode does not publish an empty prefill prefix: an explicit
             # zero copy is still a publication in this forward's ledger.
+            # 【译】decode不发布一段空的prefill前缀：显式的零长度拷贝在本次forward的账本里仍算一次发布。
             self.input_ids.np[:total_tokens_prefill] = scheduled_tokens[
                 :total_tokens_prefill
             ]
             return self._publish_input_ids(total_tokens_prefill, publication_group)
 
+        # ② 非延迟输出的decode：CPU上已有真实token，原样写
         if not self.is_deferred_out:
             token_ids = scheduled_tokens[
                 total_tokens_prefill : total_tokens_prefill + total_tokens_decode
@@ -553,6 +966,9 @@ class tokenIDProcessor:
             # is still set there (the runner keeps the drafter loaded to write
             # the draft's context KV at prefill) even though the scheduler
             # turned speculation off for it.
+            # 【译】目前没有任何投机路径支持流水线并行；它需要延迟分支那种按请求的暂存。这里直接按PP判断而不是按 `use_spec`：
+            #   P/D的producer也会走到这个分支，而且在那里这个标志仍然是True（runner保留着草稿模型，用来在prefill时写草稿的
+            #   上下文KV），尽管调度器已经为它关掉了投机。
             if self.use_spec and self.is_pipeline_parallel:
                 raise NotImplementedError("pipeline parallel + speculative decode")
             # PP verifies nothing locally and a P/D producer never speculates
@@ -560,6 +976,8 @@ class tokenIDProcessor:
             # did would need the deferred branch's per-request staging: under
             # DP a block drafter's `max_seqlen_q` is the group's maximum, not
             # this batch's row width.
+            # 【译】PP不在本地做验证，P/D的producer从不投机（包括它的DP dummy），所以这里没有任何一行带草稿。真要有的话，就需要
+            #   延迟分支那种按请求的暂存：DP下块草稿器（DSpark）的 `max_seqlen_q` 是全组的最大值，而不是这个batch的行宽。
             assert batch.num_spec_step == 0, (
                 "non-deferred decode got a speculative batch "
                 f"(num_spec_step={batch.num_spec_step})"
@@ -570,6 +988,9 @@ class tokenIDProcessor:
 
         # PD consumer first decode: no prior prefill step initialized
         # prev_batch, so use scheduled_tokens directly for this step.
+        # 【译】PD consumer的第一次decode：之前没有任何prefill步初始化过prev_batch，所以这一步直接用scheduled_tokens。
+        # ③ 解释：consumer的第一个token T0由producer采样、随kv_transfer_params传来（first_token_id），调度器已把它追加进
+        #   token_ids（scheduler.py的_schedule_first_decode_after_remote_kv，第9批），所以CPU上就是真值
         if self.prev_batch is None:
             token_ids = scheduled_tokens[
                 total_tokens_prefill : total_tokens_prefill + total_tokens_decode
@@ -578,6 +999,14 @@ class tokenIDProcessor:
             return self._publish_input_ids(total_tokens_decode, publication_group)
 
         """for decode: input ids are from prev_sampled_token_ids"""
+        # 【译】decode：input ids来自 prev_sampled_token_ids
+        # ④ 延迟输出的decode（主路径）。例（类上方【科普】的第N+1步，bs=2，不开投机）：
+        #   scheduled_tokens=[40, 2]（S的40已在CPU上；T那一格是占位2*）
+        #   get_token_locations → deferred_curr=[1]、deferred_prev=[0]、new_curr=[0] → decode_src=[-1, 0]
+        #   H2D之后GPU上：input_ids=[40, 2]、decode_src=[-1, 0]、cu_seqlens_q=[0, 1, 2]；prev_token_ids=[70]（第N步T的采样结果）
+        #   kernel：第0个请求src=-1跳过；第1个请求把input_ids[cu[1]:cu[2]]=input_ids[1:2]换成prev_token_ids[0]=70 → [40, 70]
+        #   投机解码k=1时：两个请求都被延迟，lens=[2, 2]、cu=[0, 2, 4]，prev_token_ids=[41, 71]（每行的下一个锚点）、
+        #     draft_token_ids=[[52], [83]] → kernel写出 input_ids=[41, 52, 71, 83]
         locs = self.get_token_locations(batch)
         deferred_curr_indices = locs.deferred_curr
         deferred_prev_indices = locs.deferred_prev
@@ -587,14 +1016,19 @@ class tokenIDProcessor:
 
         # The GRAPH's row stride, for sizing the padded tail only. NOT a
         # per-request length: dp>1 raises it to the DP-wide maximum.
+        # 【译】图的行跨度（每个请求在图里占几个token），只用来算补齐尾部的大小。它不是每个请求的长度：dp>1时会被抬到全DP组的最大值。
         tokens_per_seq = max_seqlen_q if self.use_spec else 1
 
         # Receive and map bonus_list to current batch order
+        # 【译】接收bonus列表，并映射到当前batch的顺序
+        # 解释：batch.num_rejected / num_bonus是调度器按它所知（再早一步的结论）填的；被延迟的请求用刚取到的上一步结论覆盖
+        #   （注意是原地改batch里的数组），注意力builder随后据num_rejected回退context_lens（见clean里num_rejected的说明）
         self.num_rejected = batch.num_rejected
         self.num_bonus = batch.num_bonus
         if num_deferred_seqs > 0 and self.prev_rejected_num is not None:
             # Remap prev step's rejected/bonus counts onto the current batch order
             # (prev_idx → curr_idx) for the deferred (carried-over) sequences.
+            # 【译】对被延迟（从上一步延续过来）的序列，把上一步的被拒数/bonus数按当前batch的顺序重新排列（prev_idx → curr_idx）。
             self.num_rejected[deferred_curr_indices] = self.prev_rejected_num[
                 deferred_prev_indices
             ]
@@ -607,11 +1041,19 @@ class tokenIDProcessor:
         # lengths -- the ragged shrink rewrites it in place, so ragged and
         # rectangular are the same array. Its prefix sum is `cu_seqlens_q`,
         # already published; a second copy is what let the two disagree under DP.
+        # 【译】---- 每个decode step都走同一条路径 ----
+        #   `num_scheduled_tokens` 是每个请求长度的唯一表述——ragged收缩（DSpark）会原地改写它，所以ragged和矩形是同一个数组。
+        #   它的前缀和是已经发布过的 `cu_seqlens_q`；再存一份拷贝，正是以前让两者在DP下对不上的原因。
+        # bs：decode请求数；lens：每个请求的token数 [bs]；cu_np：cu_seqlens_q的CPU一半 [bs+1]（attentions/backends.py decode_spans）
         bs, lens, cu_np = self.runner.attn_metadata_builder.decode_spans(batch)
 
         # Stage the scheduler's ids over the whole region. For a request the
         # scheduler just admitted this is already its real anchor (and drafts);
         # for a carried-over one it is a placeholder the kernel overwrites.
+        # 【译】把调度器给的id暂存到整个区域上。对调度器刚接纳的请求，这已经是它真实的锚点（以及草稿）；对从上一步延续过来的
+        #   请求，这是一个会被kernel覆盖的占位。
+        # 观察：这里说新请求的草稿也已就位，与下一段注释和代码不符——新请求的scheduled_tokens只有第0列（锚点）是真的，草稿列
+        #   是占位（草稿在seq.spec_token_ids里，见scheduler.py时间线②），由下面的循环从scheduled_spec_decode_tokens补上
         self.input_ids.np[:total_tokens_decode] = scheduled_tokens[
             total_tokens_prefill : total_tokens_prefill + total_tokens_decode
         ]
@@ -625,6 +1067,12 @@ class tokenIDProcessor:
         # per step (1.2us at 2) and a ragged scatter is a flat ~8us; above it
         # the scatter wins (12us vs 88us at bs=256). Swap if admissions stop
         # being few.
+        # 【译】新接纳的请求在 `prev_token_ids` 里没有对应的行，所以 `fill_deferred_decode_ids` 会跳过它（`src < 0`），它的草稿列
+        #   必须在这里暂存——`scheduled_tokens` 给它的是已提交的历史，只有第0列是对的。没有草稿的batch（`num_spec_step == 0`：
+        #   P/D producer的decode和DP的dummy）没有草稿表。
+        #
+        #   用循环而不是scatter：实测每步新接纳的请求少于约24个时循环更快（2个时1.2us），而ragged scatter固定约8us；超过这个数时
+        #   scatter更快（bs=256时12us对88us）。如果哪天新接纳的请求不再是少数，就换过来。
         if self.use_spec and batch.num_spec_step > 0 and num_new_seqs > 0:
             spec = batch.scheduled_spec_decode_tokens
             for i in new_curr_indices:
@@ -632,6 +1080,7 @@ class tokenIDProcessor:
                 if n_draft > 0:
                     s = int(cu_np[i]) + 1
                     self.input_ids.np[s : s + n_draft] = spec[i, :n_draft]
+        # decode_src：每个请求一个源行号，默认NEW_SEQUENCE（-1 = 已由CPU暂存好），被延迟的请求填它在上一步的行号
         src_np = self.decode_src.np[:bs]
         src_np.fill(NEW_SEQUENCE)
         src_np[deferred_curr_indices] = deferred_prev_indices
@@ -640,6 +1089,8 @@ class tokenIDProcessor:
             if publication_group is None
             else publication_group
         )
+        # 登记本组这次要发的长度并发布：input_ids前total_tokens_decode个、decode_src前bs个一起H2D（packed模式下还捎上
+        #   采样参数、cu_seqlens_q等）；必须在下面的kernel发射之前发布，kernel读的是它们的GPU一半（同一stream上按顺序执行）
         counts = group.counts
         counts[group.indices["input_ids"]] = total_tokens_decode
         counts[group.indices["decode_src"]] = bs
@@ -648,6 +1099,13 @@ class tokenIDProcessor:
         # `running_bs * tokens_per_seq` whatever the batch scheduled, and `bs`
         # sits between two captured buckets on most steps -- a 65-request batch
         # replays the 128 graph. The kernel zeroes the difference.
+        # 【译】forward要读多宽：被回放的decode图不管batch排了多少，读的都是固定的 `running_bs * tokens_per_seq`，而多数step里
+        #   `bs` 落在两个已录档位之间——65个请求的batch回放的是128那张图。kernel把多出来的部分清零。
+        # 解释：补出来的行没人写，MoE等算子却照样会读（decode_input_ids.py的说明），不清零就会带着上一次forward的id；0是合法的词表id
+        #   按默认档位[1..8, 16, 32, …, 512]，bs=65回放的是80那张图，需要清零的是第65~79行
+        # 观察：capture_cudagraph结束时runner.capture_sizes已按升序排好，reversed之后是降序，next(...)取到的是"最大的、≥bs的档位"，
+        #   也就是整条阶梯的最大档，而不是注释所说的"被回放的那一档"。结果只是清零范围偏大（清到最大档×tokens_per_seq为止，
+        #   不超过input_ids缓冲），不影响正确性
         fill_to = total_tokens_decode
         if not self.runner.enforce_eager:
             gbs = next(
@@ -655,6 +1113,8 @@ class tokenIDProcessor:
             )
             if gbs is not None:
                 fill_to = max(fill_to, int(gbs) * tokens_per_seq)
+        # 一次launch：每个请求一个program写它自己的[cu[i], cu[i+1])，再加若干program清零[cu[bs], fill_to)
+        #   上一步没有草稿时（pre_num_decode_token_per_seq == 1）不传draft表，此时每个请求必须恰好1个token（kernel里有assert）
         fill_deferred_decode_ids(
             self.input_ids.gpu,
             self.runner.forward_vars["cu_seqlens_q"].gpu[: bs + 1],
@@ -669,19 +1129,30 @@ class tokenIDProcessor:
         # so the decode total is the whole batch; a worker-side speculative q
         # shrink rewrites it, and reading any other total here would leave the
         # attention metadata wider than input_ids.
+        # 【译】按这条路径实际暂存的宽度切片。prefill在上面已经返回，所以decode的总数就是整个batch；worker一侧的投机q收缩会改写它，
+        #   这里若读任何别的总数，注意力元数据就会比input_ids宽。
         input_ids = self.input_ids.gpu[:total_tokens_decode]
         return input_ids
 
+    # 【分支】投机解码（第7批）：草稿token的"出"与"进"，和token那一路同理
+    # 输入：batch——本步batch；draft_token_ids——本步propose出的草稿，GPU，[bs, k]
+    # 输出：交给调度器的草稿（numpy）——非延迟时是本步的，延迟时是上一步的（和prepare_sampled_ids返回的token属于同一个batch），
+    #   第一次为空数组
+    # 调用方：ModelRunner.propose_draft_token_ids（postprocess里）
     def prepare_draft_ids(
         self, batch: ScheduledBatch, draft_token_ids: torch.Tensor
     ) -> np.ndarray:
         if not self.is_deferred_out:
             # propose() builds this on the drafter's device; the scheduler wants
             # host rows.
+            # 【译】propose()在草稿模型所在的设备上生成它；调度器要的是主机上的行。
+            # 解释：.cpu()不带non_blocking，是同步点
             ret = draft_token_ids.cpu().numpy()
         else:
+            # 留在GPU上给下一步的fill_deferred_decode_ids当草稿列；从此每个请求的输入宽度是k+1
             self.draft_token_ids = draft_token_ids
             self.pre_num_decode_token_per_seq = self.num_spec_tokens + 1
+            # 先取上一步的草稿（同步等它拷完），再对本步的发起异步D2H
             token_ids = self.recv_async_output_draft()
             self.send_to_cpu_async_draft(draft_token_ids)
             ret = (
@@ -692,8 +1163,14 @@ class tokenIDProcessor:
         return ret
 
 
+# 【分支】profiler（第10批）：装饰器，给runner的各阶段在torch profiler的trace里打上命名区间
+#   用在ModelRunner的forward、prepare_model、run_model、postprocess、_gate_staging_reuse、_mark_staging_h2d_enqueued，
+#   以及RapidServeModelRunner.forward上
+#   self.profiler为None（没调start_profiler，平时都是这样）时直接调用原方法，几乎零开销；否则用record_function("ATOM::方法名")
+#   包一层，trace里能看到每个阶段的起止；forward的标签还带上本步的token数、prefill / decode请求数
 def _profile_runner_stage(method):
     """Annotate runner stages only while its torch profiler is active."""
+    # 【译】只在runner的torch profiler处于开启状态时，给runner的各个阶段打上标注。
     name = method.__name__
     label = f"ATOM::{name}"
 
@@ -2673,6 +3150,11 @@ class ModelRunner:
             "state_runtime": state_runtime.to_wire(),
         }
 
+    # 一次分配全部PAGE子池，再按builder切成几段region（allocate_kv_cache的第①步，B级）
+    #   输入：blocks = 调度器的block数（get_num_blocks的结果）；buf：RapidServe的decode侧传入从prefill导入的池，其余为None
+    #   输出：(整块uint8 buffer, 每个builder的region列表, builder列表)，三者按位置对齐
+    #   例（get_num_blocks上方②(a)）：只有目标builder、34,698个block → torch.zeros(34,698 × 2,703,360 B ≈ 87.36GB, uint8)，
+    #     region[0]就是整块；带独立草稿池（draft_kv_builder）时region[1]紧跟在后（plan_regions按256B对齐）
     def _carve_paged_pool(self, blocks: int, buf=None):
         """One allocation for every paged pool, and each builder's region of it.
 
@@ -2688,13 +3170,24 @@ class ModelRunner:
         same walk rather than being told the offsets, so the two cannot drift.
         A builder that allocates its own answers zero and gets an empty region.
         """
+        # 【译】所有分页池只做一次分配，以及每个builder在其中的区域。
+        #
+        #   目标模型的KV、它的scale、顺带的索引缓存、草稿的兄弟池，以前最多是五个名字下的五次分配。这里只用一个buffer，
+        #   理由与把声明合并时相同：一个block的字节是同一个事实，它被存在几个名字下，就有几个地方让下一个读者跟它对不上。
+        #   剩下的就是 `kv_cache`，IPC导出发送的、sleep路径释放的都是它。
+        #
+        #   返回按位置对齐的 `(buffer, regions, builders)`。`buf` 是P/D的decode侧导入的池；那一侧用同样的遍历去切，
+        #   而不是被告知偏移量，所以两边不会漂移。自己分配内存的builder回答0，拿到一个空区域。
         builders = [self.attn_metadata_builder]
         if hasattr(self, "draft_kv_builder"):
             builders.append(self.draft_kv_builder)
         # Before pricing, not between pricing and filling: the price below
         # comes from the walk.
+        # 【译】在计价之前做，而不是在计价和填充之间：下面的价格来自那次遍历。
+        # 解释："遍历"指builder数模型里各类注意力层各有几行（pool_rows）；先作废缓存的结果，重新数
         for builder in builders:
             builder.invalidate_pool_rows()
+        # 每个builder要的字节数 = 每条目字节 × blocks（与sub_pool_specs计价时是同一份声明）；自己分配的builder回答0
         sizes = [b.paged_pool_bytes(blocks) for b in builders]
         # A builder either allocates its own pool or takes exactly what its own
         # PAGE spec was charged -- nothing between. It catches the two hooks
@@ -2702,6 +3195,9 @@ class ModelRunner:
         # walk, which both readings share. A startup check and not a unit test
         # because what it catches surfaces while serving, never as a bad number
         # here.
+        # 【译】一个builder要么自己分配池，要么恰好拿走它的PAGE规格被计价的那么多——没有中间状态。这能抓住两个钩子不一致的情况
+        #   （分别被覆写；给其中一个加了字段），抓不住过期的遍历（两种读法共享它）。做成启动时检查而不是单元测试，
+        #   因为它抓到的问题会在服务时才暴露，从来不会在这里表现为一个错误的数字。
         for builder, size in zip(builders, sizes):
             if not size:
                 continue
@@ -2713,7 +3209,9 @@ class ModelRunner:
                     f"{type(builder).__name__} wants {size} B of the paged pool "
                     f"at {blocks} blocks but was charged {charged} B"
                 )
+        # 各region首尾相接、每段起点按256B对齐（pool_layout/entry_arena.py plan_regions）
         offsets, total = plan_regions(sizes)
+        # 真正的显存分配就这一句：一维uint8字节池，布局全交给各builder（不同于nano-vllm那样直接建一个有形状、有dtype的KV张量）
         if buf is None:
             buf = torch.zeros(total, dtype=torch.uint8, device=self.device)
         elif buf.numel() < total:
@@ -2724,6 +3222,10 @@ class ModelRunner:
         regions = [buf[o : o + n] for o, n in zip(offsets, sizes)]
         return buf, regions, builders
 
+    # 让每个builder在自己的region里布局（allocate_kv_cache_tensors），并把返回的标量/映射setattr到runner上
+    #   调用方：allocate_kv_cache（本侧分配）、RapidServeModelRunner._bind_kv_cache_to_modules（decode侧用导入的池）
+    #   例：MHA builder在region里建K、V、scale几个"层主序"的字段（mha_kv_pool.py）；MLA builder返回aligned_index_dim、
+    #     index_cache_layer_map（DSA的索引缓存只有部分层有，层号 → 紧凑行号）
     def _back_paged_pools(self, blocks: int, buf=None):
         """Back every builder's paged pool and publish what comes back.
 
@@ -2734,6 +3236,11 @@ class ModelRunner:
         on both, and a path that only backed the pool leaves the other half
         dereferencing attributes nobody set.
         """
+        # 【译】给每个builder的分页池装上后备显存，并发布它们返回的东西。
+        #
+        #   只放在这一处，因为有两个调用方：本侧分配buffer，P/D对的decode侧导入它。钩子返回的东西——对齐后的索引维度、
+        #   紧凑的层映射、GLM-5.3的k-pool尾部——必须在两边都作为runner属性到达它的读者；只装了池的那条路径，
+        #   会让另一半去解引用没人设置过的属性。
         pool, regions, builders = self._carve_paged_pool(blocks, buf=buf)
         for builder, region in zip(builders, regions):
             for name, value in builder.allocate_kv_cache_tensors(
@@ -2750,12 +3257,45 @@ class ModelRunner:
             )
         return pool
 
+    # =====================================================================================
+    # allocate_kv_cache：按get_num_blocks的结果真正分配KV显存，并把每层的那一片绑到对应的注意力模块（A级）
+    #   调用方：EngineCore.__init__ 经 call_func("allocate_kv_cache", num_blocks, wait_out=True)：每个rank都按rank 0算出的
+    #     同一个block数分配（PP已在get_num_blocks里取过跨stage最小值）；返回True（返回None的RPC不回包，调用方会卡死）
+    #   前置：KVCacheTensor与kv_cache_data是什么见config.py KVCacheTensor上方的【科普】；PAGE/STATE子池、"每条目字节"见
+    #     get_num_blocks上方②③；CPU侧谁占了哪个block由BlockManager / BlockPool记账（第4批block_pool.py文件头）
+    #
+    # 流程（例：get_num_blocks上方②(a)的70B MHA模型，34,698个block）：
+    #   ① _back_paged_pools → _carve_paged_pool：一次torch.zeros分配全部PAGE子池
+    #        self.kv_cache = uint8[34,698 × 2,703,360 B ≈ 87.36GB]，按builder切成region（目标模型的，以及可能的独立草稿池）
+    #        builder在自己的region里按"层主序"排字段（mha_kv_pool.py、pool_layout/entry_arena.py的LayerMajorArena）：
+    #          [K：层0的全部block │ 层1 │ … │ 层79][V：同上][k_scale：…][v_scale：…][extra：如MiniMax-M3的索引key]
+    #          某一层的K是其中连续的一段，view成 [num_blocks, 8个KV头, 128/16, 16(block_size), 16]（SHUFFLE布局：fp8时每16个元素
+    #          凑一个16字节的MFMA tile），V是 [num_blocks, 8, 16/16, 128, 16]；scale是 [num_blocks, 8, 16] 的fp32
+    #   ② allocate_per_req_cache：STATE子池（GDN的mamba_k_cache / mamba_v_cache、V4的压缩器环和滑动窗口等），setattr到self上；
+    #      warmup_per_req_cache：首次状态checkpoint拷贝要付的一次性开销（编译kernel等）在服务前付掉
+    #   ③ 绑定：遍历目标模型（和草稿模型）的每个module，问builder的build_kv_cache_tensor(module)：
+    #        注意力层 → builder把属于这一层的视图挂到module上（MHA：module.k_cache / v_cache / k_scale / v_scale；
+    #                   MLA：module.kv_cache），并返回一个KVCacheTensor；其他module（LayerNorm、MLP…）→ None，跳过
+    #        kv_cache_data = {"layer_0": KVCacheTensor, …, "layer_79": …}，key用module自己的全局layer_num
+    #          （PP下stage 1的第一层可能是layer_40；混合模型里线性注意力层的条目是它的递归状态，per_request_state=True）
+    #   ④ 【分支】PD分离 / KV offload：builder的get_kv_transfer_tensors描述要搬运的字节区域，交给connector（第9批）
+    #   ⑤ set_kv_cache_data：kv_cache_data放进forward context；注意力层forward时按 f"layer_{self.layer_num}" 取（attention_mha.py等）
+    #   ⑥ 自检：实际新分配的字节与plan预计的相差 > 3%时打warning；多卡时barrier一次
+    #
+    # 对比nano-vllm：nano-vllm分配一个形状为 [2, 层数, block数, block_size, KV头, head_dim] 的张量，遍历module、按hasattr(k_cache)
+    #   依次赋视图。ATOM保留"一块大显存 + 每层一个视图、不拷贝"的思路，但①分配的是无类型的uint8字节池，布局交给各注意力后端；
+    #   ②一层可能不止K、V两块（scale、索引key、递归状态），统一包成KVCacheTensor，还要交给PD分离/offload；
+    #   ③层号用module自己的layer_num，而不是遍历时的序号（PP、混合模型、草稿层都会让两者不一致）
+    # =====================================================================================
     def allocate_kv_cache(self, num_kvcache_blocks):
+        # 分配前的已分配字节，用于⑥的自检
         pre_alloc = torch.cuda.memory_stats()["allocated_bytes.all.current"]
 
         config = self.config
+        # 写进本runner进程的config副本（EngineCore那边另外回填自己的）
         config.num_kvcache_blocks = num_kvcache_blocks
         hf_config = config.hf_config
+        # 本rank的KV头数，规则同_get_num_kv_heads（KV头少于TP时每rank 1个）
         if hf_config.num_key_value_heads >= self.world_size:
             assert hf_config.num_key_value_heads % self.world_size == 0
             num_kv_heads = hf_config.num_key_value_heads // self.world_size
@@ -2764,6 +3304,7 @@ class ModelRunner:
             num_kv_heads = 1
         # Promote to self so attention builders' build_kv_cache_tensor()
         # hooks can access it without re-deriving from hf_config.
+        # 【译】提升为self的属性，这样注意力builder的build_kv_cache_tensor()钩子不用再从hf_config推导就能拿到。
         self.num_kv_heads = num_kv_heads
         self.aligned_index_dim = None  # set below for DeepSeek-V3.2
 
@@ -2775,6 +3316,12 @@ class ModelRunner:
         # What comes back is only what a region cannot carry: scalars like
         # `aligned_index_dim` and the compact layer maps, setattr'd here so
         # their readers find them where they always have.
+        # 【译】主KV cache的分配：一个buffer，每个builder一个区域，各自负责自己区域内的布局。不能共用目标模型池的草稿，
+        #   就只是下一个区域——没有第二次分配，也没有任何地方去问它的注意力和目标的是否一致。
+        #
+        #   返回来的只是区域装不下的东西：`aligned_index_dim` 这样的标量和紧凑的层映射，在这里setattr上去，
+        #   让它们的读者在一贯的位置找到它们。
+        # ① 见本方法上方流程图；pool为空（所有builder都自己分配，例如DeepSeek-V4）时不设self.kv_cache
         pool = self._back_paged_pools(num_kvcache_blocks)
         if pool.numel():
             self.kv_cache = pool
@@ -2784,6 +3331,10 @@ class ModelRunner:
         # `{"mamba_k_cache": ..., "mamba_v_cache": ...}`; for stateless
         # attentions it returns an empty dict (no-op). Values are setattr'd
         # on `self` so model layers can access them as `model_runner.<name>`.
+        # 【译】每请求cache的分配（与模型无关，委托给注意力元数据builder）。对GDN它返回
+        #   `{"mamba_k_cache": ..., "mamba_v_cache": ...}`；对无状态的注意力返回空dict（什么也不做）。
+        #   返回值被setattr到 `self` 上，模型层就能以 `model_runner.<name>` 访问。
+        # ② 条目数来自plan（例：Qwen3-Next、max_num_seqs=512、不开MTP → 512个槽位 × 37.7MB）
         per_req_state = self.attn_metadata_builder.allocate_per_req_cache(
             self.pool_plan.entries
         )
@@ -2792,14 +3343,21 @@ class ModelRunner:
         # The pools are reachable through `self` only now, which is the
         # earliest the builder can touch its own addresses — and the last
         # moment before a request could.
+        # 【译】直到现在这些池才能经 `self` 访问到，这是builder最早能碰到自己地址的时刻——也是请求能碰到它们之前的最后时刻。
         self.attn_metadata_builder.warmup_per_req_cache()
 
         # Build KVCacheConfig
         # lirong TODO: This is a simple solution to build KVCacheConfig,
         # models with only one type of attention, but not support multi-type of attention models.
         # We need to support it by kv_cache_group in the future.
+        # 【译】构建KVCacheConfig
+        #   lirong TODO：这是构建KVCacheConfig的一个简单方案，只适用于只有一种注意力的模型，不支持多种注意力混合的模型。
+        #   将来要用kv_cache_group来支持。
+        # 解释：这段注释已过时——下面构造的是kv_cache_data字典，并没有KVCacheConfig（config.py KVCacheConfig上方的说明）；
+        #   混合注意力的模型也已由各builder的build_kv_cache_tensor分别处理
 
         # Prepare list of models to bind KV cache
+        # 【译】准备要绑定KV cache的模型列表（目标模型；开投机解码时再加草稿模型）
         models_to_bind = [("target", self.model)]
         if self.config.speculative_config and hasattr(self, "drafter"):
             models_to_bind.append(("draft", self.drafter.model))
@@ -2808,13 +3366,18 @@ class ModelRunner:
         # up at forward time (`kv_cache_data[f"layer_{self.layer_num}"]`). The
         # walk's ordinal used to be passed down and stood in for this, for a
         # pool row and for an index-map key; under PP it is none of the three.
+        # 【译】按每个module自己的全局layer_num作key，这正是它在forward时查找用的（`kv_cache_data[f"layer_{self.layer_num}"]`）。
+        #   以前把遍历的序号传下去，用它同时充当池里的行号和索引映射的key；在PP下它三者都不是。
+        # 例：-pp 2的80层模型，stage 1上第一个注意力层的layer_num约为40（看切分）：key是"layer_40"，而它在本stage的池里是第0行
         kv_cache_data = {}
         for model_name, model in models_to_bind:
             logger.info("Binding KV cache for the %s model", model_name)
+            # model.modules()：递归遍历所有子模块（每个decoder层、其中的注意力、线性层……），只有注意力层会被builder认出来
             for module in model.modules():
                 # A draft that owns an independent KV pool binds through its
                 # sibling builder first; for unrecognized modules it returns
                 # None and we fall through to the target builder.
+                # 【译】拥有独立KV池的草稿先经它的兄弟builder绑定；不认识的module它返回None，再落到目标模型的builder。
                 kv_cache_tensor = None
                 if model_name == "draft" and hasattr(self, "draft_kv_builder"):
                     kv_cache_tensor = self.draft_kv_builder.build_kv_cache_tensor(
@@ -2825,6 +3388,10 @@ class ModelRunner:
                 # collects the resulting KVCacheTensor entries. The builder
                 # returns None for modules it does not recognize (so a
                 # sibling module like nn.LayerNorm is silently skipped).
+                # 【译】按注意力类型绑定由注意力元数据builder负责；ModelRunner只遍历module、收集得到的KVCacheTensor条目。
+                #   builder对不认识的module返回None（所以像nn.LayerNorm这样的兄弟module会被静默跳过）。
+                # 例（MHA）：builder取出这一层的(k, v)视图，设置module.k_cache / v_cache（fp8时还有k_scale / v_scale）；
+                #   注意力层forward时写KV（按slot_mapping）、读KV（按block_table）用的就是这些视图——写视图就是写整块池，不拷贝
                 if kv_cache_tensor is None:
                     kv_cache_tensor = self.attn_metadata_builder.build_kv_cache_tensor(
                         module
@@ -2832,11 +3399,14 @@ class ModelRunner:
                 if kv_cache_tensor is not None:
                     kv_cache_data[f"layer_{module.layer_num}"] = kv_cache_tensor
 
+        # ④ 【分支】PD分离 / KV offload（第9批）：没配KV传输时builder返回None，下面三段都跳过
         transfer_tensors = self.attn_metadata_builder.get_kv_transfer_tensors()
         if transfer_tensors is not None:
             # The tier is built inside `register_kv_caches` and needs
             # `state_entry_views` to name the bytes it packs. This is the only
             # place the builder and the connector are both in scope.
+            # 【译】状态层（tier）在 `register_kv_caches` 里构建，需要 `state_entry_views` 来指明它要打包的字节。
+            #   这是builder和connector同时可见的唯一位置。
             transfer_tensors.state_backend = self.attn_metadata_builder
         if hasattr(self, "draft_kv_builder") and transfer_tensors is not None:
             transfer_tensors.merge_pages(
@@ -2848,11 +3418,16 @@ class ModelRunner:
             # scheduler's block count. The builders cannot answer this: each
             # counts in its own page, and the transfer protocol addresses
             # ``req.block_ids``, which are the scheduler's.
+            # 【译】在草稿的区域加进来之后做；放在这里，是因为只有这里同时持有完整的区域列表和调度器的block数。
+            #   builder回答不了：每个builder按自己的page计数，而传输协议寻址的是 ``req.block_ids``，那是调度器的。
             transfer_tensors.set_block_count(num_kvcache_blocks)
         # The same count reaches the codecs, which likewise index by scheduler
         # block: MLA's cache is allocated in page-size-1 rows, so its own count
         # is block_ratio times larger and would make a codec treat one token as
         # a complete scheduler block.
+        # 【译】同一个数也交给codec，它们同样按调度器的block寻址：MLA的cache按page大小为1的行分配，它自己的计数要大block_ratio倍，
+        #   会让codec把一个token当成一个完整的调度器block。
+        # ⑤ 放进forward context（配了KV传输时还会把它们登记给connector）
         set_kv_cache_data(
             kv_cache_data,
             config,
@@ -2867,12 +3442,17 @@ class ModelRunner:
         # math in `get_num_blocks()` reserves both separately, so the cross-
         # check must mirror that — otherwise it spuriously fires for any
         # backend that declares a per-request state pool (V4, GDN).
+        # 【译】交叉验证：比较预计的与实际的KV cache分配量。`actual_kv_bytes` 既包括统一池的张量（按 `block_bytes × num_blocks` 计），
+        #   也包括每请求cache的张量（状态buffer + 嵌在unified_kv里的SWA窗口前缀）。`get_num_blocks()` 的预算对两者分别做了预留，
+        #   所以交叉检查也必须照做——否则任何声明了每请求状态池的后端（V4、GDN）都会误报。
         post_alloc = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         actual_kv_bytes = post_alloc - pre_alloc
         # Each sub-pool contributes `entry_bytes × entries`. The counts come
         # straight from the sizing plan — which already absorbed the pipeline-
         # parallel reconciliation — so this mirrors the budget by construction
         # rather than re-deriving it.
+        # 【译】每个子池贡献 `entry_bytes × entries`。这些计数直接来自规模计划——它已经吸收了流水线并行的对齐——
+        #   所以这里按构造就与预算一致，而不是重新推导一遍。
         expected_kv_bytes = self.pool_plan.total_reserved_bytes
         if expected_kv_bytes > 0:
             diff_pct = abs(actual_kv_bytes - expected_kv_bytes) / expected_kv_bytes
@@ -2881,6 +3461,8 @@ class ModelRunner:
             # (round to 256 B / 16 MiB segments) and whatever transient the
             # builders touch while initializing their pools, accounting for
             # ~2% noise on multi-GiB pools. Lower thresholds spuriously fire.
+            # 【译】3%的阈值：预算公式与分配完全一致，但实测的 `post_alloc - pre_alloc` 包含分配器的对齐（取整到256B / 16MiB段），
+            #   以及builder初始化池时碰到的临时分配，在几个GiB的池上约有2%的噪声。阈值再低就会误报。
             if diff_pct > 0.03:
                 logger.warning(
                     f"KV cache allocation mismatch: "
@@ -2893,6 +3475,9 @@ class ModelRunner:
         # forces lazy NCCL communicator creation (CUDA-allocs its buffers),
         # which can OOM/fail on single-card runs. The process group stays
         # initialized so get_tp_group() and friends keep working.
+        # 【译】单rank时跳过：world_size==1的barrier本来什么也不做，却仍会强制惰性地创建NCCL通信器（为它的缓冲做CUDA分配），
+        #   在单卡运行时可能OOM或失败。进程组保持已初始化状态，所以get_tp_group()等照常可用。
+        # 多卡时：等所有rank都分配、绑定完，再一起返回（之后EngineCore就要录图、开始服务）
         if (
             torch.distributed.is_initialized()
             and torch.distributed.get_world_size() > 1
@@ -3344,6 +3929,7 @@ class ModelRunner:
     #     → sampler走带过滤的采样（sampler.py）；若三条都是temperature=0 → all_greedy=True，直接argmax
     #   每个TP rank都执行（ATOM每个rank都采样，见postprocess）。调用方：prepare_model；packed H2D时传入"token_inputs"组，
     #     和cu_seqlens_q、input_ids一起一次上传
+    #   @h2d_producer("sampling")：声明这个方法会写"sampling"组的锁页buffer，进入前先检查该组此刻可写（utils/h2d.py）
     # 对比nano-vllm：nano-vllm只有temperature（prepare_sample只拷一个[bs]张量，且只在rank 0上），ATOM多了top-k / top-p、
     #   n>1时的独立噪声，以及"整批相同就传标量"的优化
     @h2d_producer("sampling")
@@ -3423,7 +4009,8 @@ class ModelRunner:
     #      DP>1时先做本步唯一一次跨DP集合通信（DP组gloo上的一次打包all_gather，交换各rank的token数、bs、是否prefill等），然后
     #        running_bs = capture_sizes阶梯上 >= 全组最大bs 的最小一档（超过最大档就等于原值）
     #        use_cudagraph = 非prefill 且 全组都在decode 且 未enforce_eager 且 后端不拒绝 且 落在阶梯上
-    #      例（阶梯[1..8, 16, 32, 48, 64, 128, 256, 512]）：bs=5 → 5；bs=9 → 16；bs=65 → 128（补63行）；bs=600 → 600、走eager
+    #      例（阶梯[1..8, 16, 32, 48, 64, 128, 256, 512]）：bs=5 → 5；bs=9 → 16；bs=65 → 128（补63行）；
+    #        bs=600（--max-num-seqs调到600以上时才会出现）→ 不在阶梯上，running_bs=600、走eager
     #      例（DP=2）：rank0有3条decode、rank1有5条 → 全组最大5 → 两个rank的running_bs都是5，rank0补2行
     #      --enforce-eager时capture_sizes保持[0]（__init__），任何bs都不在阶梯上 → 永远eager，单DP时running_bs = bs
     #   ③ prepare_sample：采样参数
@@ -4343,7 +4930,7 @@ class ModelRunner:
         # Extract req_ids and token_ids from dict (key -1 is the is_deferred_out flag)
         # 【译】从dict里取出req_ids和token_ids（key -1是is_deferred_out标志）
         # 例（延迟输出，接prepare_inputs的例2）：本步是decode [A, B, C]，返回的是例1那一步的结果 → req_ids_out = [A, B]、
-        #   token_ids_out = [(tA,), (tB,)]；投机解码时每个元组里是本步接受的若干个token（-1之后截掉）
+        #   token_ids_out = [(tA,), (tB,)]；投机解码时每个元组是那一步输出的若干个token（遇到-1截断，_batch_process_token_ids）
         req_ids_out = [k for k in token_id_dict if k != -1]
         token_ids_out = [token_id_dict[k] for k in req_ids_out]
 
@@ -4457,7 +5044,7 @@ class ModelRunner:
     # 调用链：EngineCore._process_engine_step_inner → runner_mgr.call_func("forward", batch, wait_out=True)
     #   → 共享内存广播 → 每个TP rank的ModelRunner.forward(batch)（同一个batch、同样的forward，SPMD，engine_core.py文件开头【4】）
     #   → 只有rank 0的返回值回到EngineCore → scheduler.postprocess
-    #   装饰器：inference_mode关闭autograd记录；with_eplb_forward_monitor在开EPLB时统计专家负载（【分支】第7批）；
+    #   装饰器：inference_mode关闭autograd记录；with_eplb_forward_monitor在开EPLB时监控每次forward（专家负载统计用，【分支】第7批）；
     #     _profile_runner_stage只在torch profiler开着时打标签
     # 一步的GPU侧全流程（与下面的代码一一对应）：
     #   ① _advance_forward_vars / _gate_staging_reuse：选一组暂存buffer（PP时轮换），并确认上一步从这些buffer发出的H2D
@@ -4481,7 +5068,7 @@ class ModelRunner:
     #   被GPU掩盖的CPU时间：postprocess(N−1)、schedule(N+1)，以及forward(N+1)的准备阶段（ForwardMode.decide、注意力元数据、
     #     H2D排队、kernel发射）——它们都发生在GPU执行第N步的期间。之所以能提前准备，是因为第N+1步的input_ids直接从GPU上的
     #     prev_token_ids取（fill_deferred_decode_ids），不需要CPU先拿到第N步的token，GPU队列里始终有活
-    #   CPU在主路径上等GPU的地方：⑦里等上一步的D2H（event.synchronize，这时第N步还在GPU上跑）；①的闸门等上一步的H2D
+    #   CPU在主路径上等GPU的地方：⑦里等上一步的D2H（event.synchronize；等完时第N步已在GPU队列里）；①的闸门等上一步的H2D
     #     （decode稳态下早已完成）；投机解码时还要取上一步的草稿和接受数（同样是上一步、早已在拷的）。不延迟时则在⑦等本步的.tolist()
     #   量级（engine_core.py【3】）：decode一步GPU 10ms量级、CPU的post + sched + 准备几ms → 不延迟时这几ms里GPU空转，延迟后被盖住
     # 对比nano-vllm：nano-vllm的run() = prepare → run_model → sampler → .tolist() → reset_context，一步完全同步；
@@ -4872,8 +5459,8 @@ class ModelRunner:
     #     --cudagraph-mode FULL（默认）/ NONE               → False → 手动FULL整图捕获（原生路径没有单独判断NONE，照样录整图）
     #     PIECEWISE / FULL_AND_PIECEWISE / AF_PIECEWISE    → True（requires_piecewise_compilation()；需要--level 3在attention处切图）
     #     AF_PIECEWISE在此基础上再录attention核心（capture_cudagraph里的attn_ffn_piecewise）
-    #   读取方：prepare_model（给ForwardMode.decide传captured_tokens）、run_model、capture_cudagraph、_estimate_cudagraph_overhead、
-    #     _producer_graph_shapes
+    #   读取方：prepare_model（给ForwardMode.decide传captured_tokens）、run_model、capture_cudagraph，
+    #     以及_estimate_cudagraph_overhead和_producer_graph_shapes
     @torch.inference_mode()
     def _piecewise_cg_active(self) -> bool:
         """True when the compiled model's dense pieces self-capture PIECEWISE
@@ -5144,6 +5731,50 @@ class ModelRunner:
             fc.batch_descriptor = None
             self._piecewise_captured_tokens.add(num_tokens_dp)
 
+    # ============================ capture_cudagraph：启动时录制decode的CUDA Graph ============================
+    # 调用方：EngineCore.__init__，在allocate_kv_cache之后、not enforce_eager且不是PD分离的decode进程时
+    #   （call_func("capture_cudagraph", wait_out=True)）；返回 (耗时秒数, 捕获的bs列表, graph内存池字节数)
+    # 前置（config.py里CUDAGraphMode上方【科普】②）：graph录下的是一串kernel和它们读写的显存地址，回放时地址、形状都不变。
+    #   所以：(a) 输入必须放在固定的buffer里——这里用的input_ids / positions / outputs和注意力元数据（slot_mapping、block_tables、
+    #     context_lens、cu_seqlens_q、kv_indptr……）都是forward_vars里启动时一次分配好的（按max_num_batched_tokens / max_num_seqs），
+    #     每张graph只用它们的前缀切片[:num_tokens]、[:bs]；运行时prepare_*把新数据写进同样的地址，回放就读到了新数据
+    #     （nano-vllm是回放前再拷进graph_vars，见run_model上方的对比）
+    #   (b) 每种形状单独录一张：key = (bs, max_q_len)，max_q_len = 1（不开投机解码）或mtp_k+1（MTP每条序列验证k个草稿）
+    #   (c) 每张graph都占显存（中间激活），所以只录有限几档，运行时补齐到最近的一档（ForwardMode.decide的阶梯）
+    #
+    # 录哪些尺寸（默认 --cudagraph-capture-sizes [1,2,3,4,5,6,7,8,16,32,48,64,128,256,512]、--max-num-seqs 512、
+    #   --max-num-batched-tokens 16384）：
+    #   max_bs = min(max_num_seqs, max_num_batched_tokens // (mtp_k+1))（max_schedulable_decode_bs，与调度器schedule_decode一致），
+    #     超过max_bs的档位删掉：调度器凑不出来，而且逐token的buffer只有max_num_batched_tokens行，录了会越界
+    #   例1：不开投机解码 → max_bs = min(512, 16384) = 512 → 15档全留
+    #   例2：MTP k=3、--max-num-seqs 256、--max-num-batched-tokens 512 → max_bs = min(256, 512 // 4 = 128) = 128
+    #     → 删掉[512, 256]，剩13档 → 录13张图：(128, 4)、(64, 4)、…、(1, 4)，最大一张是128 × 4 = 512个token
+    #   例3：--max-num-seqs 16 → 删掉32以上的6档，剩[16, 8, 7, …, 1]共9档
+    #
+    # 录制顺序：从大到小（capture_sizes.sort(reverse=True)），所有FULL graph共用一个内存池（self.graph_pool）：
+    #   graph_pool：|<──────────── graph(512) 的中间激活 ────────────>|
+    #               |<──── graph(256) ────>|
+    #               |<─ graph(1) ─>|
+    #   第一张（最大的）graph创建池子并占到最大的峰值，之后小的graph在同一个池里分配、基本不再增长；同一时刻只会回放
+    #   一张graph，所以共用不冲突（先录小的反而会让池子一次次扩张）。录完再sort()回升序，供ForwardMode.decide二分查找
+    #   DSpark有多个q档时外层循环按q升序（resolve_q_buckets），最大的那张不一定第一个录
+    #   PIECEWISE路径不用这个池：片段由CUDAGraphWrapper各自录，默认每个num_tokens档一个池（utils/cuda_graph.py，
+    #     ATOM_PER_BUCKET_POOL=0恢复成共享一个池）
+    #
+    # 两条路径（_piecewise_cg_active；与config.py CUDAGraphMode上方的模式表一致）：
+    #   FULL（默认；原生下--cudagraph-mode NONE也走这里）：每档先eager跑一遍预热，再在torch.cuda.graph里录整个forward
+    #     （加上写outputs的拷贝；TP=1且不开TBO时连compute_logits一起录）→ self.graphs[(bs, q)]
+    #   PIECEWISE / FULL_AND_PIECEWISE / AF_PIECEWISE：不录整图；每档先预热，再以cudagraph_runtime_mode=PIECEWISE调一次模型，
+    #     编译图（--level 3在attention处切开，utils/backends.py）里每个稠密片段的CUDAGraphWrapper看到新的
+    #     BatchDescriptor(num_tokens)就当场录自己那一段；attention留在片段之间eager运行 → 记进_piecewise_captured_tokens；
+    #     AF_PIECEWISE再为ragged档位额外录attention核心（_capture_attn_ffn_graphs）
+    #
+    # 为什么录之前要先eager跑一遍（warmup）：第一次运行会触发torch.compile / Triton的JIT编译、各种库句柄和scratch的懒初始化
+    #   （例如AITER按(device, stream)缓存kernel的scratch，并拒绝在捕获中做第一次分配，见forward_context.py side_stream），
+    #   这些一次性的工作不能落进捕获里；先跑一遍把它们做完（nano-vllm的capture_cudagraph也是先warmup再capture）
+    # 对比nano-vllm：nano-vllm的档位写死为[1, 2, 4, 8] + 16的倍数直到min(max_num_seqs, 512)，同样从大到小录、共用一个池；
+    #   ATOM的档位可配置并按token预算过滤，key多了q长度，另有PIECEWISE路径、TBO的多stream捕获、DP下的padding、
+    #   草稿模型的graph，以及捕获前把KV写入目标指向"哪儿也不写"
     @torch.inference_mode()
     def capture_cudagraph(self):
         # M3 indexer-only CP puts an all-to-all in the captured decode path, and
@@ -5151,12 +5782,17 @@ class ModelRunner:
         # that inside a capture hangs. warmup_model() does not cover it: its
         # dummy batch is prefill-only, and prefill stays on the TP path with no
         # all-to-all. No-op unless the flag is on.
+        # 【译】MiniMax-M3的"只对索引器做CP"会在被捕获的decode路径里放一次all-to-all，而NCCL在一个组的第一次集合通信时才建立
+        #   点对点连接——在捕获里做这件事会卡死。warmup_model()覆盖不到它：warmup的dummy batch只有prefill，而prefill走的是
+        #   没有all-to-all的TP路径。开关没开时什么也不做。
+        # 【分支】MiniMax-M3索引器CP（第8、9批 distributed/indexer_cp.py）
         from atom.distributed.indexer_cp import warmup_exchange
 
         warmup_exchange(self.device)
 
         _piecewise = self._piecewise_cg_active()
         # AF_PIECEWISE: also capture the attn core (ragged combos below)
+        # 【译】AF_PIECEWISE：还要捕获attention核心（下面的ragged组合）
         cudagraph_mode = getattr(self.config.compilation_config, "cudagraph_mode", None)
         attn_ffn_piecewise = (
             cudagraph_mode is not None and cudagraph_mode.is_attn_ffn_piecewise()
@@ -5170,6 +5806,8 @@ class ModelRunner:
         start_time = time.time()
         # Config owns the declared ladder; the runner only narrows it to what
         # this deployment can actually schedule (see the bound below).
+        # 【译】声明的阶梯归Config所有；runner只把它收窄到本部署实际能调度到的范围（见下面的上限）。
+        # 解释：Config.capture_sizes是property，每次返回一份新列表，这里就地排序、过滤不会改到Config
         self.capture_sizes = self.config.capture_sizes
         self.capture_sizes.sort(reverse=True)
 
@@ -5193,6 +5831,18 @@ class ModelRunner:
         #
         # Warn rather than raise so a misconfig (default cuda_graph_sizes=[512]
         # vs e.g. max_num_seqs=16) stays recoverable.
+        # 【译】删掉调度器永远凑不出来的捕获尺寸。schedule_decode从两方面限制一个decode batch：最多max_num_seqs条序列，
+        #   最多max_num_batched_tokens个token，而且不管这一步最终回放的query长度是多少，每条序列都按mtp_k + 1个token计费。
+        #   所以能达到的batch size是两者的较小值，开投机解码时先卡住的是token预算——mtp_k=3会把256条序列变成1024个token。
+        #
+        #   按token预算过滤不只是为了避免录一张永远不会回放的graph。逐token的forward buffer（positions、input_ids、outputs）
+        #   大小是max_num_batched_tokens，所以在超出这个上限的bs上捕获会越界写——以前它表现为capture_cudagraph里冒出一句光秃秃的
+        #   "could not broadcast input array from shape (1024,) into shape (512,)"，读起来像形状bug而不是配置问题。按mtp_k + 1
+        #   计费（而不是更小的q档）也保证了下面循环访问的每个(bs, max_q_len)组合都在上限之内，所以运行时查
+        #   self.graphs[(bs, max_q_len)]不会落空。
+        #
+        #   只警告不报错，这样配置失误（默认cuda_graph_sizes=[512] 对比比如max_num_seqs=16）仍然可以恢复。
+        # 数字例子见本函数上方"录哪些尺寸"
         full_q_len = self.drafter.mtp_k + 1 if hasattr(self, "drafter") else 1
         max_seq_bs = self.config.max_num_seqs
         max_tok_bs = self.config.max_num_batched_tokens // full_q_len
@@ -5228,28 +5878,41 @@ class ModelRunner:
         # num_tokens; a shape NOT in here would force a runtime (uncoordinated)
         # capture that hangs on collectives, so run_model falls back to eager for
         # uncaptured shapes.
+        # 【译】PIECEWISE：已捕获稠密片段的num_tokens形状集合（在这里重置；__init__里初始化为空）。run_model按num_tokens分派；
+        #   不在这个集合里的形状会触发一次运行时的（各rank之间不协调的）捕获，卡死在集合通信上，所以run_model对没捕获的形状退回eager。
+        # 解释：具体判断在ForwardMode._running_tokens（piecewise_captured），run_model据此把cudagraph_runtime_mode设成PIECEWISE或NONE
         self._piecewise_captured_tokens = set()
 
+        # 把kv_indptr（以及稀疏索引的indptr）清0：捕获用的合成batch按它读KV block时，每条序列都是0个block
         if "kv_indptr" in self.forward_vars:
             self.forward_vars["kv_indptr"].gpu.zero_()
         # Present exactly when the model has an indexer -- the builder makes it
         # under the same answer -- so the buffer's own existence is the test.
+        # 【译】当且仅当模型有索引器时它才存在——builder在同样的判断下创建它——所以buffer本身存不存在就是判断条件。
         if "sparse_kv_indptr" in self.forward_vars:
             self.forward_vars["sparse_kv_indptr"].gpu.zero_()
 
+        # graphs：(bs, max_q_len) → 整forward的graph；graph_logits：同key → 录在图里的logits输出buffer（logits_in_graph时）；
+        #   graph_pool：第一张graph建池后保存下来，后面的graph共用
         self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
         self.graph_logits: dict[tuple[int, int], torch.Tensor] = {}
         self.graph_pool = None
         is_tbo = self.config.enable_tbo and isinstance(self.model, UBatchWrapper)
         # TBO graphs don't capture compute_logits, so disable logits_in_graph.
+        # 【译】TBO的graph不捕获compute_logits，所以关掉logits_in_graph。
+        # 解释：据代码只在TP=1（且不开TBO）时把LM head录进图；其余情况回放后在图外调compute_logits
         self.logits_in_graph = self.world_size == 1 and not is_tbo
 
         # start capture profiler
+        # 【译】启动捕获profiler（【分支】只在设了profiler目录且开mark_trace时生效，否则是nullcontext）
         self.start_capture_profiler()
 
         @contextmanager
         def pause_gc():
             # No GC during capture: a finalizer's hipModuleUnload aborts it (HIP 900).
+            # 【译】捕获期间不做GC：某个finalizer里的hipModuleUnload会让捕获中止（HIP错误900）。
+            # 解释：Python的GC可能在任意时刻回收对象、跑它的析构函数；先collect一遍再disable，捕获完再enable并collect
+            #   （分代GC见gc_utils.py文件开头的【科普】）
             gc.collect()
             gc.disable()
             try:
@@ -5258,9 +5921,12 @@ class ModelRunner:
                 gc.enable()
                 gc.collect()
 
+        # 记下捕获前PyTorch分配器的reserved / allocated，捕获后相减就是graph用掉的显存
         _rsv_before_capture = torch.cuda.memory_reserved()
         _alloc_before_capture = torch.cuda.memory_allocated()
 
+        # 固定buffer：就是运行时prepare_*写入、run_model回放时读的那几块（tokenIDProcessor.input_ids、positions、outputs），
+        #   每档只取前缀切片
         input_ids = self.forward_vars["input_ids"].gpu
         positions = self.forward_vars["positions"].gpu
         outputs = self.forward_vars["outputs"]
@@ -5268,6 +5934,8 @@ class ModelRunner:
         # Capture one graph per (bs, query-length bucket). Buckets default to
         # [full_q_len] (single-graph, classic per-bs capture); DSpark confidence
         # scheduling expands to the smaller q-buckets a decode step may replay.
+        # 【译】每个(bs, query长度档)捕获一张graph。档位默认是[full_q_len]（单graph，经典的按bs捕获）；DSpark置信度调度会扩展出
+        #   decode步可能回放的更小q档。
         q_buckets = self._dspark_capture_q_buckets(full_q_len)
         if q_buckets != [full_q_len]:
             logger.info("DSpark CUDA-graph query buckets: %s", q_buckets)
@@ -5277,6 +5945,8 @@ class ModelRunner:
             # every step replays at full length. The step still pays the
             # confidence schedule + ragged rebuild, so say so rather than look
             # like it is shrinking anything.
+            # 【译】resolve_q_buckets总会把full_q并进去，所以只写了full_q（或什么都没写、或没写有效值）的配置会塌缩成[full_q]，
+            #   每一步都按完整长度回放。但这一步仍要付置信度调度 + ragged重建的开销，所以明确警告出来，而不是看起来像在做收缩。
             dspark = self.config.dspark
             spec = dspark.ragged_graph_sizes if dspark.ragged else dspark.q_buckets
             logger.warning(
@@ -5289,15 +5959,20 @@ class ModelRunner:
                 full_q_len,
             )
 
+        # 捕获时模型是真跑的（预热那一遍更是真执行），会通过slot_mapping等往KV cache里写；先把所有KV写入目标填成
+        #   PAD_SLOT_ID（-1，"跳过这一行"），捕获期间哪儿都不写，不会弄脏已分配的KV cache；回放时prepare_*会写入真实槽位
+        #   （backends.py blank_cache_write_targets）。begin / finish：把这次上传纳入H2D发布协议
         self.h2d_owner.begin()
         self.attn_metadata_builder.blank_cache_write_targets()
         self.h2d_owner.finish()
 
         # Whether this backend's capture builder supports a dynamic (per-bucket)
+        # 【译】这个后端的捕获builder是否支持动态的（按档位的）max_q_len（原注释没写完；看签名里有没有max_q_len参数）
         build_capture = self.attn_metadata_builder.build_for_cudagraph_capture
         _build_params = inspect.signature(build_capture).parameters
         supports_dynamic_q_len = "max_q_len" in _build_params
         # Whether it supports a ragged num_tokens_pad (zero-copy-q attn-core graphs).
+        # 【译】是否支持ragged的num_tokens_pad（零拷贝q的attention核心graph）。
         supports_ragged_capture = "num_tokens_pad" in _build_params
 
         raw_build_capture = build_capture
@@ -5307,6 +5982,11 @@ class ModelRunner:
             # Preparation is outside actual graph capture, including calls
             # made by the drafter and ragged bucket builder. Each invocation
             # owns a synthetic transaction; normal forwards never use it.
+            # 【译】准备工作发生在真正的graph捕获之外，包括草稿模型和ragged档位builder发起的调用。每次调用拥有一个合成的
+            #   （H2D发布）事务；正常的forward从不使用它。
+            # 包一层：先写合成的cu_seqlens_q = [0, q, 2q, …, bs·q]（每条序列q行；后端自己管cu_seqlens_q时跳过）和
+            #   positions = arange(bs·q) % q，再调后端的build_for_cudagraph_capture。例：bs=4、q=2 → cu_seqlens_q=[0, 2, 4, 6, 8]、
+            #   positions=[0, 1, 0, 1, 0, 1, 0, 1]
             bs = kwargs.get("bs", args[0] if args else None)
             q_len = kwargs.get("max_q_len", full_q_len)
             self.h2d_owner.begin()
@@ -5328,6 +6008,8 @@ class ModelRunner:
                 self.h2d_owner.fail()
                 raise
 
+        # graph_capture()（aiter.dist）：给出一条专用的捕获stream（capture_ctx.stream），并让custom all-reduce进入捕获模式
+        #   （见下面with结尾处的注释）；外层按q档、内层按bs从大到小
         with pause_gc(), graph_capture() as capture_ctx, self.capture_profiler as prof:
             for max_q_len in q_buckets:
                 capture_range = (
@@ -5346,19 +6028,25 @@ class ModelRunner:
                     # after the skip above so a skipped bs never claims a file;
                     # its handful of Python statements just fold into the next
                     # iteration's window.
+                    # 【译】给本次迭代要导出的捕获trace命名。放在上面的跳过判断之后，这样被跳过的bs不会占用文件；它那几条Python语句只是
+                    #   并入下一次迭代的窗口。
                     self._capture_trace_tag = f"bs_{bs}_q_{max_q_len}"
+                    # 合成的注意力元数据与Context：都指向forward_vars里那些固定buffer的[:bs] / [:num_tokens]切片（例：aiter_attention.py
+                    #   build_for_cudagraph_capture），Context里scheduled_* = running_*（捕获的是满档的合成batch，不补行）
                     if supports_dynamic_q_len:
                         attn_metadata, context = build_capture(
                             bs=bs, max_q_len=max_q_len
                         )
                     else:
                         attn_metadata, context = build_capture(bs=bs)
+                    # 【分支】多模态的3维mRoPE位置（Qwen-VL等）：把1维positions复制成3行
                     if self.use_mrope:
                         mrope_positions = self._mrope_positions_view(num_tokens)
                         mrope_positions.copy_(
                             positions[:num_tokens].unsqueeze(0).expand(3, -1)
                         )
                         context.positions = mrope_positions
+                    # DP>1时这里有一次跨DP的all_reduce（DPMetadata.num_tokens_across_dp）；各rank同时捕获同一档，所以通常num_pad=0
                     num_pad, num_tokens_across_dp = self.get_dp_padding(num_tokens)
                     num_tokens += num_pad
                     # get_dp_padding built num_tokens_across_dp from the PRE-pad
@@ -5366,11 +6054,16 @@ class ModelRunner:
                     # (every DP rank captures the same bs), so the padded count is
                     # uniform across ranks. Rebuild the tensor at the padded size so
                     # DPMetadata.make's `across_dp[rank] == num_tokens` holds.
+                    # 【译】get_dp_padding是按补齐前的数量构造num_tokens_across_dp的，而我们刚把num_tokens补齐了。捕获是对称的（每个DP rank
+                    #   捕获同样的bs），所以补齐后的数量在各rank上一致。按补齐后的大小重建这个张量，让DPMetadata.make里的
+                    #   across_dp[rank] == num_tokens成立。
                     if num_tokens_across_dp is not None:
                         num_tokens_across_dp = torch.full_like(
                             num_tokens_across_dp, num_tokens
                         )
                     # Create ubatch slices for TBO capture (need > 2 requests)
+                    # 【译】为TBO捕获创建微batch切片（需要多于2个请求）
+                    # 【分支】TBO decode（--enable-tbo all，第9批）
                     ubatch_slices = None
                     ub_tokens_across_dp = None
                     if is_tbo and self.config.enable_tbo_decode and bs > 2:
@@ -5384,6 +6077,9 @@ class ModelRunner:
                         # a capture context declares its shape where a real step
                         # reduces one, and no consumer can tell an absent
                         # reduction from a uniform answer.
+                        # 【译】上面重建时用的对称性，再往下一层：每个rank都以同样的方式切分这个档位，所以一个微batch在各rank上的数量就是它
+                        #   自己的数量重复dp次。明确写出来，是因为捕获上下文是"声明"自己的形状，而真实的step是"归约"出形状，下游没法区分
+                        #   "缺了归约"和"归约结果恰好一致"。
                         if ubatch_slices and num_tokens_across_dp is not None:
                             dp = len(num_tokens_across_dp)
                             ub_tokens_across_dp = tuple(
@@ -5391,6 +6087,8 @@ class ModelRunner:
                                 for s in ubatch_slices
                             )
 
+                    # in_hipgraph=True：告诉模型里的组件现在处在捕获循环里（预热那一遍也算），此时才允许分叉到side stream
+                    #   （forward_context.py side_stream）
                     set_forward_context(
                         attn_metadata=attn_metadata,
                         atom_config=self.config,
@@ -5403,6 +6101,8 @@ class ModelRunner:
                     )
 
                     # Warmup
+                    # 【译】预热
+                    # eager真跑一遍（KV写入目标已经是-1），把JIT编译、懒初始化都做掉；结果也写进outputs
                     model_positions = (
                         self._mrope_positions_view(num_tokens)
                         if self.use_mrope
@@ -5416,6 +6116,9 @@ class ModelRunner:
                     if _piecewise:
                         # PIECEWISE: no manual whole-forward graph; the compiled
                         # per-piece wrappers self-capture. Replay once to register.
+                        # 【译】PIECEWISE：没有手动的整forward graph；编译出的每个片段的包装器自己捕获。再"回放"一次以完成登记。
+                        # 解释：这一次调用里，每个CUDAGraphWrapper发现自己还没有这个BatchDescriptor的图，就当场录制
+                        #   （utils/cuda_graph.py CUDAGraphWrapper.__call__）；之后运行时同样的num_tokens就走回放
                         fc = get_forward_context()
                         fc.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
                         fc.batch_descriptor = BatchDescriptor(num_tokens=num_tokens)
@@ -5424,6 +6127,7 @@ class ModelRunner:
                         fc.batch_descriptor = None
                         self._piecewise_captured_tokens.add(num_tokens)
                         # also capture the attn_ffn graphs this bs can replay ragged
+                        # 【译】再捕获这个bs在ragged时可能回放的attn_ffn graph
                         if attn_ffn_piecewise and supports_ragged_capture:
                             self._capture_attn_ffn_graphs(
                                 bs=bs,
@@ -5436,12 +6140,14 @@ class ModelRunner:
                             # Drain before closing the window so this bs's
                             # kernels land in this bs's file. Profiling-only —
                             # the unprofiled PIECEWISE path stays sync-free.
+                            # 【译】关窗口之前先排空，让这个bs的kernel落在这个bs的文件里。只在profiling时这样做——不profiling的PIECEWISE路径保持不同步。
                             torch.cuda.synchronize()
                             prof.step()
                             self._capture_trace_tag = None
                         continue
 
                     # Capture
+                    # 【译】捕获（FULL路径）
                     with (
                         record_function(f"capture_graph_bs_{bs}")
                         if self.mark_trace
@@ -5451,6 +6157,7 @@ class ModelRunner:
                             # TBO capture: threads + multi-stream captured in graph.
                             # Drafter aux (if any) is written inside the graph by
                             # capture_tbo_graph replaying the model's forward hooks.
+                            # 【译】TBO捕获：线程 + 多stream都录进graph。草稿模型的辅助hidden（如果有）由capture_tbo_graph重放模型的forward hook在图内写入。
                             graph, _ = self.model.capture_tbo_graph(
                                 input_ids[:num_tokens],
                                 positions[:num_tokens],
@@ -5463,6 +6170,10 @@ class ModelRunner:
                             # capture hook runs inside the forward and writes its
                             # own buffers (captured in-graph); model_output is a
                             # plain Tensor.
+                            # 【译】标准的单stream捕获。草稿模型的辅助捕获hook在forward里运行，写它自己的buffer（也录进图里）；model_output是一个普通Tensor。
+                            # torch.cuda.graph(graph, pool, stream)：with块里发射的kernel不执行，而是按顺序录进graph（连同读写的地址）；
+                            #   pool为None时新建一个池，否则在已有的池里分配中间激活；stream是graph_capture()给的专用捕获stream。
+                            #   outputs[:num_tokens] = model_output这句拷贝也录了进去：回放时模型输出落进固定的outputs buffer
                             graph = torch.cuda.CUDAGraph()
                             with torch.cuda.graph(
                                 graph, self.graph_pool, stream=capture_ctx.stream
@@ -5475,15 +6186,18 @@ class ModelRunner:
                                     graph_logits = self.model.compute_logits(
                                         outputs[:num_tokens]
                                     )
+                    # 第一张（最大的）graph建池，后面的graph都在这个池里分配
                     if self.graph_pool is None:
                         self.graph_pool = graph.pool()
                     self.graphs[(bs, max_q_len)] = graph
                     if self.logits_in_graph and ubatch_slices is None:
                         self.graph_logits[(bs, max_q_len)] = graph_logits
+                    # 每录完一张就等GPU把预热的kernel跑完，再进入下一档
                     torch.cuda.synchronize()
                     # After the sync: the warmup forward's kernels must have
                     # completed before the window closes, or they spill into the
                     # next bs's file.
+                    # 【译】放在同步之后：预热forward的kernel必须在窗口关闭前执行完，否则会溢到下一个bs的文件里。
                     if prof is not None:
                         prof.step()
                         self._capture_trace_tag = None
@@ -5492,6 +6206,9 @@ class ModelRunner:
             # drafter gets the capture builder already bound to this backend's
             # signature -- which of them takes a `max_q_len` is the runner's to
             # know, and it is the same probe the loop above ran.
+            # 【译】放在with里面：graph_capture()为捕获准备好custom all-reduce，pause_gc()防止垃圾回收中止捕获。传给草稿模型的捕获builder
+            #   已经按这个后端的签名绑定好了——哪个后端接受max_q_len由runner来判断，用的就是上面循环里做过的同一个探测。
+            # 【分支】投机解码：草稿模型在同一批尺寸上预热 / 录图（第7批 drafter.warmup_draft_graphs）
             if hasattr(self, "drafter"):
                 self.drafter.warmup_draft_graphs(
                     (
@@ -5501,11 +6218,14 @@ class ModelRunner:
                     ),
                     capture_ctx.stream,
                 )
+        # 排回升序：ForwardMode.decide在升序数组上用np.searchsorted找"最小的 >= bs"的档；capture_sizes_np整体重新绑定（不原地改）
         self.capture_sizes.sort()
         self.capture_sizes_np = np.asarray(self.capture_sizes, dtype=np.int32)
 
         # PIECEWISE: sorted 1D num_tokens buckets for run_model's round_up_1d(Σ)
         # dispatch (bisect_left over this to pick the tightest captured shape).
+        # 【译】PIECEWISE：排好序的一维num_tokens档位，供run_model按round_up_1d(Σ)分派（在其上bisect_left挑出最紧的已捕获形状）。
+        # 解释：实际在ForwardMode._running_tokens里使用（经prepare_model传入captured_tokens）
         self._piecewise_sorted_tokens = sorted(self._piecewise_captured_tokens)
         if _piecewise and self.rank == 0:
             logger.info(
@@ -5517,10 +6237,14 @@ class ModelRunner:
         # DSpark Phase 2: calibrate the SPS(B) throughput profile from the just-
         # captured target graphs (each is a B = bs*max_q_len token forward, i.e.
         # exactly one verification step at batch B). Cheap, GPU-only, one-shot.
+        # 【译】DSpark第2阶段：用刚捕获的目标模型graph标定SPS(B)吞吐曲线（每张graph是一次B = bs*max_q_len个token的forward，
+        #   也就是batch为B时恰好一次验证步）。开销小、只用GPU、只做一次。
         self._maybe_calibrate_dspark_sps(full_q_len)
 
         # How much GPU memory the CUDA graph capture consumed (pool = reserved
         # delta; the allocated delta is what the graphs pin live).
+        # 【译】CUDA graph捕获消耗了多少显存（池 = reserved的增量；allocated的增量是graph常驻占住的部分）。
+        # 与KV预算的关系：get_num_blocks里先按_estimate_cudagraph_overhead估计并预扣了这部分，这里打出实际值便于对照
         _pool_bytes = max(torch.cuda.memory_reserved() - _rsv_before_capture, 0)
         _alloc_bytes = max(torch.cuda.memory_allocated() - _alloc_before_capture, 0)
         if self.rank == 0:
@@ -5533,6 +6257,8 @@ class ModelRunner:
             )
 
         # Post-init memory validation
+        # 【译】初始化完成后的显存校验
+        # 实际占用超过gpu_memory_utilization 2个百分点以上就警告（说明graph或其他非KV开销被估少了，预算见get_num_blocks）
         free_after, total_after = torch.cuda.mem_get_info()
         actual_usage = total_after - free_after
         target_usage = int(total_after * self.config.gpu_memory_utilization)
@@ -5553,8 +6279,16 @@ class ModelRunner:
                 f"Consider reducing gpu_memory_utilization."
             )
 
+        # 返回给EngineCore打日志：(耗时, 升序的捕获尺寸, 池的字节数)
         return time.time() - start_time, self.capture_sizes, _pool_bytes
 
+    # 【分支】DSpark置信度调度的SPS(B)标定（第7批 spec_decode/dspark_scheduler.py）
+    #   SPS(B)：batch里一共B个验证token时引擎每秒能跑多少步。调度器为每个请求选验证长度ell_r，以最大化吞吐
+    #     Θ = τ × SPS(B)（τ = 期望接受的token数 + bonus），所以需要一张"B → 每秒步数"的表
+    #   做法：每张已录的graph (bs, max_q_len)正好是一次B = bs × max_q_len的验证步——回放21次（1次热身 + 20次计时）取中位数
+    #   例：graphs[(16, 8)]中位数4.0ms → B=128、SPS=250步/秒；各点之间线性插值、范围外取端点值，铺成长度
+    #     max_num_seqs × max_q_len + 1的稠密表（build_sps_table）
+    #   不做的情况：没有DSpark或没开置信度调度、已有离线标定、disable_sps_calib、ragged（回放会写KV，见下面的说明）
     @torch.inference_mode()
     def _maybe_calibrate_dspark_sps(self, max_q_len: int, n_iters: int = 20) -> None:
         """Profile SPS(B) by timing the captured target graphs, then hand a dense
@@ -5566,6 +6300,10 @@ class ModelRunner:
         (B, steps/sec) samples into ``sps_table[B]``. No-op unless a DSpark
         drafter with confidence scheduling enabled is present.
         """
+        # 【译】通过给已捕获的目标模型graph计时来测出SPS(B)，然后把一张稠密的代价表交给DSpark草稿器（论文§3.2.2，调度器的输入）。
+        #
+        #   每张已捕获的graph self.graphs[(bs, max_q_len)]是一次B = bs * max_q_len个token的forward——正好是batch为B时的一次验证步。
+        #   每张回放几次、取中位数步时，再把(B, 每秒步数)的采样点稠密化成sps_table[B]。只有存在开了置信度调度的DSpark草稿器时才做事。
         drafter = getattr(self, "drafter", None)
         if drafter is None or not drafter.is_block_drafter:
             return
@@ -5573,6 +6311,7 @@ class ModelRunner:
         if verify_scheduler is None:
             return
         if verify_scheduler.calibration_profile is not None:
+            # 【译】（行尾注释）显式给出的离线测量不能被覆盖。
             return  # Explicit offline measurements must not be overwritten.
         if not getattr(self, "graphs", None):
             return
@@ -5589,6 +6328,10 @@ class ModelRunner:
         # so use a synthetic table instead (matches the proven DISABLE_SPS_CALIB
         # path). Timed ragged calibration is a follow-up (needs a scratch KV pool
         # + buffer save/restore around the replays).
+        # 【译】DSpark的RAGGED graph：基于回放的SPS标定在这里不安全。每次graph.replay()都会用合成数据跑完整的decode graph（包括
+        #   SWA / KV写入），写在真实的cache槽位[0:bs]上，污染之后真实请求要读的KV cache。调度器只需要一条单调的SPS(B)曲线，
+        #   所以改用合成的表（与已验证过的DISABLE_SPS_CALIB路径一致）。带计时的ragged标定留待后续（需要一块临时KV池，以及在
+        #   回放前后保存 / 恢复buffer）。
         if self.config.dspark.ragged:
             logger.info(
                 "DSpark SPS calibration skipped under RAGGED graph "
@@ -5605,10 +6348,13 @@ class ModelRunner:
             B = bs * max_q_len
             # Every row of the recording is real here: time the whole of it
             # (the DP pad-row mask reads the real token count from here).
+            # 【译】这里录制的每一行都是"真实"的：给整张图计时（DP的补行掩码从这里读真实token数）。
             cu = self.forward_vars["cu_seqlens_q"]
             cu.np[: bs + 1] = np.arange(0, B + 1, max_q_len, dtype=np.int32)
             cu.copy_to_gpu(bs + 1)
             # Warm replay, then timed replays (median for robustness to jitter).
+            # 【译】先热身回放一次，再计时回放（取中位数，抗抖动）。
+            # 用一对CUDA event计时：record(start) → replay → record(end) → 等end完成 → elapsed_time（毫秒）
             graph.replay()
             torch.cuda.synchronize()
             times_ms: list[float] = []
@@ -5625,6 +6371,7 @@ class ModelRunner:
             if median_ms <= 0:
                 continue
             token_points.append(B)
+            # 【译】（行尾注释）每秒步数
             sps_points.append(1000.0 / median_ms)  # steps per second
 
         if not token_points:

@@ -287,7 +287,7 @@ class CheckpointNameRewriter:
         # ② 加载目标模型时丢掉 mtp 权重
         if "mtp" in name and not self.spec_decode:
             return None
-        # ③ KV cache 的量化 scale（ATOM 的 KV scale 自己管理）和 RoPE 频率表（启动时计算）不从 checkpoint 加载
+        # ③ 不加载 checkpoint 里的 KV cache 量化 scale（kv_scale）和 RoPE 频率表（inv_freq，rotary embedding 启动时自己算）
         if name.endswith("kv_scale") or "inv_freq" in name:
             return None
         # Model-declared prefixes to ignore, e.g. the vision encoder of a

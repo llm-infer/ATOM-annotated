@@ -20,8 +20,8 @@
 #       └ reset_forward_context()               ← 本文件：清空，防止下一步误用上一步的元数据
 #
 # 为什么要"全局"上下文
-#   model.forward 的签名固定为 (input_ids, positions)：torch.compile 按这个签名抓图、CUDA Graph 按它录制，
-#   几十个模型文件和 vLLM / SGLang 插件也都遵守它。可注意力层还要 slot_mapping、block_tables、cu_seqlens，
+#   model.forward 的主参数固定为 (input_ids, positions)（PP / 多模态另带少数关键字参数）：torch.compile 按这个签名抓图、
+#   CUDA Graph 按它录制，几十个模型文件和 vLLM / SGLang 插件也都遵守它。可注意力层还要 slot_mapping、block_tables、cu_seqlens，
 #   MoE 要知道 DP 各 rank 的 token 数，LM head 要知道这步是不是 prefill（只取每条序列最后一个 token）……
 #   层层传参的话，每个模型的每层 forward 都得多带一串参数。于是在 forward 之前把它们放进一个模块级全局，用的地方自己取。
 #   代价是隐式依赖：层的行为取决于"此刻全局里放的是什么"。所以只在 prepare_inputs 末尾 set、forward 结束 reset；
@@ -59,7 +59,7 @@
 #   ⑤ ForwardContext → ⑥ get_forward_context / set_forward_context / reset_forward_context 三个函数
 #   【分支】SpecDecodeMetadata（投机解码，第7批）、GDNAttentionMetadata（线性注意力，第8批）、
 #     BoundedReplay*（DeepSeek-V4.1 有界重放，第8批）、DP pad-row mask（MegaMoE，第7批）、
-#     side_stream 与 TBO 的线程局部上下文（第9批）、cudagraph 运行模式（分段图，第5批 cuda_piecewise_backend.py）、
+#     side_stream 与 TBO 的线程局部上下文（第9批）、cudagraph 运行模式（分段图的分派，第5批 utils/cuda_graph.py）、
 #     KV connector（PD 分离 / KV offload，第9批）
 #
 import logging
@@ -1012,7 +1012,7 @@ class Context:
 #   形状记号：B = 逐序列宽度（decode 为 running_bs；prefill 为本步序列数，部分数组再补到 running_bs）
 #             T = 逐 token 行数（decode 为 running_tokens；prefill 为 scheduled_tokens）   M = 每序列最多 block 数
 #
-#   ── nano-vllm 也有的 8 个（含义相同）──
+#   ── nano-vllm 也有的（含义相同；nano-vllm Context 的第 8 个字段 is_prefill 在 ATOM 里放在 Context）──
 #   cu_seqlens_q    int32 [B+1]  各序列 query 行数的前缀和，第 i 条序列的行 = [cu[i], cu[i+1])；补出来的序列长度为 0。
 #                                唯一写入方 backends.py prepare_cu_seqlens_q（在 input ids 之前发布，decode_input_ids 的 kernel 也读）；
 #                                prefill 时 LM head 用 cu_seqlens_q[1:]-1 取每条序列最后一行
@@ -1030,16 +1030,18 @@ class Context:
 #                   int32 [B+1] / [Σ]   aiter 的 paged attention / MLA kernel 要的是压紧的"行指针 + 列表"。
 #                                例：序列 0 占物理块 [7, 2, 9]、序列 1 占 [4] → kv_indptr=[0, 3, 4]、kv_indices=[7, 2, 9, 4]。
 #                                MHA decode：kv_indptr 在 CPU 上累加 cdiv(context_lens, block_size)，kv_indices 由
-#                                kv_indices_generate_triton 在 GPU 上从 block_tables 展开；MLA 按 1 token 一页（见下一项）
+#                                kv_indices_generate_triton 在 GPU 上从 block_tables 展开；MLA 默认 1 token 一页（见下一项）
 #   qo_indptr       int32        q 侧的 CSR（≈ cu_seqlens_q）。基础 MHA 直接把 cu_seqlens_q 当 qo_indptr 传给 kernel；
 #                                这个字段只由 DeepSeek-V4 注意力和插件 bridge 设置
-#   kv_last_page_lens int32 [B]  每条序列最后一页里的有效 token 数；MLA 按 1 token 一页，所以初始化时整块填 1
+#   kv_last_page_lens int32 [B]  每条序列最后一页里的有效 token 数。MLA 默认 1 token 一页（ATOM_MLA_PAGE_SIZE ≤ 1 时），
+#                                此时恒为 1，aiter_mla.py 在初始化时整块填 1；页更大时写真实的末页填充数
 #   cu_seqlen_ks / cu_seqlen_ke  DSA 索引器（prefill）：第 t 个 query token 可以打分的 key 区间 [ks, ke)（因果窗口，key 按序列拼接）。
 #                   int32 [T]    aiter_mla.py 填，deepseek_v2.py 的 Indexer 读（DSA 见 arg_utils.py 的【科普】DSA）
 #   sparse_kv_indptr int32 [T+1] DSA 主注意力：每个 query token 当成一条"序列"，它选中的 top-k 个 KV 位置组成 CSR
 #   sparse_kv_last_page_lens     同上，每个 query token（decode 为每条序列）一个 1；与 kv_last_page_lens 分开，免得互相覆盖
 #   dcp_local_context_lens / index_row_ends / dcp_token_block_tables 这三个：
-#                                DSA + DCP（KV 按 rank 切开）/ FP4 索引器的逐 query token 元数据（第7、9批；DCP 见 arg_utils.py 的【科普】）
+#                                DSA + DCP（KV 按 rank 切开）/ FP4 索引器的逐 query token 元数据（第7、9批；
+#                                DCP 见 arg_utils.py 中 decode_context_parallel_size 上方的【科普】）
 #   work_meta_data / work_indptr / work_info_set / reduce_indptr / reduce_final_map / reduce_partial_map 这六个：
 #                                aiter persistent decode kernel 的调度表。前置（split-KV / flash-decoding）：decode 时每条序列
 #                                只有 1~(1+k) 行 q，若一个 workgroup 负责一条序列（MLA 只有 1 个 KV 头），bs=4 时全卡只有 4 份活，
@@ -1053,7 +1055,7 @@ class Context:
 #   此外 builder 还会动态挂一些后端私有属性（如 aiter_attention 的 flydsl_work_plan、aiter_mla 的 g_kv_indptr、dtype_q）：
 #   类没有 __slots__，可以随意加属性
 # 对比nano-vllm：nano-vllm 只有前 8 个，因为它只用 flash-attention 的 varlen / kvcache 两个接口；ATOM 的 aiter kernel
-#   要 CSR 和预先算好的调度表，又支持 MLA / DSA / 前缀缓存，所以字段多了三倍
+#   要 CSR 和预先算好的调度表，又支持 MLA / DSA / 前缀缓存，所以多出近 30 个字段
 @dataclass
 class AttentionMetaData:
     """Attention metadata for prefill and decode batched together."""
@@ -1513,12 +1515,12 @@ class ForwardContext:
     #   由本步的 DP sync 构建。没带这些表的步上都是 None。
     dp_stages: BoundedReplayDPStages | None = None
 
+    # __post_init__：容错——即使有人显式传了 None，也换成空容器
     def __post_init__(self):
         if not hasattr(self, "no_compile_layers") or self.no_compile_layers is None:
             self.no_compile_layers = {}
         if self.attn_metadata is None:
             self.attn_metadata = {}
-            # 上面：容错——即使有人显式传了 None，也换成空容器
 
     @contextmanager
     def use_dp_stage(self, name: str | None):
@@ -1831,6 +1833,7 @@ def set_forward_context(
     ub_tokens_across_dp: tuple | None = None,
 ) -> None:
     global _forward_context
+    # 上一行 global：函数里要给模块级变量重新赋值，必须先声明 global，否则赋值只会创建一个同名局部变量
     # DP>1 才建 DPMetadata。主路径递进了 decide 得到的表 → make 不再通信（见 DPMetadata 上方【科普】）
     dp_metadata: DPMetadata | None = None
     if atom_config.parallel_config.data_parallel_size > 1 and num_tokens is not None:
@@ -1853,7 +1856,8 @@ def set_forward_context(
         None if num_tokens_across_dp is None else tuple(num_tokens_across_dp.tolist())
     )
 
-    # 新建而不是原地修改：上一步若有人还持有旧对象的引用（如 TBO 线程），不会被悄悄改掉
+    # 每步新建一个对象，而不是在旧对象上改字段：pad_rows_done（空集合）、cudagraph_runtime_mode / batch_descriptor（None）
+    #   这些"每次 forward 从零开始"的字段因此每步都是干净的
     #   kv_cache_data 从 _forward_kv_cache_context 复制引用；main_stream 取调用时的当前 stream（录图循环里就是录制用的 stream）；
     #   dp_stages 只有 V4.1 有界重放、且 sync 带了阶段表时才非 None
     _forward_context = ForwardContext(

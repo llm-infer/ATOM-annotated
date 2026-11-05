@@ -530,6 +530,8 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
         with self.fake_mode, enable_python_dispatcher():
             return super().run(*fake_args)
 
+    # Interpreter 每执行到 split_gm 里的一个子模块调用（call_module 节点）就进这里；target 是子模块名，如 "submod_2"
+    # 先照常（用 fake 张量）执行它得到 output 供下游使用，再对稠密子图做编译 + 替换；返回 output
     def call_module(
         self,
         target: torch.fx.node.Target,
