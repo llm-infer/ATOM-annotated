@@ -2621,6 +2621,49 @@ class BlockManager:
             start = (start - short) // hbs * hbs
         return max(0, start)
 
+    # ================ 【分支】每请求状态槽位与CPU状态层（B级；LMCache / offload部分见第9批） ================
+    # 前置：每请求状态是什么、为什么要checkpoint，见上面 can_allocate 里的【前置：每请求状态与状态checkpoint】
+    # 本组函数：_state_leg_secured、_attach_state_slots（allocate 调用，给槽位、从checkpoint恢复）；
+    #   _tier_can_serve、_request_state_load、cancel_state_load、abandon_state_load、_release_oldest_orphan_slot、
+    #   settle_state_load、take_state_loads（CPU层加载）；take_state_stores、settle_state_store、release_state_store_source、
+    #   has_pending_state_store_pins、reclaim_stale_state_store_pins（CPU层存储）；reconcile_orphan_load_slots（孤儿槽位回收）
+    #
+    # 什么是"槽位"（slot）：ModelRunner启动时按 pool_entries["state"] 预先分配一个状态张量，槽位号就是它的下标；
+    #   一个槽位 = 一条请求在所有状态层的一份完整状态（例：Qwen3-Next每个GDN层一个约52万个数的矩阵，外加conv状态）。
+    #   一条请求拿 state_slots_per_req = 1 + 投机token数 个槽位：state_slots[0] 是已提交状态（每步读写它），
+    #   [1:] 是投机解码的回滚槽位（MTP k=3 → [s0, r1, r2, r3]，见sequence.py has_per_req_cache处的科普），彼此不必相邻。
+    #   空闲表（state_pool.py StateSlotPool）也是"先给空槽位（号小的先）、再按LRU花掉存着checkpoint的槽位"，
+    #   和KV的BlockPool是同一套惰性淘汰
+    #
+    # checkpoint放在哪里——三种后端，由注意力后端的 state_transfer() 决定（state_runtime.py StateTransfer）：
+    #   PAGE（copy）：checkpoint的状态镜像切成若干"PAGE单元"存进KV池（和KV block是同一个BlockPool，
+    #     PagedStateCheckpointCoordinator 管理）；恢复 = 下一个batch之前把镜像从这些单元gather到请求自己的新槽位（begin_restore 排队）。
+    #     用于Qwen3-Next / Qwen3.5的GDN、Kimi-K3的KDA（这两类在PP或RapidServe下改用fork）、DeepSeek-V4
+    #   fork：checkpoint就是一个"内容仍有效的空闲槽位"（StateSlotPool.hash_to_slot）；恢复 = 下一次forward从源槽位
+    #     （seq.state_fork_src）读初始状态、写进请求自己的槽位，源槽位被pin住直到那次forward发出。用于上述模型在PP / RapidServe下、
+    #     以及不在PAGE名单里的GDN模型（gdn_attn.py GDN_PAGE_CHECKPOINT_MODEL_TYPES 之外，如Qwen4Exp）
+    #   replay：不存checkpoint，命中时重算一小段来重建（DeepSeek-V4.1默认，见 replay_start）
+    #
+    # CPU状态层（self.state_offload，只有配了能承载状态的KV connector——如LMCache——时才存在；第9批）：
+    #   HBM里的checkpoint被淘汰后，它的镜像可能还在CPU / LMCache里。准入时门控也会为这些hash"投票"
+    #   （PagedStateCheckpointCoordinator._reachable），allocate 在HBM里找不到时就请求加载（_request_state_load）
+    #
+    # 为什么加载 / 存储是异步的：一份镜像是几十MiB量级（例：DSpark3一份镜像29.51 MiB，见 __init__ 里 max_cpu_entries 处的英文），
+    #   要经KV connector在worker进程里做H2D / D2H拷贝和LMCache读写，调度器不能为此停下一整步。所以：
+    #   加载 = 准入时登记（_state_loads、seq.offload_joint.load_hash）→ 本轮 take_state_loads 交给connector → 请求挂起等待
+    #     （WAITING_FOR_REMOTE_KVS）→ 若干步后worker报告 finished / failed_loading → settle_state_load
+    #   存储 = take_state_stores 交出READY的checkpoint并pin住它的单元 → GPU读完（D2H排空）→ release_state_store_source 还单元
+    #     → CPU侧put有了结果 → settle_state_store，成功才登记hash（两阶段，见各函数）
+    #
+    # "孤儿槽位"（orphan load slot）：请求在状态加载还在途时就被 deallocate（客户端断开 / 被抢占），它的已提交槽位正被worker写入，
+    #   不能还回空闲表（否则下一条请求会拿到一个别人正在写的槽位）。deallocate 把它停放到 _orphan_load_slots[req_id]
+    #   （带时间戳，同一请求可能停放多次，按准入顺序排队），由 settle_state_load / abandon_state_load 按FIFO还回；
+    #   报告永远不来时（worker崩溃、完成信号丢失），reconcile_orphan_load_slots 在超时后回收
+    #   （超时 = Scheduler._save_abandon_timeout_s，LMCache下为 LMCACHE_EC_PIN_TIMEOUT_SEC + 30秒）。
+    #   注意与 StateSlotPool.checkpoints_orphaned 区分：那是"checkpoint所在前缀的KV已被淘汰、再也无法命中"的计数
+    #
+    # 对比nano-vllm：这一整组都没有（nano-vllm只支持逐token存KV的标准注意力，前缀命中即可直接接上）
+    # =====================================================================================================
     def _state_leg_secured(self, seq: Sequence) -> bool:
         """Whether something will really put state behind this seq's boundary.
 
@@ -2631,10 +2674,18 @@ class BlockManager:
         returns True as well, which is correct with no boundary and wrong with
         one.
         """
+        # 【译】是否真的有东西会把状态放到这条seq的边界后面。
+        #
+        #   恰好有三种方式能让它成立，正是 _attach_state_slots 在认领了边界的情况下返回True的三个出口：排了一次PAGE恢复、
+        #   采用或读取了一个fork源、或者请求了一次CPU加载。冷启动不在其中——它同样返回True，这在没有边界时正确，有边界时就错了。
+        # 调用方：allocate 末尾的兜底检查（联合边界背后必须有状态那条腿）
+        # 【译】（行尾注释）有一次CPU加载正为它在途
         if seq.offload_joint.load_hash != -1:
             return True  # a CPU load is in flight for it
+        # 【译】（行尾注释）有一个fork checkpoint作为它的源
         if getattr(seq, "state_fork_src", -1) != -1:
             return True  # a fork checkpoint is its source
+        # PAGE：下一个batch是否排了一次gather恢复，目标正是这条seq的已提交槽位
         if self.paged_state_checkpoints is None:
             return False
         return self.paged_state_checkpoints.restore_queued_for(seq.state_slot)
@@ -2679,16 +2730,43 @@ class BlockManager:
         adopted: the bytes live in the KV pool, not in a state slot, so there is
         nothing here to hand over. Only fork checkpoints can be adopted.
         """
+        # 【译】给seq分配它的状态槽位；有checkpoint时从checkpoint恢复。
+        #
+        #   返回 hit_hash 对应的状态是否真的就是seq现在持有的状态。False表示调用方必须丢掉这个边界；见 allocate。hit_hash 是
+        #   最后一个被复用block的内容hash（冷启动为-1）。can_allocate 已经把命中缩到了 _resumable_from 接受的边界，而这和
+        #   "在HBM中"不是一回事：存储层也会投票。所以一个槽位已转去LMCache的hash，到这里表现为未命中并变成一次加载
+        #   （_request_state_load）；一个字节已被LMCache自己的LRU丢掉的hash也一样——存储层要等取数据落空才知道。二者靠
+        #   "存储层是否仍持有这个hash"来区分，因为只有其中一种可以保留边界。
+        #
+        #   无论怎样开始，一条seq都占 state_slots_per_req 个槽位——一个已提交状态，外加每个投机token一个回滚槽位。它恢复所用的
+        #   checkpoint只有一个槽位宽，因为投机用的草稿空间不是谁会恢复进去的状态，所以一次恢复花掉的槽位与冷启动完全相同。
+        #
+        #   恢复是共享的：checkpoint仍留在索引里，请求拿到自己的槽位，于是第二个命中同一前缀的请求仍能找到它。状态如何到达
+        #   已提交槽位，由后端的 StateTransfer 决定——fork在一次forward里读取checkpoint，copy则是把字节交过去——两者在这里只差
+        #   一行。当池子给不出完整的一组槽位时，请求改为把checkpoint采用为自己的已提交槽位：仍然正确，状态正是它想要的那份，
+        #   只是花掉了checkpoint而不是共享它。
+        #
+        #   checkpoint是只读的，所以同一步里可以有多个请求从同一个checkpoint恢复。第一个把它从空闲表取走，pin覆盖所有读者直到
+        #   release_state_pins；同一步里后来的请求发现它已被pin住，只需要可写入的槽位。这时就不能再采用它了——pin意味着别人的
+        #   forward还要读它，或从它拷出数据。
+        #
+        #   PAGE checkpoint是gather到一个新的已提交槽位，而不是被采用：字节住在KV池里，不在某个状态槽位里，所以这里没有可以
+        #   交出去的东西。只有fork checkpoint可以被采用。
+        # 观察：docstring里的 _resumable_from 和 release_state_pins 在代码里都已不存在，对应的分别是各状态类的 resumable_hit
+        #   （经 _gated_hit 调用）和 StateSlotPool.release_pins（经 complete_previous_state_batch 调用）
+        # ---- PAGE后端：checkpoint镜像在KV池里。总是先拿一组新槽位，再把镜像gather进已提交槽位 ----
         width = self.state_slots_per_req
         if self.paged_state_checkpoints is not None:
             seq.state_slots = self.state.pop_many(width)
             seq.state_fork_src = -1
+            # 【译】（行尾注释）冷启动：什么都没认领，也没有要恢复的
             if hit_hash == -1:
                 return True  # cold start: nothing claimed, nothing to restore
             if self.paged_state_checkpoints.begin_restore(hit_hash, seq.state_slot):
                 # Queued for the next batch, which gathers the image out of its
                 # PAGE units into the committed slot. What the caller holds is
                 # what it asked for.
+                # 【译】排进下一个batch：那个batch会把镜像从它的PAGE单元gather到已提交槽位。调用方持有的正是它要的东西。
                 return True
             # HBM does not have it. That used to be an invariant violation and
             # this used to raise -- `can_allocate` had shrunk the hit to a
@@ -2699,6 +2777,12 @@ class BlockManager:
             # CPU tier too, so a hash it accepted may live only there. Leaving
             # the raise in would take the engine down on the first request that
             # actually used the tier.
+            # 【译】HBM里没有它。这曾经算违反不变量，这里曾经直接raise——can_allocate 已经把命中缩到HBM索引里有的边界，所以这里
+            #   未命中就意味着门控和存储意见不一。
+            #
+            #   现在这是正常路径，而且必须是：门控也会咨询CPU层，所以它接受的hash可能只存在于那里。留着raise的话，第一个真正用到
+            #   存储层的请求就会让引擎崩溃。
+            # 【分支】CPU状态层（第9批）：请求把镜像从LMCache加载进已提交槽位
             if self._request_state_load(seq, hit_hash):
                 return True
             # Neither tier can produce it. Reachable rather than defensive:
@@ -2706,13 +2790,19 @@ class BlockManager:
             # and an HBM checkpoint can be unindexed between `can_allocate` and
             # here by another seq's `_fresh_block` in the same pass. Disown the
             # boundary -- blocks stay claimed and the forward recomputes.
+            # 【译】两层都给不出它。这是可达的而不是防御性代码：存储层的索引是乐观的（hashes 的意思是"曾经存过一次"），而且HBM里的
+            #   checkpoint可能在 can_allocate 与这里之间，被同一轮里另一条seq的 _fresh_block 取消登记。放弃这个边界——block仍然
+            #   认领着，forward重新计算。
             self.state_gate_lost_boundary += 1
             return False
 
+        # ---- fork后端（以及replay）：checkpoint就是状态池里的一个空闲槽位 ----
         if self.state.transfer.replays:
             # Nothing to resume or load: a fresh slot, as for a cold start; the
             # forward rebuilds the state (`replay_start`).
+            # 【译】没有可恢复或加载的：像冷启动一样给新槽位；forward会重建状态（replay_start）。
             hit_hash = -1
+        # 找存着这个hash时刻状态的空闲槽位（StateSlotPool.hash_to_slot）；找不到时先看CPU层能否给，然后拿一组新槽位
         src = self.state.lookup(hit_hash) if hit_hash != -1 else -1
         if src < 0:
             wants_load = self._tier_can_serve(hit_hash)
@@ -2723,19 +2813,29 @@ class BlockManager:
             # A fresh slot holds the previous occupant's bytes. That is fine
             # for a cold start (nothing claims otherwise) and wrong for a hit,
             # so the hit only survives if there was none to begin with.
+            # 【译】新槽位里装的是上一个占用者的字节。这对冷启动没问题（没有谁声称别的），对命中就是错的，所以只有本来就没有命中时，
+            #   这个"命中"才算保得住。即：冷启动返回True；有命中却找不到checkpoint → False，allocate 放弃边界、从0重算
             return hit_hash == -1
         # Being resumed from is the evidence a guessed position was right, so a
         # checkpoint that pays off stops being spent first — see
         # `StateSlotPool.mark_speculative`. Here rather than in `claim`, which
         # `_set_hash` also calls to re-file a slot that nobody read.
+        # 【译】被恢复使用，就证明当初猜的位置是对的，所以一个有回报的checkpoint不再优先被花掉——见 StateSlotPool.mark_speculative。
+        #   放在这里而不是 claim 里，是因为 _set_hash 也会调用 claim，去重新归档一个没人读过的槽位。
         self.state.promote(src)
+        # 同一步里已有别的请求从它恢复（已被pin住）→ 它已不在空闲表上，不必再取；否则用 claim 把这个指定槽位从空闲表取下
+        #   （内容和hash保留：它仍是可被命中的checkpoint）
         shared = self.state.is_pinned(src)
         if not shared:
             self.state.claim(src)
+        # 还拿得出一整组新槽位 → 共享式恢复：自己的槽位 + 下一次forward从src读初始状态
         if self.state.has_free(width):
             seq.state_slots = self.state.pop_many(width)
             seq.state_fork_src = src
             # Held off the free list until the forward that reads it is issued.
+            # 【译】在读它的那次forward发出之前，一直不放回空闲表。
+            # 例：width=1、空闲槽位{3, 5}，checkpoint在槽位5：claim(5) → 空闲{3} → 本请求拿3、fork源=5；5被pin住，
+            #   那次forward发出后由 release_pins 放回空闲表（仍带着hash，下一个同前缀请求还能命中）
             self.state.pin(src)
             return True
         # `can_allocate` admitted this seq against a free list holding at least
@@ -2743,6 +2843,11 @@ class BlockManager:
         # here if this seq's own `claim` above took the slot that made up the
         # count — which is `src`, unshared. Adopting it hands that slot straight
         # back to this seq, so the width is met.
+        # 【译】can_allocate 是在空闲表至少有 width 个槽位时准入这条seq的，之后没有别的东西运行过，所以这里空闲表不够，只可能是
+        #   这条seq自己上面的 claim 拿走了凑数的那个槽位——也就是 src，且没有被共享。采用它就把那个槽位直接交还给这条seq，
+        #   宽度就够了。
+        # 采用：把checkpoint槽位直接当成自己的已提交槽位（invalidate 去掉它的hash：内容马上会被改写，不能再被别人命中）。
+        #   例：width=1、空闲表只剩槽位5（存着checkpoint）：claim(5) 后空闲表为空 → 采用5，state_slots=[5]
         assert not shared, "no slot to resume into and the source is being read"
         self.state.invalidate(src)
         seq.state_slots = [src] + self.state.pop_many(width - 1)
@@ -2761,6 +2866,12 @@ class BlockManager:
         the resumable scan stopped at the tier rung and skipped a still-resident
         HBM rung, and the boundary was disowned into a full recompute.
         """
+        # 【译】存储层能否真的为 hit_hash 提供一次加载。
+        #
+        #   每次准入问两次——一次是 _attach_state_slots 决定要不要尝试加载，一次在 _request_state_load 里面。这两处以及
+        #   request_load 本身都走 StateOffloadIndex.could_serve，所以三者检验的是同一个"能力 + 成员"谓词，不会各说各话。
+        #   这里若只写 `hit_hash in hashes`，就丢掉了 can_load 那一半：一个只存不取的角色（kv_producer）会为一个它随后又拒绝的
+        #   命中投票，可恢复扫描停在存储层那一级、跳过了一个仍驻留在HBM里的级，边界随后被放弃，变成整段重算。
         return (
             hit_hash != -1
             and self.state_offload is not None
@@ -2783,10 +2894,19 @@ class BlockManager:
         bytes no `get` can produce would park the request forever. The caller
         then disowns the boundary -- the pre-tier answer.
         """
+        # 【译】请存储层把 hit_hash 取回到seq刚拿到的槽位里。
+        #
+        #   只有HBM索引未命中时才会走到这里——这正是存储层存在的意义。字节落在已提交槽位里，恢复的forward从那里读。
+        #
+        #   state_fork_src 保持-1。被加载的槽位本身就是输入状态，指定一个源会让forward去读另一个槽位，而不是正在被填充的那个。
+        #
+        #   False表示存储层给不了。request_load 会拒绝未知的hash，因为一次加载只能由一份报告来了结，为没有任何 get 能产出的
+        #   字节发起加载，会让请求永远挂起。调用方随后放弃边界——也就是有存储层之前的做法。
         if not self._tier_can_serve(hit_hash):
             return False
         if not self.state_offload.request_load(seq.id, hit_hash):
             return False
+        # 登记：load_hash 让调度器把这条seq挂起等加载（WAITING_FOR_REMOTE_KVS）；(req_id, hash, 目标槽位) 本轮由 take_state_loads 交给connector
         seq.offload_joint.load_hash = hit_hash
         self._state_loads.append((seq.id, hit_hash, seq.state_slot))
         return True
@@ -2803,6 +2923,13 @@ class BlockManager:
         caller must abandon this admission rather than resume over the shared
         prefix. ``True`` when there was nothing to cancel or the disown held.
         """
+        # 【译】撤回本轮请求的一次加载，此时还什么都没发出。只能在 take_state_loads 把它交出去之前这样做；交出之后字节已在路上，
+        #   槽位必须一直留着。边界的放弃方式与 allocate 完全一样——包括把认领的前缀私有化（finding #2），这样重算就不会撕坏
+        #   一个共享它的decode。
+        #
+        #   池子给不出私有副本时返回 False；调用方必须放弃这次准入，而不是在共享前缀上恢复。没有要取消的、或放弃成功时返回 True。
+        # 调用方：scheduler.py 准入循环里 allocate 之后、同一轮 _publish_state_loads 之前（KV那条腿和状态加载对不上、
+        #   或联合边界的KV腿被拒时）
         if seq.offload_joint.load_hash == -1:
             return True
         self._state_loads = [e for e in self._state_loads if e[0] != seq.id]
@@ -2819,6 +2946,10 @@ class BlockManager:
         `forget` the hash on a miss that never happened, erasing the index one
         request at a time and inflating its false-positive counter.
         """
+        # 【译】放弃一次加载，但不把责任归到那些字节上。用于没有任何东西能承载的加载。settle_state_load(ok=False) 会因为一次
+        #   从未发生过的未命中而 forget 这个hash，一个请求一个请求地把索引抹掉，还会抬高它的误报计数。
+        # 调用方：scheduler.py _publish_state_loads（connector不接这批加载时）、_abandon_state_load（KV腿失败但状态那一路完好时）。
+        #   顺带按FIFO还回一个孤儿槽位（如果有）
         if self.state_offload is None:
             return
         self.state_offload.abandon_load(req_id)
@@ -2832,6 +2963,12 @@ class BlockManager:
         the one this report settles. Releasing newest-first would free a slot a
         later load is still writing.
         """
+        # 【译】如果 req_id 有被停放的孤儿槽位，交还最早停放的那个。
+        #
+        #   FIFO：一次抢占 / 重新准入可能让同一请求的槽位被停放不止一次，而worker按准入顺序报告加载，所以这份报告结清的是
+        #   最早的那次停放。若先释放最新的，就会放掉一个后来的加载还在写的槽位。
+        # 例：请求7第一次准入时向槽位12加载、加载未完就被抢占（12停放）；重新准入后向槽位20加载、又被abort（20停放）
+        #   → _orphan_load_slots[7] = [(12, t1), (20, t2)]；第一份报告还12，第二份还20
         parked = self._orphan_load_slots.get(req_id)
         if not parked:
             return
@@ -2849,8 +2986,15 @@ class BlockManager:
         abandoned load is already out of the index, but its slot is still being
         written and comes back here, and only here.
         """
+        # 【译】应用worker的一份加载报告。和KV加载一样按请求为键。
+        #
+        #   每个 finished_loading / failed_loading 的id都会调用它，其中很多只是普通的KV加载——对它们这是空操作，这样调度器
+        #   就不必知道一份报告属于哪条腿。一次被放弃的加载已经不在索引里了，但它的槽位仍在被写入，会在这里、也只在这里还回来。
+        # 调用方：scheduler.py _settle_state_load（_update_from_kv_xfer_finished 处理 finished_loading / failed_loading 时）。
+        #   请求还活着时，加载好的槽位就是它的已提交槽位，这里不释放（没有孤儿项）；只有已被 deallocate 的请求才在这里还槽位
         if self.state_offload is None:
             return
+        # 成功：complete_load；失败：fail_load（乐观索引的误报在这里自我纠正：忘掉这个hash，见 PagedStateCheckpointCoordinator._reachable）
         if ok:
             self.state_offload.complete_load(req_id)
         else:
@@ -2866,11 +3010,18 @@ class BlockManager:
         into the KV pool where a set of units can be read without being
         rescued first.
         """
+        # 【译】要交给CPU层的checkpoint，形如 (operation, unit_ids)。
+        #
+        #   每交出一个就pin住它；settle_state_store 负责释放。没有coordinator（fork后端）时为空，这是正确的而不是缺口：fork
+        #   checkpoint是一个状态槽位，而 #2045 正是把K3的checkpoint搬进KV池的那次改动，在KV池里一组单元可以直接被读取，
+        #   不必先抢救出来。
+        # 调用方：scheduler.py _publish_state_stores（每轮一次，和 _publish_state_loads 一起；max_inflight 限制同时在途的存储数）
         if self.paged_state_checkpoints is None or self.state_offload is None:
             return []
         if not self.state_offload.can_store:
             # A load-only role. Handing over a store pins units against a
             # report the worker's save half will never produce.
+            # 【译】只加载的角色。交出一次存储，会为一份worker的保存那一半永远不会产出的报告钉住单元。
             return []
         out = self.paged_state_checkpoints.take_offload_stores(max_inflight)
         self.state_offload.stores_attempted += len(out)
@@ -2897,12 +3048,26 @@ class BlockManager:
         The index is keyed by hash, because what a resume asks is whether the
         prefix is in LMCache -- not which attempt put it there.
         """
+        # 【译】一次存储报告回来了。释放单元；如果字节确实落地了，就登记这个hash。
+        #
+        #   成功和失败释放pin的方式完全相同——pin的作用是在拷贝期间让字节保持不动，而无论哪种结果，拷贝都已经结束了。
+        #   只有登记不同，因为只有字节真的在那里的hash才能被投票选中。
+        #
+        #   对于connector拒绝承载的存储，attempted 为 False：pin仍然要在这里释放，但拷贝从未到达worker，所以它不算
+        #   stores_failed——调用方把这次拒绝记一次 stores_refused，再加 stores_failed 就会用两个名字重复计数同一件事。出于同样
+        #   的原因，它要把 take_state_stores 交出时乐观地加上的 stores_attempted 减回去，免得一次拒绝一直留在
+        #   attempted − completed − failed 里。
+        #
+        #   op 是一个 StateStoreOperationId：pin按这个确切的代次释放，所以一份来自已被取代的尝试的迟到报告什么也不结清。
+        #   索引按hash为键，因为恢复时问的是"这个前缀在不在LMCache里"——而不是哪次尝试把它放进去的。
+        # 调用方：scheduler.py 处理connector的存储报告（成功 / 失败），以及 _publish_state_stores 里connector拒收时（attempted=False）
         reclaimed = False
         if self.paged_state_checkpoints is not None:
             reclaimed = self.paged_state_checkpoints.was_reclaimed(op)
             # Idempotent: normally the source release already returned these
             # units, and this is the backstop for a store that failed before
             # it ever read them.
+            # 【译】幂等：通常源释放（release_state_store_source）已经把这些单元还回去了，这里是给"还没读到它们就失败了"的存储兜底。
             self.paged_state_checkpoints.settle_offload_store(op)
         if self.state_offload is None:
             return
@@ -2914,6 +3079,9 @@ class BlockManager:
             # image a mix of two prefixes filed under the first one's hash --
             # and a resume onto that is silent wrong output. The bytes may well
             # be fine; there is no way to know, so they are forfeited.
+            # 【译】过期回收器在这次存储报告之前就把它的单元收回了，没有任何办法知道worker当时是否已停止读取它们。如果还没停，
+            #   池子可能已把这些单元交给另一个请求，而gather读到了那个请求的写入，使CPU里的镜像成了两个前缀的混合、却登记在
+            #   第一个前缀的hash下——从它恢复就是静默的错误输出。字节很可能没问题；但无从得知，所以放弃它们。
             self.state_offload.stores_untrusted += 1
             logger.warning(
                 "state offload: %s reported stored, but its units were "
@@ -2932,6 +3100,8 @@ class BlockManager:
             # out: the event is counted once as `stores_refused`, and leaving it
             # in `stores_attempted` would read as permanently in-flight in the
             # `attempted - completed - failed` funnel.
+            # 【译】一次拒绝。take_state_stores 交出这个op时把 stores_attempted 加了1，但它从未到达worker，所以减回去：这件事只记一次
+            #   stores_refused，若留在 stores_attempted 里，在 attempted − completed − failed 这个漏斗里就会显示为永远在途。
             self.state_offload.stores_attempted -= 1
 
     def release_state_store_source(self, op) -> None:
@@ -2951,6 +3121,14 @@ class BlockManager:
         undrained in the worker, so `note_stored` never ran and the checkpoint
         was never votable.
         """
+        # 【译】GPU已读完这次存储的PAGE单元；把它们还回去。
+        #
+        #   与 settle_state_store 分开，是因为两者回答的是不同问题：单元属于KV池，D2H一排空就空出来了；而CPU侧的put是否成功
+        #   是之后才决定的，与它们无关。在那期间把一整份镜像扣在池子外，只会白白损失复用。
+        #
+        #   两阶段pin的第一阶段：它释放单元，但让这次操作保持"已派发、未报告"的pin，于是 has_offload_pins（以及把它或进来的
+        #   存活判断）会让引擎一直轮询，直到登记报告真正到达。像以前那样在这里就撤掉pin，会让存活判断在存储报告还没从worker
+        #   取出时读成空闲，于是 note_stored 永远不会执行，这个checkpoint也永远不能被投票选中。
         if self.paged_state_checkpoints is not None:
             self.paged_state_checkpoints.release_offload_store_source(op)
 
@@ -2967,12 +3145,20 @@ class BlockManager:
         unit-store twin of the `deferred_free_blocks` condition the gate already
         checks for the KV save leg.
         """
+        # 【译】是否有一次已派发的状态存储还在等它的报告。
+        #
+        #   引擎的存活判断（EngineCore.has_pending_kv_work）把它或进去，这样当一步唯一剩下的工作是一次已交给worker的状态存储时，
+        #   不会被读成空闲。没有它的话，这次存储的PAGE单元会一直被pin在KV池之外直到超时，因为能释放它们的报告——以及作为报告
+        #   唯一兜底的回收——都由 _poll_kv_transfer_progress 取出，而存活判断一变成False，空闲循环就不再调用它。这是存活判断
+        #   已经为KV保存那条腿检查的 deferred_free_blocks 条件在"单元存储"上的孪生。
         if self.paged_state_checkpoints is None:
             return False
         return self.paged_state_checkpoints.has_offload_pins()
 
     def reclaim_stale_state_store_pins(self, timeout_s: float) -> int:
         """Release store pins whose report never came. See the store."""
+        # 【译】释放那些报告一直没来的存储pin。详见store（PageUnitCheckpointStore.reclaim_stale_offload_pins）。
+        # 调用方：scheduler.py 处理完存储报告之后，超时用 _save_abandon_timeout_s()（与KV保存的回收同一个窗口）
         if self.paged_state_checkpoints is None:
             return 0
         return self.paged_state_checkpoints.reclaim_stale_offload_pins(timeout_s)
@@ -2998,15 +3184,33 @@ class BlockManager:
         index leg was abandoned back in `deallocate`, so nothing here touches
         it; a late report finds the slot already popped and releases nothing.
         """
+        # 【译】在 timeout_s 之后，释放那些 settle_state_load 一直没来的加载槽位。
+        #
+        #   reclaim_stale_state_store_pins 在加载一侧的孪生。deallocate 拆掉一个状态加载仍在途的请求时，会把槽位停放到
+        #   _orphan_load_slots，指望worker报告每一次加载、settle_state_load 会把它交还。worker崩溃或完成信号丢失会打破这个承诺，
+        #   槽位就永远不在空闲表上——一旦搁浅的槽位够多，can_allocate 的状态闸门就会拒绝新的每请求工作，把池子卡死，而且找不到
+        #   任何故障可以指认。
+        #
+        #   **这是最后手段，分不清"报告丢了"和"worker还在慢慢写这个槽位"**——和存储pin那个孪生记录的局限一样。在一次仍在进行的
+        #   H2D之下回收，会把一块别人正在填充的缓冲区交给下一个请求，而它上面的 has_initial_state 已经为真。所以窗口必须是放弃
+        #   超时，而不是一个很紧的值：要长到任何仍在途的报告都已经到达。索引那条腿早在 deallocate 里就放弃了，所以这里不碰它；
+        #   迟到的报告会发现槽位已被取走，什么也不释放。
+        # 观察：docstring最后一句说迟到报告"什么也不释放"，但下面循环里的英文说它"会释放下一个停放的槽位"。按
+        #   _release_oldest_orphan_slot 的实现（弹出最早的一项），同一req_id还有更新的停放时，过期项被回收后迟到的报告会把那个
+        #   更新的槽位提前还回空闲表——而它可能还在被后一次加载写入。只有同一请求被停放过不止一次时才会出现
+        # 调用方：scheduler.py 处理KV传输进度时，与 reclaim_stale_state_store_pins 同窗口（_save_abandon_timeout_s；0 = 关闭）
         if timeout_s <= 0 or not self._orphan_load_slots:
             return 0
+        # monotonic()：单调时钟秒数（不受系统时间调整影响），停放时记的也是它
         cutoff = monotonic() - timeout_s
         reclaimed = 0
+        # list(...) 先拷一份键：循环里会删条目
         for req_id in list(self._orphan_load_slots):
             parked = self._orphan_load_slots[req_id]
             # Each admission is stamped and expires on its own age -- a stale
             # park is dropped even when a newer one for the same id is still
             # inside the window (kept in place).
+            # 【译】每次准入各自带时间戳、按各自的年龄过期——即使同一id还有一个仍在窗口内的较新停放（原地保留），过期的那个也会被丢掉。
             fresh = []
             for slot, at in parked:
                 if at <= cutoff:
@@ -3015,6 +3219,8 @@ class BlockManager:
                     # Do not touch the index again here -- a second `abandon_load`
                     # would double-count the miss. A late report that still calls
                     # in finds this slot gone and releases the next parked one.
+                    # 【译】槽位被停放时，索引那条腿已经在 deallocate 里放弃了；比报告活得更久的只有槽位本身。这里不要再碰索引——第二次
+                    #   abandon_load 会把这次未命中重复计数。仍然打进来的迟到报告会发现这个槽位已不在，转而释放下一个被停放的槽位。
                     self.state.release(slot)
                     reclaimed += 1
                 else:
@@ -3032,8 +3238,12 @@ class BlockManager:
         connector. Draining rather than reading is what keeps a load from being
         submitted twice into a slot the first transfer is already filling.
         """
+        # 【译】自上次调用以来准入的加载，形如 (req_id, hash, target_slot)。调度器每轮取走一次、交给connector。用"取走"而不是
+        #   "读取"，才能防止同一次加载被提交两次、写进第一次传输已经在填充的槽位。
+        # 调用方：scheduler.py _publish_state_loads（build_connector_meta 之前）
         if self.state_offload is None:
             return []
+        # 元组赋值：先取出旧列表、再换上新的空列表，一步完成"取走"
         out, self._state_loads = self._state_loads, []
         return out
 
@@ -3044,6 +3254,14 @@ class BlockManager:
         are expected to hash blocks before this is called. A gap means a
         source-level bug; callers skip the range rather than mint false hashes.
         """
+        # 【译】返回第 start−1 块的链式hash；中间有缺口时返回 None。
+        #
+        #   所有来源路径（register_prefill_hashes、postprocess、offload唤醒）都应在调用它之前已经hash过前面的block。出现缺口
+        #   说明来源处有bug；调用方跳过这段范围，而不是造出错误的hash。
+        # hash_blocks 要从第start块接着链，就需要第start−1块的hash：start=0 时用 cache_seed；否则读 block_table[start−1]
+        #   那个物理块上登记的hash（-1 = 还没登记 → 缺口）。例：can_allocate 例子里的B命中4块，prefill算完后 hash_blocks 从第4块
+        #   开始，父hash = 物理块3上的h3（A登记的，B共享）。对比nano-vllm：hash_blocks 里的
+        #   `h = self.blocks[seq.block_table[start - 1]].hash if start > 0 else -1`，ATOM多了缺口检查
         if start <= 0:
             return seq.cache_seed
         h = self.kv.block(seq.block_table[start - 1]).hash
