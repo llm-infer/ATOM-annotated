@@ -3651,7 +3651,7 @@ class BlockManager:
         #   真正落地的forward再检查一次。这里也做一次，能让"切"和"存"不打架，这是两者之间的长期约定。
         # 解释：锚点 = min( (P − room)//hbs×hbs , (ceil(P/hbs) − 1)×hbs )，room = max(successor_room, min_final_prefill_rows,
         #   ATOM_STATE_CHECKPOINT_END_MARGIN)。例：DeepSeek-V4，P = 40000、hbs = 256、room = 0 → 39936（上方【科普】的表）
-        #   调用方：_evaluate，每次准入都重算（所以deallocate把它清零）
+        #   调用方：_evaluate，每次准入都重算；deallocate也会把它清零（理由见那里）
         seq.checkpoint_end_pos = 0
         if not self.state.enabled:
             return
@@ -3933,7 +3933,7 @@ class BlockManager:
             return 0
         return snap_midstep_position(anchor, start, end, self.midstep_grid)
 
-    # 本序列的状态checkpoint类（PAGE协调器或StateSlotPool）能否中途读、且适用于这条序列
+    # 状态checkpoint类（PAGE协调器或StateSlotPool）能否在forward中途读快照、且适用于这条序列
     def _midstep_applies(self, seq: Sequence) -> bool:
         cache = self._state_checkpoint_cache
         return cache.readable_midstep and cache.applies(seq)
