@@ -957,18 +957,35 @@ class BlockManager:
         #   或者forward的起点不在block网格上。每一个都是"截chunk的阶梯"本来会保留下来的checkpoint。
         self.midstep_positions_unreadable: int = 0
 
+    # ★ 主干：一个block的链式hash（= prefix_hash.block_hash；前端预先算hash链用的也是同一个函数）
+    #   做法：token id按int64的字节喂给xxh64；prefix ≠ -1时先拼上前一块hash的8个字节（小端序）：
+    #     h0 = H(seed, 块0的token)，h1 = H(h0, 块1的token)，……，hi隐含了从开头到第i块的全部内容
+    #   第0块的prefix是seq.cache_seed：纯文本请求为-1（什么都不拼），多模态请求是图片等内容的指纹——同样的文本 + 不同的图片，
+    #     链从第0块起就不同，不会误命中（sequence.py cache_seed处）
+    # @classmethod：第一个参数是类本身，所以不用实例也能调用（BlockManager.compute_hash(...)）
+    # 对比nano-vllm：与nano-vllm的compute_hash相同（xxh64，前一块hash的8字节小端序 + token字节）
     @classmethod
     def compute_hash(cls, token_ids: array.array, prefix: int = -1):
         return block_hash(token_ids, prefix)
 
     def complete_previous_state_batch(self) -> None:
         """Complete state reads and copies issued by the previous batch."""
+        # 【译】完成上一个batch发出的状态读取和拷贝。
+        # 【分支】每请求状态（第4、8批）：Scheduler._schedule每步一开头调用（RapidServe的调度器也一样）。此时上一个batch的forward
+        #   已经发出，它要读的源槽位（fork的源等）可以解除钉住、回到空闲表——下一个拿到它的请求的forward排在同一条stream上、
+        #   一定在后面执行；PAGE协调器把上一批发出的checkpoint拷贝标为完成（镜像从COPYING变成READY、登记进索引，之后才能被
+        #   恢复），借给midstep的scratch槽位也还回状态池
         self.state.release_pins()
         if self.paged_state_checkpoints is not None:
             self.paged_state_checkpoints.complete_previous_batch()
 
     def take_state_maintenance_ops(self) -> StateMaintenanceOps:
         """Drain state maintenance for the batch being built."""
+        # 【译】取出正在构建的这个batch要做的状态维护操作。
+        # 【分支】调度器构造ScheduledBatch时调用（batch为空时不取，留给下一批），结果放进batch.state_maintenance_ops；worker在准备
+        #   这个batch的注意力元数据之前先执行它们（attentions/backends.py的relocate_state_slots、execute_paged_state_copies）。
+        #   三类：relocations（池子边界移动时槽位搬家，src → dst）、checkpoint_stores（活跃槽位 → PAGE单元：存一个checkpoint）、
+        #   checkpoint_restores（PAGE单元 → 新请求的槽位：从checkpoint恢复）
         relocations = self.state.take_relocations()
         stores = restores = ()
         if self.paged_state_checkpoints is not None:
@@ -987,6 +1004,11 @@ class BlockManager:
         the method is skipped with a warning, latched per class: the caller is a
         periodic stats line and the omission is a static property of the build.
         """
+        # 【译】所有状态类的命运计数之和，给周期性的统计行用。
+        #
+        #   累加每个类的 checkpoint_fates() 返回的内容，所以新增一个计数器不用改这个方法。没有这个方法的类会被跳过并警告，
+        #   按类只警告一次：调用方是周期性的统计行，而缺这个方法是构建时就定下的静态属性。
+        # 调用方：调度器的周期统计、pool_pressure（kept / dropped / orphaned等计数由各类自己定义）
         totals: dict[str, int] = {}
         for cache in self.state_caches:
             fates_fn = getattr(cache, "checkpoint_fates", None)
@@ -1007,6 +1029,9 @@ class BlockManager:
 
     def _note_index_change(self, h: int) -> None:
         """`h` left the KV index or moved to another block id."""
+        # 【译】h 离开了KV索引，或者改指向了另一个block id。
+        # 两条来路：BlockPool的on_remap回调（publish时同一个hash改登记到别的block上）、下面的_record_evicted。
+        #   只服务can_allocate_memoized：一次被缓存的查找读过的hash只要在这里出现，那次查找就作废（_walk_still_valid）
         self._index_changes += 1
         self._recent_index_changes.append(h)
 
@@ -1019,12 +1044,28 @@ class BlockManager:
         Without this the state pool keeps handing slots to checkpoints nothing
         can reach and spends live ones to make room for them.
         """
+        # 【译】块池刚丢掉了一个hash：上报它，并把状态那边结清。
+        #
+        #   这件事放在这里，而不放在任何一个池子里——两者由同一个链式内容hash寻址，一次前缀命中同时认领两者，所以不能让任何
+        #   一方留着一个另一方已经兑现不了的边界。没有这一步，状态池会不断把槽位分给根本到达不了的checkpoint，还会为了腾地方
+        #   把活着的花掉。
+        # ★ 主干部分：BlockPool的on_evict回调。触发时机就是惰性淘汰的那一刻：BlockPool.allocate把一个还带hash的空闲block拿去装
+        #   新内容（文件开头例子的⑦）；另外publish把一个block改登记成新hash时，旧hash也走这里。做三件事：
+        #   计数（total_evicted_blocks）；记一条BlockRemoved事件（开了KV事件时）；【分支】把同一hash上的状态checkpoint一并删掉
+        #   ——"状态 ⊆ KV"：那个位置的KV都没了，那里的状态快照也就接不上了
+        #   观察：因为publish改登记也算进来，total_evicted_blocks会比BlockPool.blocks_evicted（只数allocate里的淘汰）略大
+        # 对比nano-vllm：nano-vllm在_allocate_block里直接 del hash_to_block_id[hash]，没有回调
         self.total_evicted_blocks += 1
         self._note_index_change(h)
         if self._event_log is not None:
             self._event_log.append(_make_block_removed([h]))
         self._state_checkpoint_cache.unindex(h)
 
+    # ★ 主干：取一个block来装"这一步马上要算的新内容"（≈ nano-vllm的_allocate_block）
+    #   kv.pop()：先发没hash的vacant（id小的先），没有了才发cached里最早释放的那个；kv.allocate(id)：它若还带着hash，就在这一刻
+    #   把hash从索引删掉（惰性淘汰，回调_record_evicted），并把ref_count设为1
+    #   _ensure_page_units(1)：不开PAGE checkpoint时就是"还有没有空闲block"；开了时，空闲不够就先淘汰一个checkpoint腾出单元
+    #   调用方：allocate（prompt里没命中的block）、may_append（decode和草稿lookahead要的新block）、disown_claimed_prefix
     def _fresh_block(self) -> int:
         """Take a block for content this step is about to compute.
 
@@ -1046,12 +1087,31 @@ class BlockManager:
         starts running alongside this pass's pins and the argument has to be
         redone.
         """
+        # 【译】为这一步马上要算的内容取一个block。
+        #
+        #   经由Scheduler到不了这里的raise，checkpoint缓存也不会让它变得可达：一个READY且没被钉住的checkpoint算作可用，而两个
+        #   调用方都在同一轮里先过了一道考虑pin的检查。allocate保护它马上要钉住的那一个checkpoint，并且看得到在它之前取的pin；
+        #   may_append只在一个没排prefill的轮次里运行（scheduler.py里 if num_seqs_prefill > 0 先返回了），所以每个pin在那一轮
+        #   开头就已经释放了——唯一的例外是准入在 allocate 之后紧接着分配的草稿lookahead，而 can_allocate 在同一次单元检查里
+        #   （draft_lookahead_blocks）、针对同一个被保护的checkpoint把它算进去了。竞争之下实际能发生的是一次准入被拒绝，
+        #   而不是走到这里。
+        #
+        #   后半段论证依赖"prefill和decode永远不在同一轮"。如果 scheduler.py 里那个TODO的混合batch落地了，may_append就会和
+        #   本轮的pin同时运行，这个论证就得重做。
+        # "一步只做prefill或只做decode"：见scheduler.py _schedule上方的决策流程图
         if not self._ensure_page_units(1):
             raise AssertionError("No PAGE unit available for a fresh KV block")
         block_id = self.kv.pop()
         self.kv.allocate(block_id)
         return block_id
 
+    # 【分支】放弃一段已认领的共享前缀（review "finding #2"）：准入时认领了别人也在用的前缀block，之后发现它背后没有可用的
+    #   状态（joint边界的状态腿没到、checkpoint丢了……），只能把num_cached_tokens清零、从token 0重算。可block_table还指着那些
+    #   共享block，重算会就地覆写别的序列正在读的KV，所以先把共享的换成私有的新block
+    # 例：A正在decode，B准入时认领了A的block [7, 3]（两个ref_count都是2），后来B要从0重算：
+    #   free(7)、free(3) → ref_count回到1（A照常用）；B.block_table[0:2]换成两个新block，如[20, 21]，表长不变；
+    #   B后面那些hash == -1的新block本来就是私有的，不动
+    # 调用方：allocate（状态没接上时）、调度器两处（joint的KV腿被拒、offload的状态没送到）；返回False时调用方deallocate后重新排队
     def disown_claimed_prefix(self, seq: Sequence, keep_blocks: int = 0) -> bool:
         """Make this seq's claimed canonical prefix private, in place.
 
@@ -1076,6 +1136,18 @@ class BlockManager:
         are reserved up front. ``ref_count == 1`` blocks recycle their own unit
         and never fail.
         """
+        # 【译】把这条seq已认领的规范前缀就地变成私有的。
+        #
+        #   一次disown把 num_cached_tokens 设为0，让forward从token 0重算，但 block_table 仍指向这条seq用 kv.claim 认领的、登记在
+        #   hash索引里的block——别的序列可能正从这些block里decode。重算会就地把KV写进这些共享block，撕坏另一个持有者的值
+        #   （不可复现的数据损坏——这就是review finding #2）。这里把 block_table[keep_blocks:] 里每个认领来的前缀block交还
+        #   （kv.free），并在同一位置放一个新的私有block（_fresh_block），所以表长和其他每个位置的映射都不变。新的尾部
+        #   （hash == -1）本来就是私有的，不动；keep_blocks 以下仍共享的block也不动。
+        #
+        #   池子撑不起这些私有副本时返回 False——调用方必须放弃这次准入（deallocate + 重新排队），而不是在共享block上跑一次
+        #   forward。只有仍在 ref_count > 1 共享的block会在这里净耗一个PAGE单元（还有别的持有者时 free 什么都释放不了），而
+        #   can_allocate 从没为它们预留过（它从 num_new_blocks 里减掉了已被占用的命中block）；所以先把它们预留出来。
+        #   ref_count == 1 的block回收的是它自己的单元，永远不会失败。
         if not self.enable_prefix_caching:
             return True
         table = seq.block_table
@@ -1085,15 +1157,23 @@ class BlockManager:
             if self.kv.block(table[i]).hash != -1
             and self.kv.block(table[i]).ref_count > 1
         )
+        # n_shared：要净增几个单元——带hash（认领来的）且还有别人共享的block；先一次性确认够了再动手，不会换到一半才失败
         if n_shared and not self._ensure_page_units(n_shared):
             return False
         for i in range(keep_blocks, len(table)):
+            # 【译】（下一行行尾）已经私有的新尾部（或之前已被disown过的位置）
             if self.kv.block(table[i]).hash == -1:
                 continue  # already-private fresh tail (or a prior disown)
             self.kv.free(table[i])
             table[i] = self._fresh_block()
         return True
 
+    # 下面三个函数回答"KV池还拿得出多少个PAGE单元"。PAGE单元就是KV池里的一个block：它要么装KV，要么（开了PAGE状态checkpoint
+    #   时）是某个checkpoint镜像的一片。不开PAGE checkpoint时三者都退化成 kv.has_free(n)——"空闲block够不够"（空闲里包括还带
+    #   hash的cached block，取用时才淘汰）；开了时，可以淘汰的checkpoint占着的单元也算可用，protected_hash是这次准入马上要
+    #   恢复的那个checkpoint，不能算作可淘汰
+    #   _checkpoint_has_room的调用方：_record_checkpoint_demand；_has_page_units：_evaluate、can_append（只问，不动池子）；
+    #   _ensure_page_units：_fresh_block、disown_claimed_prefix（开了PAGE checkpoint时真的淘汰checkpoint，把空闲表补到count个）
     def _checkpoint_has_room(
         self, live_blocks: int = 0, protected_hash: int | None = None
     ) -> bool:
@@ -1112,6 +1192,16 @@ class BlockManager:
         `True` when no PAGE-backed checkpoints exist at all: a fork checkpoint
         costs the pool nothing, so there is nothing to gate.
         """
+        # 【译】在已拿走 live_blocks 之后，一个镜像是否还放得下。
+        #
+        #   live_blocks 是问这个问题的那次准入马上要分配的数量。把它算进去，是"有地方放一个镜像"和"有地方放这个请求*加*一个镜像"
+        #   的区别，而只有后者才是要问的问题：请求的block先拿。
+        #
+        #   protected_hash 是同一次准入马上要钉住的checkpoint，不算在淘汰可回收的范围内——与 can_allocate 在下一行传给
+        #   _has_page_units 的参数相同，所以同一轮里的两道门对"什么可以花"意见一致。
+        #
+        #   完全没有PAGE checkpoint时返回 True：fork checkpoint不花池子任何东西，所以没什么要把关的。
+        # units_per_checkpoint = ⌈镜像字节数 / 一个block的字节数⌉，例：KDA一个镜像127个block（见__init__里paged_state_checkpoints处）
         if self.paged_state_checkpoints is None:
             return True
         return self.paged_state_checkpoints.has_available_units(
@@ -1143,8 +1233,16 @@ class BlockManager:
         pool (`can_allocate`/`allocate`) or to reject a prompt as too large for
         it (`Scheduler._unschedulable_reason`).
         """
+        # 【译】一条 seq_len 个token的序列在本rank上占KV池的多少个block。
+        #
+        #   开DCP时一个rank只存它交错分到的那一份，所以这个数比全局的 ceil(seq_len / block_size) 小 dcp_world_size 倍。池子正是
+        #   按同样的每rank单位定的大小，所以只有这个数可以拿来和 kv.num_blocks 比——无论是决定要不要从池里取
+        #   （can_allocate / allocate），还是判定一个prompt对这个池来说太大而拒绝（Scheduler._unschedulable_reason）。
+        # 例（block 16）：不开DCP，1000个token → ⌈1000/16⌉ = 63个；-dcp 4、S = 1 → rank 0本地 ⌈1000/4⌉ = 250个token → 16个
+        #   （DCP为什么这么算见下面_effective_block_size上方的【前置：DCP】）。对比nano-vllm：就是nano-vllm的seq.num_blocks
         if self.dcp_world_size <= 1:
             return (seq_len + self.block_size - 1) // self.block_size
+        # 只有开DCP才用到，所以在函数里导入。dcp_rank恒为0：rank 0分到的本地token最多（见__init__里dcp_rank处）
         from atom.model_ops.dcp_ops import get_dcp_local_seq_lens
 
         local_len = get_dcp_local_seq_lens(
@@ -1161,12 +1259,18 @@ class BlockManager:
         What admission charges on top of the prompt, so the block `may_append`
         takes for a forward ending at `seq_len` was paid for in the same pass.
         """
+        # 【译】draft_lookahead 在 num_pool_blocks(seq_len) 之外多出来的block数。
+        #
+        #   这是准入在prompt之外多收的部分，这样 may_append 为一次止于 seq_len 的forward取的block，在同一轮里已经付过了。
+        # 例（block 16、draft_lookahead = 2）：seq_len = 1000 → num_pool_blocks(1002) − num_pool_blocks(1000) = 63 − 63 = 0；
+        #   seq_len = 1008 → 64 − 63 = 1（见draft_kv_lookahead上方的图）。调用方：_evaluate、max_pool_tokens
         if not self.draft_lookahead:
             return 0
         return self.num_pool_blocks(
             seq_len + self.draft_lookahead
         ) - self.num_pool_blocks(seq_len)
 
+    # @property：当属性读（bm.max_pool_tokens，不加括号），每次读都重新计算
     @property
     def max_pool_tokens(self) -> int:
         """Longest prompt, in global tokens, whose KV fits an entirely empty pool.
@@ -1185,10 +1289,26 @@ class BlockManager:
         server needs it published because `num_kvcache_blocks` is measured in
         the engine subprocess and its own Config never learns the value.
         """
+        # 【译】一个完全空的池子能装下其KV的最长prompt（全局token数）。
+        #
+        #   对 num_pool_blocks 做二分查找（它关于 seq_len 单调），而不是用闭式解求逆：在block级交错下
+        #   （cp_kv_cache_interleave_size > 1），一个rank的份额并不是简单的 seq_len / dcp_world_size，手推的反函数只要那段算术
+        #   一变就会和分配器对不上。只在启动时跑一次。
+        #
+        #   它与 Scheduler._unschedulable_reason 执行的上限一致，所以前端能预判那个结论，在还在应答客户端时就用一个错误拒绝过大
+        #   的prompt，而不是等客户端已经在等待时才由调度器发现。API server需要把它公布出来，是因为 num_kvcache_blocks 是在引擎
+        #   子进程里测出来的，它自己那份Config永远拿不到这个值。
+        # 流向：EngineCore的READY消息（engine_core.py）→ CoreManager取各rank的最小值 → api_server的_validate_pool_capacity对更长
+        #   的prompt返回400
+        # 例：100个block、block 16、不开DCP / MTP → 1600；开MTP k = 3（draft_lookahead = 2）→ 1598（要给草稿留2个位置）；
+        #   -dcp 4、S = 1 → 每卡1600个本地token → 6400个全局token
         capacity = self.kv.num_blocks
         # A prompt this long needs more than `capacity` blocks on some rank, so
         # it bounds the search from above: each rank holds at least
         # `1 / dcp_world_size` of it, i.e. over `capacity` blocks' worth.
+        # 【译】这么长的prompt在某个rank上需要超过 capacity 个block，所以它是搜索的上界：每个rank至少存它的 1 / dcp_world_size，
+        #   也就是超过 capacity 个block的量。
+        # 二分：找最大的lo使"prompt的block + 草稿lookahead的block ≤ capacity"；mid取上中位数（+ 1），lo = mid时区间也在缩小
         hi = (capacity + 1) * self.block_size * max(1, self.dcp_world_size)
         lo = 0
         while lo < hi:
@@ -1199,16 +1319,50 @@ class BlockManager:
                 hi = mid - 1
         return lo
 
+    # =========================================================================================
+    # 【前置：DCP】为什么开DCP后"hash block = block_size × DCP"（本文件里DCP只在这里讲；完整原理见arg_utils.py
+    #   EngineArgs.tensor_parallel_size下方的【科普】MLA、decode_context_parallel_size上方的【科普】）
+    # =========================================================================================
+    #   ① 前提：MLA只有1个KV头。MLA（DeepSeek-V3、Kimi-K2、GLM-5等）每token每层只缓存一行所有头共用的576维潜在向量
+    #     （DeepSeek-V3若用MHA要存 128头 × (192 + 128) = 40960个数），相当于只有1个KV头。TP按头切KV，1个头切不开：
+    #     -tp 8时8张卡各存一整份同样的KV
+    #   ② DCP（decode上下文并行）：让TP组里的几张卡按token轮流各存一份，不增加卡数。-dcp 4、interleave = 1时token t只存在
+    #     第t % 4张卡上，每卡只存1/4；注意力各卡先对自己那部分算，再用LSE合并（结果与在全部token上算一次相同）
+    #   ③ 对账本的影响：4张卡用同一个block id，各在自己的KV池里放自己那16个token（dcp_ops.dcp_prefill_slot_mapping：
+    #     槽位 = block_table[pos // (16 × 4)] × 16 + 本地序号 % 16），所以一个block table条目覆盖 16 × 4 = 64个全局token：
+    #
+    #       全局token        0  1  2  3  4  5  6  7  …  60 61 62 63 │ 64 65 …
+    #       卡0的block 7     0           4           …  60          │          （卡0本地的第0~15个token）
+    #       卡1的block 7        1           5        …     61       │          （卡1本地的第0~15个token）
+    #       卡2、卡3同理                                             │
+    #       → block_table[0] = 7 覆盖全局token 0~63，block_table[1]从64开始
+    #
+    #     于是本类里有两个数：
+    #       block_size（16）                 一个rank上的物理block装几个token；KV池按"每卡本地token数 / block_size"计
+    #                                        （num_pool_blocks、max_pool_tokens）
+    #       hash_block_size = _effective_block_size() = block_size × DCP（64）
+    #                                        一个block table条目覆盖几个全局token：前缀hash、命中、登记（_n_hash_blocks、
+    #                                        _hash_block_tokens），以及can_append / may_append判断何时要加条目，都用它
+    #     例：1000个token、-dcp 4：⌈1000/64⌉ = 16个条目；每卡本地 ⌈1000/4⌉ = 250个token → 也是16个物理block
+    #   不开DCP（默认）时两个数相等，和nano-vllm一样
+    #
+    # 一个block table条目覆盖的全局token数。读者：can_append、may_append、draft_writes_allocated，以及调度器的一条报错信息。
+    #   观察：和hash_block_size是同一个数的两种写法（这里每次现乘，hash_block_size在__init__里由prefix_hash.hash_block_size_for算好）
     def _effective_block_size(self):
         return self.block_size * self.dcp_world_size
 
+    # 等价于直接读self.hash_block_size（allocate、hash_blocks、_joint_kv_boundary等用这个写法）
     def _hash_block_size(self) -> int:
         return self.hash_block_size
 
+    # 这条序列一共要几个block table条目：⌈len(seq) / hash_block_size⌉；len(seq)即num_tokens，延迟输出 / MTP时含末尾的占位。
+    #   例（不开DCP）：1000个token → 63个，最后一个可能没写满（≈ nano-vllm的seq.num_blocks）
     def _n_hash_blocks(self, seq: Sequence) -> int:
         hbs = self.hash_block_size
         return (len(seq) + hbs - 1) // hbs
 
+    # 第i个条目覆盖的token id：token_ids[i × hbs : (i + 1) × hbs]（array("i")的切片，最后一块可能不满）。
+    #   用来算链式hash，以及命中后比对内容（≈ nano-vllm的seq.block(i)）
     def _hash_block_tokens(self, seq: Sequence, i: int) -> array.array:
         hbs = self.hash_block_size
         return seq.token_ids[i * hbs : (i + 1) * hbs]
@@ -1898,20 +2052,30 @@ class BlockManager:
 
     def _walk_prefix(self, seq: Sequence) -> _PrefixWalk:
         """`seq`'s contiguous HBM prefix hit, the costly half of `can_allocate`."""
+        # 【译】seq在HBM里连续命中的前缀，can_allocate中开销大的那一半。
+        # "HBM"指GPU显存里的KV池（与【分支】CPU / LMCache那一层相对）。两种实现，结果相同：
+        #   快速遍历 _hit_walk（ATOM_PREFIX_FAST_WALK，默认开）：批量查表，只比对最后一个命中块的token
+        #   逐块遍历（关掉快速遍历时）：下面的for循环，和nano-vllm的can_allocate循环一样（每块都比对token）
+        # prompt = 本seq的prompt hash链（_prompt_hashes：每个seq只算一次；默认用前端算好送来的链，核对后采用）
         prompt = self._prompt_hashes(seq)
         if self.fast_prefix_walk:
             hashes, ids = self._hit_walk(seq, prompt)
         else:
+            # h从cache_seed开始：纯文本为-1（第0块不拼前缀）；多模态是对图像数据算出的种子，同样的文字配不同的图不会误命中
             hashes, ids, h = [], [], seq.cache_seed
+            # 只看前 n−1 块：最后一块不复用（见 can_allocate 里的例子）
             for i in range(self._n_hash_blocks(seq) - 1):
+                # 链上已有就直接读，没有就现算，并追加到链上（只追加prompt的满块）
                 h = self._block_hash(seq, prompt, i, h)
                 block_id = self.kv.lookup(h)
+                # 查不到，或hash碰撞（索引里那块的token和本块不同）→ 停：链式hash下后面的块也不可能命中
                 if block_id == -1 or self.kv.block(block_id).token_ids != (
                     self._hash_block_tokens(seq, i)
                 ):
                     break
                 hashes.append(h)
                 ids.append(block_id)
+        # 连同"在什么条件下遍历的"一起返回：token数、种子、索引版本号——allocate（_take_admission_walk）据此判断能否直接用这些id
         return _PrefixWalk(
             seq.num_tokens, seq.cache_seed, self.kv.index_version, hashes, ids
         )
@@ -1919,6 +2083,10 @@ class BlockManager:
     def _admission_walk(self, seq: Sequence) -> _PrefixWalk:
         """The exact probe's walk, kept on the fast walk for `seq`'s `allocate`
         (`_take_admission_walk`)."""
+        # 【译】精确探测的遍历结果；快速遍历模式下把它存起来，留给这条seq的 allocate 使用（_take_admission_walk）。
+        # 只在快速遍历时保存：allocate 直接 claim_many 这些id，省掉第二遍"算hash → 查表"（nano-vllm的allocate会把命中块
+        #   重新hash、重新查一遍）；关掉快速遍历时 allocate 逐块重查。_admission_walks 是 WeakKeyDictionary（以seq为弱引用键，
+        #   seq被回收时条目自动消失），每次精确探测覆盖、allocate 时取走
         walk = self._walk_prefix(seq)
         if self.fast_prefix_walk:
             self._admission_walks[seq] = walk
@@ -1936,7 +2104,23 @@ class BlockManager:
         and then every block is compared as the per-block walk did. A collision
         on an interior block alone goes undetected (vLLM compares none).
         """
+        # 【译】seq在HBM里连续命中的前缀，返回 (hash列表, block id列表)。
+        #
+        #   对已缓存的prompt链用 map 分轮查表，每轮的块数从只查第一块开始增长（_WALK_LOOKUP_ROUND_MIN），所以一个冷prompt
+        #   只花一次查表；越过缓存链之后，再分轮往前算hash。只比对最后一个命中块的token：已登记的内容不会改变（publish 会撤销
+        #   block的旧hash，allocate 会先取消登记），所以比对不上只可能是64位hash碰撞，这时再像逐块遍历那样逐块比对。
+        #   只发生在中间某块上的碰撞检测不到（vLLM一块都不比对）。
+        # 分轮的例子（block 16）：
+        #   查表轮（链已缓存：前端送来的，或之前算过的）：每轮查 1、16、64、256、1024、4096…块（第一轮只查1块，之后每轮 ×4、至少16）
+        #     冷prompt：第1轮查第0块就未命中 → 只查1次
+        #     128k prompt（8192块）命中3000块：前5轮累计查1361块全中；第6轮查4096块，在第3000块处未命中 → 共查5457次。
+        #     每轮是一次 map(dict.get, …)，在C层循环，比Python逐块循环快得多；未命中之后多查的部分不超过命中的约4倍
+        #   算hash轮（链没覆盖到的部分）：每轮算 64、128、256、512、1024、1024…块（chained_block_hashes 一次算一段），
+        #     算出的若是prompt的满块就顺手追加到链上，下次不必再算；未命中之后白算的hash最多一轮
+        # 碰撞概率与"为什么只比最后一块"的讨论见prefix_hash.py文件头【科普】③
+        # 最后一块不复用：只遍历前 n−1 块
         n = self._n_hash_blocks(seq) - 1
+        # 索引dict的get方法本身（查不到返回None），配合 map 在C层批量查表
         get = self.kv.index_get
         hashes: list[int] = []
         ids: list = []
@@ -1944,9 +2128,11 @@ class BlockManager:
         look = 1
         while len(hashes) < n:
             k = len(hashes)
+            # 链上还有现成的hash：取下一轮的 look 个去查，然后把 look 放大到 max(4×look, 16)
             if k < len(prompt):
                 new = prompt[k : min(n, k + look)]
                 look = max(4 * look, _WALK_LOOKUP_ROUND_MIN)
+            # 链用完了（前端没送链 / 链被拒，或已越过prompt的满块）：现算下一段hash，从上一块的hash（第0块则从cache_seed）接着链
             else:
                 end = min(n, k + hash_round)
                 new = chained_block_hashes(
@@ -1958,19 +2144,25 @@ class BlockManager:
                 )
                 if k == len(prompt):
                     # Prompt blocks only: those past it can still change.
+                    # 【译】只追加prompt的块：prompt之后的块还可能变。
+                    # 链缓存只承诺"被prompt填满的块"这一段不变（prefix_hash.full_prompt_blocks；含生成token的块可能还挂着占位token，
+                    #   见prefix_hash.py文件头【科普】⑤）。要 k == len(prompt) 才追加：保证新算的这段正好接在链的末尾
                     full = full_prompt_blocks(seq, self.hash_block_size)
                     prompt += new[: max(0, full - k)]
                 hash_round = min(2 * hash_round, _WALK_HASH_ROUND_MAX)
             new_ids = list(map(get, new))
             try:
+                # 本轮第一个未命中的位置
                 miss = new_ids.index(None)
             except ValueError:
+                # 本轮全部命中（list.index找不到时抛ValueError）：收下，继续下一轮
                 hashes += new
                 ids += new_ids
                 continue
             hashes += new[:miss]
             ids += new_ids[:miss]
             break
+        # 只比对最后一个命中块的token（理由见docstring）；对不上说明发生了hash碰撞，退回逐块比对，截在第一个不一致处
         last = len(ids) - 1
         if last >= 0 and self.kv.block(ids[last]).token_ids != (
             self._hash_block_tokens(seq, last)
@@ -1985,6 +2177,16 @@ class BlockManager:
         """`seq`'s last fast walk if its first `blocks` ids, all `allocate`
         claims, still hold (consumed either way). Past its `index_version` they
         hold while their hashes still resolve to the same ids."""
+        # 【译】如果seq上一次快速遍历的前 blocks 个id（即 allocate 要认领的全部）仍然有效，就返回它（无论有效与否都会被取走）。
+        #   索引版本号变过之后，只要这些hash仍解析到同样的id，它们就仍然有效。
+        # 为什么要验证——can_allocate 与 allocate 之间可能变了什么：
+        #   BlockPool.index_version 在"某个hash离开索引或改指向另一个block"时+1（块被重新分配而淘汰、clear_cache、同一hash
+        #   改登记到别的块）；新登记一个hash不+1（已经查到的id仍然对）。所以：
+        #     版本号没变 → 这批id一定还对，O(1)放行；
+        #     变了 → 用map把前k个hash重查一遍，与当时的id完全一致才放行，否则返回None，allocate 逐块重查（查不到就截断命中）
+        #   主路径上同一条seq的探测和allocate紧挨着（中间只有预算 / chunk检查，不动池子），版本号通常不变；但这份结果存在
+        #   字典里，可能来自更早的探测，也可能经过中间动过池子的路径，所以总要验证一次。token数或cache_seed变了（例如被抢占后
+        #   带着已生成的token重新排队）则整份作废
         walk = self._admission_walks.pop(seq, None)
         if (
             walk is None
@@ -1992,6 +2194,7 @@ class BlockManager:
             or walk.cache_seed != seq.cache_seed
         ):
             return None
+        # 只验证 allocate 真要认领的前k块
         k = min(blocks, len(walk.ids))
         if walk.index_version != self.kv.index_version and (
             list(map(self.kv.index_get, walk.hashes[:k])) != walk.ids[:k]
@@ -2012,10 +2215,28 @@ class BlockManager:
         `clear_cache`, the first miss still resolves the same (a hit only grows
         by a publish of that hash), and token count and seed are unchanged.
         """
+        # 【译】给PrefillDelayer和DP chunk代价估计用的 can_allocate(seq, record=False)，前缀遍历按seq缓存。走的是同一个 _evaluate，
+        #   所以状态槽位空间、门控、重放、checkpoint的demand/end、命中块里正被使用的块数，以及放不放得下，每次调用都重新询问，
+        #   答案与精确探测一致。
+        #
+        #   只要遍历读过的东西都没动，就复用这次遍历：watched 中没有hash被淘汰或改指向别的block（_note_index_change；自上次
+        #   检查以来变化超过 _RECENT_INDEX_CHANGES 个就重新遍历），没有 clear_cache，第一个未命中块的hash仍解析成同样的结果
+        #   （命中只会因为登记了这个hash而变长），token数和种子也没变。
+        # 为什么要跨tick缓存：调用方（scheduler.py的 _probe_local_prefill_work、_estimate_prefill_chunk_cost、_can_admit_head_prefill）
+        #   每个tick都要探一遍waiting队列，而PrefillDelayer为了攒批，可能让同一批请求在waiting里等好几个tick。一个128k的prompt
+        #   是8192块，每tick重走一遍链就是成千上万次查表；缓存后每次只检查"自上次以来索引里变了哪些hash"，代价与索引变化量成正比、
+        #   与prompt长度无关
+        # tick之间可能变的：
+        #   别的请求prefill完、hash_blocks登记了新hash → 命中可能变长（只有"第一个未命中块"的hash被登记时才会，所以只盯这一个）
+        #   别的请求取新块淘汰了缓存块 → 命中可能变短（watched里的某个hash离开索引）
+        #   clear_cache；本seq被抢占后token变多（num_tokens变了）
+        # 只缓存遍历；"命中块里几块正被使用"等随池子变化的量仍每次重算（见 _evaluate）。ATOM_PREFIX_WALK_MEMO=0 时不缓存
+        # 对比nano-vllm：没有这一层（nano-vllm没有delayer，每步只对真正要准入的请求调一次can_allocate）
         walk_of = self._memoised_walk if self.walk_memo else self._walk_prefix
         return self._evaluate(seq, walk_of, False, None)
 
     def _memoised_walk(self, seq: Sequence) -> _PrefixWalk:
+        # 有缓存且仍有效 → 直接用；否则重新遍历一次，并记下以后用来验证的东西
         memo = self._cached_walks.get(seq)
         if memo is not None and self._walk_still_valid(seq, memo):
             return memo.walk
@@ -2023,14 +2244,19 @@ class BlockManager:
         hit = len(walk.hashes)
         boundary_hash = None
         boundary_id = -1
+        # 命中没走到最后一个可复用块（第n−2块）：记下"第一个未命中块"的hash和它此刻查到的id（通常是-1；hash碰撞时是那个
+        #   token对不上的块）。以后它一旦被登记或改指，命中就可能变长 → 缓存作废。命中已到最后一个可复用块时不会再变长，记None
         if hit < self._n_hash_blocks(seq) - 1:
             # Read back from the prompt chain, where the walk left it.
+            # 【译】从prompt链里读回来，遍历时已经把它留在那里了。
             prev = walk.hashes[-1] if hit else seq.cache_seed
             boundary_hash = self._block_hash(seq, self._prompt_hashes(seq), hit, prev)
             boundary_id = self.kv.lookup(boundary_hash)
+        # watched = 这次遍历读过的全部索引项：命中的各块 + 第一个未命中块
         watched = set(walk.hashes)
         if boundary_hash is not None:
             watched.add(boundary_hash)
+        # 同时记下此刻的 clear 次数和索引变化计数，作为下次 _walk_still_valid 的起点
         self._cached_walks[seq] = _CachedWalk(
             walk=walk,
             index_clears=self._index_clears,
@@ -2044,21 +2270,30 @@ class BlockManager:
     def _walk_still_valid(self, seq: Sequence, memo: _CachedWalk) -> bool:
         """Whether the KV index still answers `memo`'s walk the same way. Costs
         the index changes since the last check, not the prompt length."""
+        # 【译】KV索引对 memo 那次遍历的回答是否仍然一样。代价是自上次检查以来的索引变化数，而不是prompt长度。
+        # 例：memo之后索引又变了30次（30个别的hash被淘汰），逐条看这30个是否在watched里，都不在 → 仍有效；
+        #   代价是30次集合查询，而不是把几千块重走一遍
+        # token数、种子变了，或其间 clear_cache 过 → 作废
         if (
             memo.walk.num_tokens != seq.num_tokens
             or memo.walk.cache_seed != seq.cache_seed
             or memo.index_clears != self._index_clears
         ):
             return False
+        # 自上次检查以来新增的索引变化条数（_note_index_change：hash被淘汰、或改指向另一个block时各记一条）
         new = self._index_changes - memo.index_changes_seen
         if new:
+            # 变化太多，最近变化的环形队列（deque(maxlen=8192)）已装不下 → 无法逐条核对，保守地作废、重新遍历
             if new > len(self._recent_index_changes):
                 return False
             watched = memo.watched
+            # 只看最近 new 条（islice(it, n)：取迭代器的前n个，不复制）：有一条落在watched里 → 遍历读过的某项变了 → 作废
             for h in islice(reversed(self._recent_index_changes), new):
                 if h in watched:
                     return False
+            # 都与本遍历无关：把检查起点推进到现在，下次只看更新的变化
             memo.index_changes_seen = self._index_changes
+        # 最后看第一个未命中块：它的hash现在查到的id与当时相同（通常仍是-1），命中就没有变长
         return (
             memo.boundary_hash is None
             or self.kv.lookup(memo.boundary_hash) == memo.boundary_id
@@ -2068,6 +2303,13 @@ class BlockManager:
         self, seq: Sequence, num_cached_blocks: int, block_hashes: list[int]
     ) -> None:
         """Commit the fit probe before any allocation changes the pool."""
+        # 【译】在任何分配改动池子之前，提交这次"放得下"的探测结果。
+        # 【分支】联合边界（LMCache offload，有每请求状态的模型，第9批）：HBM里的前缀在第一次未命中处就停了，但LMCache可能还存着
+        #   后面的KV和状态checkpoint；_joint_kv_boundary 找一个"KV和状态都能从LMCache取回"的更远边界，_commit_joint_boundary
+        #   把它写进 seq.offload_joint（allocate 据 claim_tokens 多认领、据 boundary_hash 找状态）。没有状态层时（state_offload
+        #   为None，普通部署都是）只记一次 joint_skips["off"] 并清空 seq.offload_joint 的联合字段
+        # 为什么单独一步、放在allocate之前：边界要对着"分配前"的池子算（allocate取新块会淘汰缓存）；调度器在预算检查通过后才调它，
+        #   被拒绝的探测就不必付这次计算
         if self.enable_prefix_caching:
             decision = self._joint_kv_boundary(seq, num_cached_blocks, block_hashes)
             self._commit_joint_boundary(seq, decision)
@@ -2087,8 +2329,23 @@ class BlockManager:
         back the private prefix copies; the caller must then deallocate and
         requeue the seq rather than run a forward over shared blocks.
         """
+        # 【译】为seq分配block。num_cached_blocks 是 can_allocate 返回的命中数（调用方没调它时为0）。
+        #
+        #   hash登记推迟到 hash_blocks()，由 scheduler.postprocess() 在forward算完每个block的KV之后调用。这让manager在将来的
+        #   chunked prefill调度下也保持正确：一个跨越多步才写满的block，在完全填满之前不能以hash的形式发布。
+        #
+        #   成功返回 True。只有当一个没有状态支撑的联合边界必须被放弃（finding #2），而池子又给不出前缀的私有副本时才返回 False；
+        #   这时调用方必须 deallocate 并把seq放回队列，而不是在共享block上跑forward。
+        # 步骤编号对应 can_allocate 里第二个流程图的 (1)~(9)
+        # 观察：docstring说"将来的chunked prefill"，而chunked prefill现在已默认开启（arg_utils.py enable_chunked_prefill=True），
+        #   这条"写满才登记"的规则正是它所依赖的
+        # 观察：返回False的实际条件是"state_holds为False 且 disown_claimed_prefix失败"。state_holds为False不只发生在联合边界上：
+        #   普通HBM命中背后的checkpoint在探测之后没了（_attach_state_slots 里PAGE分支的"Neither tier can produce it"、fork分支的
+        #   `return hit_hash == -1`）也会走到这里，比docstring说的范围宽
+        # 调用方：scheduler.py _schedule Phase 2（返回False时 deallocate + 放回waiting队头 + 本轮停止准入）
         assert not seq.block_table
         # Admitted: the delayer no longer probes this seq.
+        # 【译】已准入：delayer不会再探测这条seq。所以丢掉它的跨tick遍历缓存（can_allocate_memoized）
         self._cached_walks.pop(seq, None)
         # Two extents, and they are not the same number. `num_cached_blocks` is
         # what the request may call cached -- it needs a resumable state behind
@@ -2101,25 +2358,41 @@ class BlockManager:
         # Only a joint boundary widens it -- without one there is nothing above
         # `num_cached_blocks` this request will ever treat as computed, and
         # claiming further would pin blocks the forward is about to overwrite.
+        # 【译】两个范围，而且它们不是同一个数。num_cached_blocks 是请求可以称为"已缓存"的部分——背后需要一份可恢复的状态。
+        #   claim_blocks 是它的block table可以指向的部分：前缀遍历匹配上的每个block，不论那里有没有checkpoint。两者之差是被状态
+        #   门控拒绝的真实复用，拿下它们不花任何代价：这些block在forward将要开始的联合边界之下，没有人会写它们。
+        #
+        #   只有联合边界会放宽它——没有联合边界时，num_cached_blocks 之上没有任何东西会被这个请求当作已计算，认领更多只会
+        #   钉住forward马上要覆盖的block。
+        # (1) 普通情况 claim_blocks == num_cached_blocks；只有【分支】联合边界（record_allocation 写了 claim_tokens）才更大
         hbs = self._hash_block_size()
+        # 记下调用方要的命中块数：下面若因淘汰截短了命中，【分支】V4重放据此判断
         requested_blocks = num_cached_blocks
         claim_blocks = max(
             num_cached_blocks,
             int(seq.offload_joint.claim_tokens or 0) // hbs,
         )
+        # h：链上"上一块"的hash，从cache_seed开始；hit_hash：最后一个"算作已缓存"的块的hash，-1表示冷启动——
+        #   【分支】状态槽位按它找checkpoint（普通模型用不到）
         h = seq.cache_seed
         hit_hash = -1
         # Claim the probe's ids as one run; the loop walks only the rest (a
         # joint tail past the HBM hit, or everything if the walk is stale).
+        # 【译】把探测得到的id当作一整段认领；下面的循环只走剩下的部分（HBM命中之后的联合尾段，或walk已失效时的全部）。
         claimed = 0
         walk = self._take_admission_walk(seq, claim_blocks)
+        # (2) `:=`（海象运算符）：在表达式里赋值并取值。claim_many：已被别的序列用着的块 ref_count+1；在空闲表里的块从空闲表
+        #   取出、ref_count=1，内容和hash原样保留（BlockPool.claim；对比nano-vllm allocate里 `if block_id in self.used_block_ids`
+        #   的两个分支）。例：can_allocate 里例子(a)的B → claim_many([0,1,2,3])，block_table = [0,1,2,3]
         if walk is not None and (claimed := min(claim_blocks, len(walk.ids))):
             ids = walk.ids[:claimed]
             self.kv.claim_many(ids)
             seq.block_table.extend(ids)
+            # 下面的循环（如果还有要认领的）从第claimed块接着链；hit_hash = 已缓存部分最后一块的hash
             h = walk.hashes[claimed - 1]
             if cached := min(claimed, num_cached_blocks):
                 hit_hash = walk.hashes[cached - 1]
+        # 逐块认领剩下的：walk失效时就是全部命中块（和nano-vllm的allocate一样：算hash、查表、认领），否则只有联合尾段
         prompt = self._prompt_hashes(seq)
         for i in range(claimed, claim_blocks):
             h = self._block_hash(seq, prompt, i, h)
@@ -2138,10 +2411,18 @@ class BlockManager:
                 # real control flow instead: never treat more than the `i` blocks
                 # actually claimed as cached, and drop any joint boundary that
                 # sits above them so the KV leg cannot resume over a gap.
+                # 【译】在 can_allocate 和这里之间被淘汰了。对放宽出来的联合尾段这是预料之中的——LMCache或状态层仍持有它，forward会重新取。
+                #   对已缓存的范围这本应不可达（一次准入内部不会淘汰任何东西），但 `assert i >= num_cached_blocks` 在 python -O 下会消失，
+                #   旧代码于是一路执行下去：把 num_cached_blocks * hbs 记为已缓存、覆盖一个它没能认领的前缀，让 hit_hash 保持未赋值
+                #   （走冷启动的状态出口），并且只钳制了 claim_tokens，而 boundary / kv 仍停在认领区域之上——两方面都是静默的错误输出。
+                #   改用真正的控制流：已缓存的部分绝不超过实际认领到的 i 个block，并丢弃位于它们之上的任何联合边界，这样KV那条腿就
+                #   不会越过一个缺口去恢复。
+                # 命中截到实际认领到的 i 块
                 claimed_tokens = i * hbs
                 num_cached_blocks = min(num_cached_blocks, i)
                 # Partial reset by design: the claim is clamped, not zeroed,
                 # so this cannot go through `reset_joint`.
+                # 【译】有意只做部分重置：认领范围是被钳制而不是清零，所以这里不能走 reset_joint。
                 if int(seq.offload_joint.boundary_tokens or 0) > claimed_tokens:
                     seq.offload_joint.boundary_tokens = 0
                     seq.offload_joint.boundary_hash = -1
@@ -2161,16 +2442,26 @@ class BlockManager:
             # stayed > 0 -- a cold-start state restore over a prefix that is in
             # fact cached. Assigning on every cached block leaves hit_hash on the
             # last one actually claimed, whichever way the loop exits.
+            # 【译】一边走一边记下最后一个被认领的"已缓存"block的hash，而不是只在循环走到 num_cached_blocks-1 时才记。如果上面
+            #   block_id==-1 的分支把 num_cached_blocks 钳到更早的 i（已缓存范围内发生了淘汰），`i + 1 == num_cached_blocks` 这个判断
+            #   就永远不会触发，hit_hash 停在 -1 而 num_cached_tokens 仍 > 0——在一个实际已缓存的前缀上做冷启动的状态恢复。
+            #   每个已缓存block都赋值一次，无论循环怎么退出，hit_hash 都停在最后一个真正认领到的block上。
             if i < num_cached_blocks:
                 hit_hash = h
         if self.state_replay_tokens and seq.replays_hit:
             # A replay starts from a fresh state slot, never a checkpoint: it
             # rebuilds the state below whatever the claim above reached.
+            # 【译】重放总是从一个新的状态槽位开始，从不从checkpoint开始：它在上面认领到的位置之下重建状态。
+            # (3) 【分支】DeepSeek-V4有界重放（_replay_hit 判定重放时）：不找checkpoint，hit_hash 置-1 → 下面拿新槽位
             hit_hash = -1
             if num_cached_blocks < requested_blocks:
                 # A KV-only load past the hit would start above a gap.
+                # 【译】越过命中的"只加载KV"会从一个缺口之上开始。
                 seq.replay_kv_load = False
         # Pin the restore before fresh blocks can evict its checkpoint.
+        # 【译】在新block可能淘汰checkpoint之前，先把恢复钉住。
+        # (4) 【分支】PAGE checkpoint的状态镜像就住在KV池的单元里，下面 _fresh_block 取新块时可能按LRU淘汰它；
+        #   先 begin_restore（checkpoint的pin_count+1，不再是可淘汰对象），它就安全了
         state_holds = True
         if seq.has_per_req_cache and self.paged_state_checkpoints is not None:
             # The joint boundary, when there is one -- the same rule the fork
@@ -2185,12 +2476,25 @@ class BlockManager:
             # joint boundary and `_claim_after_load` raised `num_cached_tokens`
             # to it, so the forward resumed over a prefix the state does not
             # cover. Silent wrong output, no exception.
+            # 【译】有联合边界时用联合边界——这正是下面fork分支早已采用、而PAGE分支以前没有采用的规则。
+            #
+            #   hit_hash 是HBM命中处的hash，而联合边界按构造严格位于它之上。这里出过两种错：num_cached_blocks == 0 时循环根本没有
+            #   给 hit_hash 赋值，于是走了 -1 的冷启动出口，完全没有请求状态；命中非零时，它恢复的是覆盖 [0, hbm) 的那个checkpoint。
+            #   无论哪种，KV那条腿随后都加载到联合边界，_claim_after_load 把 num_cached_tokens 提升到那里，于是forward在一个状态
+            #   并不覆盖的前缀上恢复。静默的错误输出，没有异常。
             joint_hash = seq.offload_joint.boundary_hash
             state_holds = self._attach_state_slots(
                 seq, joint_hash if joint_hash != -1 else hit_hash
             )
+        # (5) 补齐新块：从 len(block_table) 补到整条序列（len(seq) = num_tokens 个token）所需的本rank block数——和nano-vllm一样，
+        #   准入时一次分配整条prompt（chunked prefill的后续chunk不再分配）；草稿lookahead由调度器随后另外分配
+        #   （_allocate_prefill_draft_lookahead）。_fresh_block 从空闲池取：先给没有hash的空块（id小的先），没有了才给最久没用的
+        #   缓存块，并在这一刻淘汰它的hash（惰性淘汰；淘汰回调 _record_evicted 会记KV事件、并作废同一hash名下的状态checkpoint）
+        #   例：例子(a)的B补3块 → 7、8、9；例子(b)的B补3块 → 6、7、8
         for _ in range(len(seq.block_table), self.num_pool_blocks(len(seq))):
             seq.block_table.append(self._fresh_block())
+        # (6) 复用了多少token，prefill从这里开始（【分支】有状态的模型可能再往前退，见 replay_start）。例：命中4块 → 64
+        #   对比nano-vllm：`seq.num_cached_tokens = num_cached_blocks * self.block_size`；ATOM乘的是hbs（开DCP时 = block_size × DCP）
         seq.num_cached_tokens = num_cached_blocks * hbs
 
         # Per-request cache: claim this seq's slot indices from the
@@ -2199,15 +2503,23 @@ class BlockManager:
         # in ModelRunner.get_num_blocks(), so admitting a seq adds no further
         # paged-block cost. The state pool's free list is the sole admission
         # bound for state cache.
+        # 【译】每请求缓存：从预先分配好的状态张量里为这条seq认领槽位编号（例如GDN的 mamba_k_cache、V4的压缩器环形缓冲）。
+        #   状态这一类在 ModelRunner.get_num_blocks() 给分页类定规模之前就拿走了自己的字节，所以准入一条seq不会再增加任何
+        #   分页block的开销。状态池的空闲表是状态缓存唯一的准入上限。
+        # (7) 【分支】fork类后端（checkpoint是状态池里的空闲槽位，不在KV池里，取新块不会淘汰它），所以放在取完新块之后
         if seq.has_per_req_cache and self.paged_state_checkpoints is None:
             # A joint load aims the state leg at its own boundary, which is
             # above the HBM hit by construction. `num_cached_tokens` stays at
             # the HBM prefix until the KV leg lands, so the forward covers
             # `[hbm, num_prompt)` if anything goes wrong from here.
+            # 【译】联合加载让状态这条腿瞄准它自己的边界，而那个边界按构造就在HBM命中之上。KV那条腿送达之前，num_cached_tokens
+            #   一直停在HBM前缀处，所以从这里开始无论哪里出了问题，forward都会覆盖 [hbm, num_prompt)。
             joint_hash = seq.offload_joint.boundary_hash
             state_holds = self._attach_state_slots(
                 seq, joint_hash if joint_hash != -1 else hit_hash
             )
+        # 标记"本次allocate之后状态还没初始化"：【分支】offload连接器（kv_transfer/offload/hybrid/dsv4/connector.py）读它；
+        #   调度器在这次prefill的forward返回之后把它置True（scheduler.py里 `_state_initialized_after_alloc = True` 处）
         if seq.has_per_req_cache:
             seq._state_initialized_after_alloc = False
         # A claimed joint boundary must have a state leg behind it. The two
@@ -2219,6 +2531,10 @@ class BlockManager:
         # disagreement into a recompute instead, and it is deliberately a
         # separate check from `state_holds` rather than folded into it: it
         # holds even if the code above stops asking the right question.
+        # 【译】一个被认领的联合边界背后必须有状态那条腿。两个决定是在不同地方做出的——can_allocate 选边界，_attach_state_slots
+        #   保证状态——而迄今为止它们每一种不一致的结局都一样：KV那条腿加载到边界，_claim_after_load 认领它，forward在一个
+        #   没有任何状态覆盖的前缀上运行。这是把任何此类不一致转成一次重算的兜底，而且有意作为一个独立于 state_holds 的检查，
+        #   而不是并进去：即使上面的代码不再问对问题，它依然成立。
         if (
             state_holds
             and seq.has_per_req_cache
@@ -2240,13 +2556,20 @@ class BlockManager:
             # canonical blocks would tear another sequence's decode. Keeping the
             # boundary is silent wrong output too, since `has_initial_state`
             # (`gdn_attn.py`) is `num_cached_tokens > 0`.
+            # 【译】边界背后没有状态，就说明它不是这个请求的历史。放弃它——forward从0重算。先把认领的前缀私有化（finding #2）：
+            #   在共享的规范block上重算，会撕坏另一条序列的decode。保留边界同样是静默的错误输出，因为 has_initial_state
+            #   （gdn_attn.py）就是 num_cached_tokens > 0。
+            # (8) 例（GDN）：命中1024块、本该从16384处的checkpoint恢复，但这份checkpoint在探测之后已不在 → state_holds=False →
+            #   disown_claimed_prefix 把认领的共享前缀块逐个换成私有新块（ref_count>1 的块要多占一块），num_cached_tokens=0，从0重算
             if not self.disown_claimed_prefix(seq):
                 # Pool cannot back the private copies; signal the caller to
                 # deallocate and requeue for a clean recompute next pass.
+                # 【译】池子给不出私有副本；通知调用方 deallocate 并重新排队，下一轮干净地重算。
                 return False
             seq.num_cached_tokens = 0
             # Clears only the boundary here, as the pre-record code did -- a
             # partial reset, not a full `reset_joint`.
+            # 【译】这里只清边界，和拆出record之前的代码一样——是部分重置，不是完整的 reset_joint。
             seq.offload_joint.boundary_tokens = 0
             seq.offload_joint.boundary_hash = -1
         return True
@@ -2260,13 +2583,39 @@ class BlockManager:
         else. And at a hit `can_allocate` admitted with no checkpoint behind
         its state (`_replay_hit`, DeepSeek-V4), the state's receptive field,
         `state_replay_tokens`."""
+        # 【译】一次在 start 处恢复的prefill从哪里开始——要足够早，才能重建它的forward在 start 之下要读的东西：在 replay 状态
+        #   传输方式下、且是命中时，重建状态（往前一个hash block）；在完成整个prompt的那次forward里，从末尾往前
+        #   min_final_prefill_rows 行开始（decoder有界重放），并对齐到hash block网格。其他情况就是 start 本身。另外，对
+        #   can_allocate 准入的、状态背后没有checkpoint的命中（_replay_hit，DeepSeek-V4），往前退状态的感受野，即 state_replay_tokens。
+        # 【分支】前置：为什么有状态的模型要"往前退"——见上面 can_allocate 里的【前置：每请求状态与状态checkpoint】：KV命中到N，
+        #   状态却只存在于少数checkpoint处。GDN / KDA / DeepSeek-V4（PAGE或fork checkpoint）在准入时就把命中截到checkpoint
+        #   （_gated_hit：KV命中18432、checkpoint阶梯8192 → num_cached_blocks对应16384），所以 start 已经是checkpoint位置，
+        #   本函数原样返回16384。本函数只处理"不靠checkpoint、靠重算一小段来重建状态"的三种情况：
+        #   ① replay 状态传输（DeepSeek-V4.1 encoder SWA有界重放，--encoder-swa-bounded-replay 默认开：deepseek_v41/backend.py
+        #      的 state_transfer 返回 StateTransfer.replay()）：不存checkpoint、不门控（StateSlotPool.resumable_hit 对replay原样
+        #      返回命中），命中时往前退一个hash block重算，重建128行的滑动窗口。
+        #      例（V4.1 block 128，不支持DCP → hbs=128）：命中80块 → start=10240 → 从10112开始
+        #   ② DeepSeek-V4有界重放（ATOM_DSV4_STATE_REPLAY；_replay_hit 判定"重放比从checkpoint接上省"时 seq.replays_hit=True）：
+        #      往前退 state_replay_tokens。例：命中12800、state_replay_tokens=509 → 从12291开始（不重放就要从8192接上）
+        #   ③ 完成prompt的那次forward至少跑 min_final_prefill_rows 行（DeepSeek-V4.1 decoder SWA有界重放，= sliding_window = 128；
+        #      命中与否都检查）：剩下的不够就往前退，并向下对齐到hbs。
+        #      例（续算partial prefill，hit=False）：prompt 10300、上一个chunk算到10240 → 只剩60行，差68 →
+        #        (10240−68)//128×128 = 10112 → 最后一次forward跑188行
+        #   退回去的那段KV本来就在cache里，重算只为重建状态；hash_blocks 不会把 replay_until 以下的块重新登记
+        # 调用方：scheduler.py的准入（hit=True，start = 命中块数×hbs）、续算partial prefill（hit=False）、PrefillDelayer的探测等，
+        #   都只算起点、不改池子
+        # 对比nano-vllm：没有这一步（prefill总是从 num_cached_tokens 开始）
+        # 没有每请求状态（普通模型），或从0开始：原样返回
         if not (seq.has_per_req_cache and start):
             return start
         hbs = self.hash_block_size
+        # ①（self.state 是StateSlotPool；有PAGE checkpoint时它被建成 StateTransfer.none()，replays 为False）
         if hit and self.state.transfer.replays:
             start -= hbs
+        # ②
         elif hit and self.state_replay_tokens and seq.replays_hit:
             start -= self.state_replay_tokens
+        # ③ short = 还差多少行才够 min_final_prefill_rows（≤0 表示够了；min_final_prefill_rows=0 的模型恒 ≤0）
         short = self.min_final_prefill_rows - (seq.num_tokens - start)
         if short > 0:
             start = (start - short) // hbs * hbs
@@ -2745,33 +3094,103 @@ class BlockManager:
         Left unset it reads `seq.replay_until`, which under pipeline
         parallelism a later chunk's scheduling may already have moved.
         """
+        # 【译】为最近一步"定稿"的block登记hash。
+        #
+        #   在forward完成之后由 scheduler.postprocess() 调用，所以一个block的hash只有在它的KV真正算出来之后才发布。
+        #   `[start, end)` 这个范围覆盖本步完全填满的block：
+        #     start = 第一个"首token位于num_cached_tokens处"的block
+        #     end   = 第一个还没填满的block（不含那个半满的block）
+        #   调用方传入 `num_new_tokens` = 本步forward的token数。一次性prefill就是 `seq.num_tokens - seq.num_cached_tokens`；
+        #   chunked prefill传每个chunk的token数。
+        #
+        #   `start_tokens` 覆盖范围起点的token偏移。流水线并行在调度时就推进了进度，已经把 seq.num_cached_tokens 推过了这个chunk，
+        #   所以head在这里传入该chunk推进之前的偏移。
+        #
+        #   `next_forward_tokens` 传给 `checkpointers_at`，见那里。不传时取prompt的剩余部分，这正是prefill时的答案。
+        #
+        #   `replay_until`：如果forward是从某个点下方开始的，这就是forward恢复的那个点，取batch被调度时的值
+        #   （`ScheduledBatch.replaying`）。它下方的任何东西都不发布、也不做checkpoint：那些block属于命中部分，而一个结束在它
+        #   下方的forward留下的重放状态仍不精确。正好结束在它上面的forward同样什么都不发布，但DeepSeek-V4的有界重放
+        #   已经在那里把状态完整重建了，所以那里可以做checkpoint。
+        #   不传时读 `seq.replay_until`，而在流水线并行下，后面某个chunk的调度可能已经把它挪动了。
+        # 解释：start实际按 max(base, until) // hbs 算，即包含起点token的那个block——它可能在上一个chunk里写了一半，本步才写满
+        #
+        # ═══════════════ hash_blocks：把"KV已经算好的满block"登记进前缀缓存索引（A级） ═══════════════
+        # 调用方（grep核对，都在forward之后）：
+        #   Scheduler.postprocess          非PP：每条prefill序列，在 num_cached_tokens += chunk 之前；
+        #                                  PP（advance_on_schedule）：用batch里冻结的chunk起点传start_tokens
+        #   Scheduler.register_prefill_hashes  PP的中间chunk（不经postprocess），由pp_engine_core._flush_pending_prefix_hashes调用
+        #   Scheduler.postprocess 的 batch=None 分支（RapidServe的DecodeEngineCore）：一次性登记整段prompt
+        #   hash_decode_blocks（下面）      decode生成的block，aimed=False
+        #
+        # 链式hash（prefix_hash.block_hash；本类的compute_hash就是它）：
+        #   h_-1 = seq.cache_seed   纯文本 = -1，表示"没有父hash"；多模态 = multimodal_cache_seed(媒体数据)：
+        #                           像素、图像网格、token类型和embedding_spans的64位blake2b摘要（multimodal_runtime.py）
+        #   h_i  = xxh64( h_{i-1}的8字节小端 ‖ 第i块token按int64排列的字节 )；h_{i-1} = -1 时只hash token字节
+        #
+        #   token：[0 ...... hbs-1][hbs .... 2hbs-1][2hbs ... 3hbs-1][3hbs .. 半满]
+        #   hash ：  h0=H(种子,块0) ─► h1=H(h0,块1) ──► h2=H(h1,块2) ──► 不登记
+        #   hbs = hash_block_size = block_size × DCP（不开DCP时就是block_size，默认16；DCP下一个block_table条目
+        #     对应 block_size × DCP 个全局token，前置知识见scheduler.py文件开头【前置⑥】）
+        #   h2相同 ⇔ 种子相同且块0~2的token全同：同一段文字配不同的图片，种子不同，从h0起就全不一样，不会误命中
+        #
+        # 为什么只在forward之后登记：allocate时只是把block号写进block_table，GPU上那些行还没写。这时就登记的话，别的请求可能
+        #   复用一个KV还没写——甚至永远不会写（这条请求在forward之前被抢占、取消）——的block；chunked prefill下一个block还可能
+        #   跨两步才写满。半满的block也不登记：它后面的token还没来，hash不是最终值，内容也不完整。
+        #     步N 调度：A准入，物理block 9 = A的块3（未登记）     步N forward：GPU写块3的KV
+        #     步N postprocess：本函数登记 h3 → block 9           之后准入的请求才能命中h3
+        #
+        # 例（hbs=16）：本步是chunk [40, 90)，即base = 40、num_new_tokens = 50
+        #   start = 40//16 = 2（块2 = [32,48)：32~39是上一个chunk写的，40~47本步写，本步才满）
+        #   end   = 90//16 = 5（块5 = [80,96)只写到89，半满，不登记）
+        #   → 登记块2、3、4；num_hashed_tokens = 5×16 = 80；本次forward结束于pos = 90，再交给checkpointers_at判断要不要存状态
+        # 对比nano-vllm：nano-vllm的hash_blocks也在postprocess里调、也只登记 [start, end) 里填满的block，这条规则相同。
+        #   ATOM多处理了：PP在调度时就推进了num_cached_tokens（start_tokens）、有界重放（replay_until）、DCP（按hbs分块）、
+        #   多模态种子、复用准入时 / 前端已算好的prompt hash链（known）、KV事件、状态checkpoint与midstep快照（函数末尾）
         if not self.enable_prefix_caching:
             return
         hbs = self._hash_block_size()
         base = seq.num_cached_tokens if start_tokens is None else start_tokens
         # A replaying forward's rows below where it resumed are published.
+        # 【译】重放forward中位于它恢复点以下的那些行，是（早已）发布过的。
+        # 解释：有界重放（sequence.py Replay类上方科普④）从命中点下方开始重算一段，只为重建状态；那段block属于命中部分，
+        #   早就登记过，所以起点取 max(base, until)
         until = seq.replay_until if replay_until is None else replay_until
         start = max(base, until) // hbs
         end = (base + num_new_tokens) // hbs
         # A finished or preempted seq has had its block table released; the
         # deferred publish paths can still reach it with a stale token count.
+        # 【译】已结束或被抢占的seq已经释放了它的block table；延迟发布的路径仍可能带着过时的token计数走到这里。
+        # 解释：deallocate清空了block_table，end被截成0，下面直接返回
         end = min(end, len(seq.block_table))
+        # 没有新填满的block就返回。唯一例外：DeepSeek-V4有界重放的forward正好结束在until上——不发布block，
+        #   但可以在那里存状态checkpoint（见docstring）
         if start >= end and not (
             seq.replays_hit and until and base + num_new_tokens == until
         ):
             return
+        # 父hash：start = 0时是cache_seed，否则是前一个block上登记的hash；前一个block没登记（-1）说明调用顺序有bug，
+        #   整段跳过而不是造出错误的hash（_chain_parent_hash）
         h = self._chain_parent_hash(seq, start)
         if h is None:
             return
         # Watermark for the decode-side continuation, maintained here so every
         # prefill path feeds it without knowing about it.
+        # 【译】给decode侧续登记用的水位线，在这里维护，这样每条prefill路径都会顺带更新它、而不必知道它的存在。
+        # 解释：num_hashed_tokens = 已登记的token数（总是hbs的整数倍），hash_decode_blocks从这里接着登记
         seq.num_hashed_tokens = max(seq.num_hashed_tokens, end * hbs)
+        # 【分支】KV事件（见文件末尾的KV event API）：把本次登记的一串block合成一条BlockStored。start = 0时父hash就是
+        #   cache_seed：纯文本为-1 → 事件里写None；多模态则把媒体种子当作父hash发出去
         record = self._event_log is not None
         store_run_parent: int | None = h if h != -1 else None
         store_run_hashes: list[int] = []
         store_run_tokens: list[int] = []
         # Prompt blocks the seq's chain covers (`_prompt_hashes`) are named
         # from it; only the rest are hashed here.
+        # 【译】seq的hash链（`_prompt_hashes`）覆盖到的prompt block直接从链上取名字；只有其余的block才在这里现算hash。
+        # 解释：known = 准入时为这条序列算好的（或前端算好随请求送来、_adopt_shipped_chain校验过的）整段prompt hash链，
+        #   只含prompt里填满的block；种子对不上、或链上第start-1个与刚取到的父hash不一致时不用它。省掉调度线程里的一遍xxhash；
+        #   链之外的（decode生成的block）照常现算
         known = self._prompt_hash_chains.get(seq)
         known = known[1] if known and known[0] == seq.cache_seed else ()
         if 0 < start <= len(known) and known[start - 1] != h:
@@ -2779,6 +3198,8 @@ class BlockManager:
         for i in range(start, end):
             token_ids = self._hash_block_tokens(seq, i)
             h = known[i] if i < len(known) else self.compute_hash(token_ids, h)
+            # kv.publish（block_pool.py）：block记下(h, 本块token)，索引 h → 这个block。h已经指向别的block时改指向这个
+            #   （后发布者胜出，并通知prefix walk的memo失效）；这个block原先挂着别的hash则先摘掉那个旧条目
             self.kv.publish(seq.block_table[i], h, token_ids)
             if record:
                 store_run_hashes.append(h)
@@ -2793,6 +3214,9 @@ class BlockManager:
                     token_offset=start * hbs,
                 )
             )
+        # 【分支】状态checkpoint（见下方checkpoint_limit上方的【科普】状态checkpoint阶梯）：pos = 本次forward结束的位置，
+        #   checkpointers_at选出要在这里存快照的状态类。快照归档在h名下，h = 刚登记的最后一个block（块end-1，恰好结束在pos）
+        #   的hash——所以能存的pos都是hbs的整数倍；last_checkpoint_pos供decode侧"离上一个checkpoint够远"的间距规则使用
         pos = base + num_new_tokens
         kept = self.checkpointers_at(seq, pos, next_forward_tokens, aimed)
         for cache in kept:
@@ -2804,8 +3228,28 @@ class BlockManager:
         # the forward for `[base, base + num_new_tokens)` has completed, which
         # is precisely when the reserved bytes exist. A no-op with nothing
         # reserved, so decode and unreadable backends pay a branch.
+        # 【译】同一时刻的midstep那一半。放在这里而不是三个prefill调用处各放一份，因为这正是它们的共同点：
+        #   `[base, base + num_new_tokens)` 的forward已经完成，这恰恰是预留的字节已经存在的时刻。没有预留时是空操作，
+        #   所以decode和不能中途读的后端只付出一次分支判断。
         self.commit_midstep(seq)
 
+    # ═══════════════ hash_decode_blocks：decode生成的block写满后也登记进前缀缓存（A级） ═══════════════
+    # 调用方：Scheduler.postprocess每步对每条序列调用一次，committed_kv_len = num_tokens − (延迟输出 ? 0 : 1)，
+    #   next_forward_tokens = Scheduler._checkpoint_room（本步就结束、或投机解码 + fork类状态时为0，否则为1）
+    # 为什么要登记生成部分：多轮对话下一轮的prompt = 上一轮prompt + 上一轮回答 + 新问题；只登记prompt的话，
+    #   回答那一段每一轮都要重算
+    # 例（hbs = 16，按不开延迟输出算，数字好读）：prompt 16380个token
+    #   prefill：hash_blocks登记块0~1022（16380//16 = 1023块），num_hashed_tokens = 16368；
+    #     块1023 = [16368, 16384)里只有12个prompt token，半满不登记
+    #   decode生成g0~g3，依次写位置16380~16383：每步本函数都被调用，committed ≤ 16383时 start = end = 1023，什么都不登记
+    #   算位置16383（输入g3）的那一步之后：采样出g4，num_tokens = 16385 → committed_kv_len = 16384
+    #     → hash_blocks(seq, 16, start_tokens=16368, aimed=False) → 登记块1023：h1023 = H(h1022, 12个prompt token + g0~g3)，
+    #       num_hashed_tokens = 16384；下一轮"本轮prompt + 回答 + …"的请求就能命中到这里
+    #   开延迟输出时同一个block早一次postprocess登记：那时位置16383的KV由一个已经发出、排在同一条stream上的forward写，
+    #     之后任何请求读它时它一定已经写完
+    # 对比nano-vllm：nano-vllm的decode也走同一个hash_blocks（decode时num_scheduled_tokens = 1、num_cached_tokens每步+1），
+    #   生成的block同样会登记；ATOM的decode不累加num_cached_tokens（sequence.py里num_cached_tokens的说明），所以单独用
+    #   num_hashed_tokens做水位线，并用committed_kv_len这条硬线挡住延迟输出的在途token和被拒绝的投机草稿
     def hash_decode_blocks(
         self, seq: Sequence, committed_kv_len: int, next_forward_tokens: int = 0
     ) -> None:
@@ -2831,6 +3275,20 @@ class BlockManager:
         defaults to "no next forward", i.e. hash but never checkpoint, so a
         caller opts into decode-point checkpointing rather than out of it.
         """
+        # 【译】为已填到 `committed_kv_len` 的生成block登记hash。
+        #
+        #   `may_append` 分配decode block时不算hash：分配时这些token还没采样出来，而在投机解码下，forward写的一部分
+        #   马上就要被拒绝。
+        #
+        #   `committed_kv_len` 统计的是这两条都不再成立的token——id已定、KV已算——它是一条硬线，不是提示。它停在任何还没被
+        #   forward读过的token之前：那个token的KV槽位要由下一次forward来写，而一个盖在未写槽位上发布出去的block，会把一份可能
+        #   永远不会到来的KV交给后来的请求（这条seq可能先结束）。prefill的 `hash_blocks` 从它自己那一侧划了同一条线，
+        #   在 `num_cached_tokens + chunk` 处。
+        #
+        #   没有这个函数，前缀缓存只索引prompt block，后续的一轮——上一轮prompt加上一轮回答——除了原始prompt之外什么都匹配不上。
+        #
+        #   `next_forward_tokens` 传给 `checkpointers_at`，见那里。默认是"没有下一次forward"，即只登记hash、从不做checkpoint，
+        #   所以调用方是主动选择在decode点做checkpoint，而不是主动退出。
         if not self.enable_prefix_caching:
             return
         base = seq.num_hashed_tokens
@@ -2843,9 +3301,24 @@ class BlockManager:
                 # Generation cannot choose where a step ends, least of all a
                 # speculative one, so it is held to spacing rather than to the
                 # grid.
+                # 【译】生成阶段无法选择一步在哪里结束，投机步更是如此，所以它受间距约束而不受网格约束。
+                # 解释：见checkpointers_at的unaimed分支（hash block边界 + 离上一个checkpoint ≥ interval）
                 aimed=False,
             )
 
+    # 【分支】每请求状态的fork（只用于"rolling"状态类StateSlotPool，即StateTransfer.fork；第4批state_pool.py）
+    # 前置：GDN等线性注意力层每请求只有一份定长状态（Qwen3-Next一层约52万个数），放在状态池的一个"槽位"里。走fork的后端
+    #   做checkpoint和恢复都靠"换槽位"，不另外拷贝：
+    #     做checkpoint（StateSlotPool.checkpoint）：forward结束在边界P时，当前槽位S里正是P处的状态 → 把S交给hash索引，
+    #       变成只读的checkpoint，序列换到新槽位S'；下一次forward从S读初始状态、写进S'
+    #     从checkpoint恢复（_attach_state_slots）：新请求拿新槽位S'，第一次forward从checkpoint槽位S读、写进S'
+    #   两种都叫fork：seq.state_fork_src = S。fork之后的那次forward至少要带min_fork_tokens个token才能把S'写完整
+    # 本函数：那次forward太短时取消fork——不写新槽位，直接把S接过来当自己的槽位（S上的checkpoint随之作废）：
+    #   做checkpoint的那种 → 等于没存；恢复的那种 → 变成独占式命中（S不再留给别人）
+    #   S还被同一步的另一个请求读（pin_count > 1）时不能接管，返回False，调用方改为把chunk撑到min_fork_tokens
+    # 调用方：Scheduler._finalize_prefill_chunk（chunk < state.min_fork_tokens 时）
+    # 观察：现有走fork的后端都声明fork(1)（gdn_attn.py、kimi_mla_gdn_attn.py），min_fork_tokens = 1，而chunk总 ≥ 1，
+    #   所以目前只有fork_tokens > 1的后端（如tests/test_state_checkpoint.py里的MIN_FORK = 8）才会走到取消这一步
     def cancel_state_fork(self, seq: Sequence) -> bool:
         """Undo a pending fork by adopting its source slot.
 
@@ -2862,11 +3335,20 @@ class BlockManager:
         a slot that request's forward still has to read. The caller keeps the
         fork instead and must not shorten the forward below `min_fork_tokens`.
         """
+        # 【译】通过接管源槽位来撤销一次待执行的fork。
+        #
+        #   当本来要承载这次fork的forward短到填不满一个新槽位（`min_fork_tokens`）时调用。两种fork都归结为同一个动作——
+        #   把源槽位接过来当这条seq的已提交槽位，并花掉它上面的checkpoint：一次恢复变成不共享的命中，一次checkpoint
+        #   变成根本没有checkpoint。只有已提交槽位易手；投机解码的scratch槽位留在原处，因为源槽位从来没带过它们。
+        #
+        #   如果同一步里还有另一个请求也要从这个源fork，就无法接管，返回False：接管意味着往一个那个请求的forward
+        #   还要读的槽位里写。此时调用方保留fork，并且不能把forward缩短到 `min_fork_tokens` 以下。
         src = seq.state_fork_src
         if src < 0:
             return True
         if self.state.pin_count(src) > 1:
             return False
+        # 新槽位S'还回空闲列表；invalidate：把S上的checkpoint从hash索引里摘掉（这条序列马上要接着往S里写）
         self.state.release(seq.state_slot)
         self.state.invalidate(src)
         # Both flavours of source are pinned — held off the free list for the
@@ -2875,11 +3357,68 @@ class BlockManager:
         # `checkpoint` handed its source straight back, so adopting it meant
         # claiming it off the free list, and `pin_count` then undercounted the
         # readers this refuses to overwrite.
+        # 【译】两种源都是被pin住的——为了必须读它们的那次forward而不放回空闲列表——所以接管一个源只是丢掉本请求对它的认领。
+        #   以前这和源是哪一种有关：`checkpoint` 会把它的源直接还回去，所以接管它意味着从空闲列表里把它认领回来，
+        #   而 `pin_count` 随之会少算本函数拒绝覆盖的那些读者。
         self.state.unpin(src)
         seq.state_slot = src
         seq.state_fork_src = -1
         return True
 
+    # ════════ 【分支】状态checkpoint阶梯（ladder）：存在哪些位置、什么时候切chunk、什么时候真的存（B级，第4批） ════════
+    # 【科普】前置（要点；完整讲解见arg_utils.py EngineArgs.state_checkpoint_interval_tokens上方的【科普】、
+    #   sequence.py Replay类上方的"科普：状态checkpoint与有界重放"）
+    #   ① MHA/GQA的KV按token一行一行存，前缀命中到哪就从哪接着算。线性注意力层（GDN：Qwen3-Next / Qwen3.5；KDA：Kimi-K3）
+    #      每请求只有一份定长状态S（Qwen3-Next一层GDN ≈ 32头×128×128 ≈ 52万个数），每来一个token原地覆盖；DeepSeek-V4的
+    #      128窗口环形缓冲和压缩器没凑满的尾巴也一样。算到位置P时"P处的状态"只存在一瞬间
+    #   ② 想让以后的请求从P接上，就得当时把状态另存一份 = 状态checkpoint，归档在"块P/hbs−1的链式hash"名下——和KV block
+    #      共用一条hash链：KV命中到第k块后，再问状态池"h_{k-1}名下有没有快照"（_gated_hit），没有就往回找更短的
+    #   ③ 状态一般只在forward的最后一个token处是完整的（中间位置的状态在kernel里一闪而过），所以要在P处存，就得让某次
+    #      forward恰好结束在P：把prefill chunk截短到P——多一次forward，这是放checkpoint的主要代价
+    #      （例外：能在forward中途读快照的后端，见下方midstep_positions上方的说明）
+    #   ④ 每个checkpoint都占一份状态大小的存储（PAGE路径从KV池借单元，fork路径占一个状态槽位），所以只放在少数位置
+    #
+    #   三种位置（都是hash_block_size的整数倍，否则算不出hash，存了也找不到）：
+    #     阶梯（rung）   每interval个token一级（--state-checkpoint-interval-tokens，默认8192）："猜"复用会从哪里接上。
+    #                   一次forward只取不超过它终点的最右一级（同一个类，右边一级覆盖左边一级），且不超过checkpoint_limit
+    #     需求（demand） 准入时KV命中被状态门控截短，就把"本来能命中到的位置"记成这条序列自己的一级（_record_checkpoint_demand）：
+    #                   发现缺口的请求反正要从更低处重算，顺手在缺口处存一份，下一个同前缀的请求就能接满
+    #     锚点（anchor） 本prompt的末尾，退到hash block边界（_record_checkpoint_end）：多轮对话的下一轮
+    #                   "上一轮prompt + 回答 + 新问题"正好从这里接上（源码实测：cc-traces里93.5%的恢复落在上一轮prompt末尾）
+    #   interval取值：>0 阶梯开；0 checkpoint全关；-1 只有demand和锚点（见__init__里state_checkpoint_interval_tokens处）
+    #
+    #   谁做什么：
+    #     准入（can_allocate → _evaluate）    _record_checkpoint_demand、_record_checkpoint_end：记下demand / 锚点位置
+    #     调度（Scheduler._finalize_prefill_chunk）  checkpoint_cut：在(起点, 终点]里挑最早的候选，把chunk截到那里
+    #     forward之后（hash_blocks）          checkpointers_at：forward结束在pos，哪些状态类在这里存
+    #     两边必须逐个位置一致：切了却不存 = 白多一次forward；该存的位置没切 = forward越过去，状态已不是那里的了
+    #
+    #   例（DeepSeek-V4：hash_block_size = 256，copy式PAGE checkpoint、successor_room = 0、不能中途读；interval 8192，
+    #     每步预算max_num_batched_tokens = 16384，ATOM_STATE_CHECKPOINT_END_MARGIN = 0；数字按本区段各函数的公式推算）
+    #   请求A：40000个token的prompt，冷缓存
+    #     准入：checkpoint_limit = (40000 − 0)//8192×8192 = 32768；锚点 = (40000 − 0)//256×256 = 39936
+    #           （上限 (ceil(40000/256) − 1)×256 = 156×256 = 39936，不变）；demand = 0（没有被拒绝的命中）
+    #     ┌────┬───────┬──────────┬──────────────────────────────┬────────────────┬─────────────────┬────────────────────────┐
+    #     │ 步 │ 起点  │ 预算终点 │ (起点, 终点]里的候选         │ checkpoint_cut │ 本步forward     │ 结束处存不存           │
+    #     ├────┼───────┼──────────┼──────────────────────────────┼────────────────┼─────────────────┼────────────────────────┤
+    #     │ 1  │ 0     │ 16384    │ 阶梯16384（8192被它覆盖）    │ 16384 = 终点   │ [0, 16384)      │ 存（在网格上）         │
+    #     │ 2  │ 16384 │ 32768    │ 阶梯32768                    │ 32768 = 终点   │ [16384, 32768)  │ 存                     │
+    #     │ 3  │ 32768 │ 40000    │ 锚点39936（32768不在区间内） │ 39936，截短    │ [32768, 39936)  │ 存（= 锚点）           │
+    #     │ 4  │ 39936 │ 40000    │ 无                           │ 0              │ [39936, 40000)  │ 不存（不在网格上）     │
+    #     └────┴───────┴──────────┴──────────────────────────────┴────────────────┴─────────────────┴────────────────────────┘
+    #     → A留下3个checkpoint：16384、32768、39936（步3计入chunks_cut_for_end）；8192、24576从没成为某次forward的终点，所以没有
+    #       （预算若够一步算完整个prompt：步1的候选是32768和39936，取最早的32768 → 只留32768、39936，共3次forward）
+    #   请求B：与A共享前30000个token，总长也是40000
+    #     准入：KV链逐块命中到块116（117块 = 29952个token；块117 = [29952, 30208)含分叉点30000，未命中）→ compressed_hit = 117
+    #           状态门控：117块以内A只在16384（前64块的边界）有checkpoint → hit = 64块，B从16384开始prefill
+    #           假设处处都有checkpoint（assume_checkpointed）能命中117块 → demand = 117×256 = 29952
+    #     步1：起点16384、预算终点32768，候选{阶梯32768, demand 29952} → 截到29952（chunks_cut_for_demand + 1），存
+    #     步2：[29952, 32768) 落在阶梯上，存；步3：[32768, 39936) 落在锚点上，存；步4：[39936, 40000)
+    #   请求C：又一个共享前30000个token的请求 → 直接命中到29952（B在缺口处补的那一级），不再产生demand
+    #     ——"发现一次、填一次、就收敛"（_record_checkpoint_demand的docstring）
+    #   decode阶段（hash_decode_blocks，aimed=False）：不要求落在网格上，只要在hash block边界上、且离上一个checkpoint
+    #     ≥ interval：A的prompt最后一个checkpoint在39936 → 生成到48128（= 39936 + 8192，正好是256的倍数）时再存一个
+    # 对比nano-vllm：nano-vllm只支持纯KV的模型，前缀命中就是KV命中，没有这一整套
     def checkpoint_limit(self, seq: Sequence) -> int:
         """Rightmost prompt position any state class may checkpoint at, 0 none.
 
@@ -2893,11 +3432,25 @@ class BlockManager:
         nothing: a demand rung sits outside the grid and `checkpoint_cut`
         takes it either way.
         """
+        # 【译】任何状态类可以做checkpoint的最右prompt位置，0表示没有。
+        #
+        #   这是针对prefill求解的 `checkpointers_at`：阶梯上的最后一级，它仍给伸得最远的那个类留下 `successor_room` 个prompt
+        #   token去forward。单独做成一个方法，是因为调度器需要提前知道这个上界，好把prefill chunk切得落在阶梯上。
+        #
+        #   0表示网格在这条prompt上放不下任何一级——所有短于一个间隔的prompt都是如此，还有别的情况。它不表示这条seq什么都不存：
+        #   demand那一级在网格之外，`checkpoint_cut` 无论如何都会取它。
+        # 解释：successor_room = 存完checkpoint之后的那次forward至少要带的token数：PAGE（copy）类为0，fork(n)类为n，
+        #   replay / none类为inf（根本不能存）。limit = (prompt长度 − room) // interval × interval
+        #   例：P = 40000、PAGE类 → 40000//8192×8192 = 32768；P = 8192、fork(1)类 → (8192 − 1)//8192×8192 = 0——在8192处存的话，
+        #     prompt已没有token留给后继forward去写新槽位；锚点、demand不受这个上限约束
         interval = self.state_checkpoint_interval_tokens
         if interval <= 0:
             return 0
         # The smallest room reaches furthest right, and `inf` — no class can
         # checkpoint this seq at all — falls out as 0 without a special case.
+        # 【译】最小的room伸得最远；`inf`——没有任何类能给这条seq做checkpoint——不用特判就会得到0。
+        # 观察：紧接着的 `if isinf(room)` 正是一个特判，而且必需：(P − inf)//interval 得到nan，int(nan) 会抛ValueError。
+        #   没有任何类适用时 min 取 default=inf，同样走这条特判
         room = min(
             (c.successor_room for c in self.state_caches if c.applies(seq)),
             default=inf,
@@ -2956,6 +3509,33 @@ class BlockManager:
         scores the two identically, which is the signature of a harness that
         models eviction order but not the cost of the write.
         """
+        # 【译】以反事实的方式再问一次命中，并把差距变成一级阶梯。
+        #
+        #   每当门控把命中截短，都值得在"所有阶梯都稠密"的前提下把同一个问题再问一遍：本来能到多远？这样找回的是只因为没人
+        #   在那里做checkpoint才被拒绝的复用；找不回的，是不管谁存什么都已经没了的部分。两者分别记进 `num_wanted_hit_blocks`
+        #   （`EngineStats` 用它拆分被拒绝的复用）和 `checkpoint_demand_pos`（阶梯据此行动）。
+        #
+        #   demand是这条seq自己的一级，不在间隔网格上；而发现缺口的seq正是最适合填它的那一个：它拿不到这部分复用，
+        #   反正都得把这段前缀算一遍。
+        #
+        #   在这里、两个数都在手边时就做决定，而不是交给读取方：`hit` 之后只以 `seq.num_cached_tokens` 的形式存在，而调度器会
+        #   随着chunk落地推进它——在流水线并行下，等 `hash_blocks` 运行时它已经越过了这个chunk，所以拿它比较的读取方恰恰会在
+        #   为它而截短的那次forward上把demand丢掉。
+        #
+        #   demand不用间隔来衡量。网格是在猜复用会从哪里接上；demand是请求过却被拒绝的复用，猜测的粒度不是丢弃它的理由——
+        #   用一个去卡另一个，曾让所有短于一个间隔的prompt把它们本有的复用全部拒掉。这个位置和命中出自同一个可fork测试，
+        #   所以总满足 `num_prompt_tokens - pos >= successor_room`：确实有人能存下它。
+        #
+        #   为此付代价的形状是一个模板头部，它的checkpoint在任何人用到之前就被作废了——此时每个请求都切一刀chunk，却没有一个
+        #   能用上。约束它的是收敛而不是阈值：发现一次、填一次、就没了。如果不收敛，会体现在 `chunks_cut_for_demand`
+        #   相对 `demands_recorded` 的比值上。
+        #
+        #   `--no-state-checkpoint-demand` 去掉这一级，只保留prompt末尾锚点。值得测一测：这一级占了大部分写流量，却只带来很少
+        #   的读回（`StateSlotPool.mark_speculative` 里有数字），而且每次写都会淘汰点什么。到底*去掉*这些写更好，还是只*降级*
+        #   它们更好，仍是悬而未决的问题——CPU重放给两者打了同样的分，这正是一个只模拟淘汰顺序、不模拟写入成本的测试框架的特征。
+        # 解释（数字见上方checkpoint_limit处【科普】的请求B）：compressed_hit = 117块（KV命中）、hit = 64块（状态门控之后）
+        #   → 反事实命中 wanted = _gated_hit(assume_checkpointed=True) = 117 → demand = 117 × hash_block_size = 29952
+        #   调用方：_evaluate（can_allocate与can_allocate_memoized共用），在算完本次准入要拿的num_new_blocks之后
         wanted = (
             self._gated_hit(seq, compressed_hit, block_hashes, assume_checkpointed=True)
             if hit < compressed_hit
@@ -2966,6 +3546,8 @@ class BlockManager:
         # nothing then, so a cut for a demand would buy nothing either. -1 is
         # the other thing: the interval grid is off but checkpointing is on, and
         # the demand rung is one of the two placements that then carries it.
+        # 【译】0会彻底关掉checkpoint——那时 `checkpointers_at` 什么都不存，所以为demand切chunk也换不来任何东西。-1是另一回事：
+        #   间隔网格关了但checkpoint还开着，此时demand这一级正是承担它的两种放置之一。
         interval_on = self.state_checkpoint_interval_tokens != 0
         demand = (
             wanted * self.hash_block_size
@@ -2978,6 +3560,9 @@ class BlockManager:
         # there, for a branch at that exact hit that may never come:
         # conversations resume at prompt ends, which the anchor covers, the
         # hit included (`scheduler._cut_floor` lets it land there).
+        # 【译】重放式命中（`_replay_hit`）本来就够到 `wanted`，而且重放限定了缺checkpoint的代价。再放demand的话，会把每个重放准入
+        #   的forward都截在命中处、并在那里写一个checkpoint，只为了一个也许永远不会来的、恰好在这个命中处分叉的请求：对话都在
+        #   prompt末尾恢复，那里由锚点覆盖，命中处也包括在内（`scheduler._cut_floor` 允许切点落在那里）。
         if seq.replays_hit:
             demand = 0
         # A demand is an instruction to cut a prefill chunk onto a rung, and
@@ -3004,6 +3589,19 @@ class BlockManager:
         # gate removes is the loss that was knowable at admission;
         # `checkpoints_dropped` is what counts the rest, and the two are meant
         # to be read together.
+        # 【译】demand是"把一个prefill chunk截到某一级上"的指令，这一刀要请求多付一次forward。为一次 `begin_store` 马上就会拒绝的
+        #   存储买这一刀，是整个漏斗里唯一纯粹的损失——上面的归因无论如何都保留，因为复用确实是因缺checkpoint而被拒绝的。
+        #
+        #   每次尝试都重新问，因为这才是要问的问题：池子有空间时记下的demand，在池子没空间之后就不再负担得起，让先前的答案继续
+        #   生效，恰恰就是这道门要扣下的那一刀。不能重复的是*计数*，所以seq自己带一个标记，而不是让门去读它正要覆盖的位置。
+        #
+        #   问的时候把这次准入自己的block算进去，因为它们先被拿走：一个放得下一份镜像、却放不下"请求 + 镜像"的池子，在这里会
+        #   回答"能"，然后在 `begin_store` 拒绝——那一刀已经买了，漏斗里却什么都看不出来。
+        #
+        #   它仍然只是一次采样。存储发生在许多次forward之后、在这一刀造出的那一级上，面对的池子早已变了——这里问的任何问题都不
+        #   可能就是 `begin_store` 将来问的那个。这道门去掉的是准入时就能知道的损失；其余的由 `checkpoints_dropped` 计数，
+        #   两者要放在一起看。
+        # 解释：_checkpoint_has_room只对PAGE checkpoint有意义（镜像从KV池借单元）；fork类checkpoint不占额外容量，总返回True
         if demand and not self._checkpoint_has_room(live_blocks, protected_hash):
             self.demands_declined_no_room += not seq.checkpoint_demand_declined
             seq.checkpoint_demand_declined = True
@@ -3015,6 +3613,8 @@ class BlockManager:
         # decline above: a decline zeroes the position, so the position alone
         # would let a recorded demand be counted twice the next time the pool
         # has room.
+        # 【译】在demand第一次出现时计数，而不是每次尝试都计——否则一个被推迟的请求会抬高上面收敛检查所对照的分母。
+        #   和上面的拒绝用不同的标记：一次拒绝会把位置清零，只看位置的话，一个已记录的demand会在下次池子有空间时被算两次。
         if demand:
             self.demands_recorded += not seq.checkpoint_demand_counted
             seq.checkpoint_demand_counted = True
@@ -3039,6 +3639,19 @@ class BlockManager:
         forward that actually lands. Applying it here as well keeps the cut and
         the keep from disagreeing, which is the standing contract between them.
         """
+        # 【译】把本prompt自己的末尾保留为一个恢复点。
+        #
+        #   阶梯在猜复用会从哪里接上，demand要晚一次拒绝才学到。两者都覆盖不了agentic流量里占主导的情形：一段对话的下一轮把
+        #   整个prompt重发一遍、再接着往后写。那会在*这个*prompt的末尾恢复，而唯一有机会在那里留下checkpoint的请求就是这一个。
+        #
+        #   在SemiAnalysis的cc-traces上测得（4,808次KV命中非零的恢复）：93.5%落在上一个prompt的末尾，0.0%落在8192阶梯上。
+        #
+        #   和demand一样，它按构造就不在网格上：`checkpoint_limit` 约束的是*阶梯*，而一个短于一个间隔的prompt一级都放不下，
+        #   却仍然完全可以作为恢复点。但 `successor_room` 测试不能省——正是它让这个位置能被存下，而 `checkpointers_at` 会针对
+        #   真正落地的forward再检查一次。这里也做一次，能让"切"和"存"不打架，这是两者之间的长期约定。
+        # 解释：锚点 = min( (P − room)//hbs×hbs , (ceil(P/hbs) − 1)×hbs )，room = max(successor_room, min_final_prefill_rows,
+        #   ATOM_STATE_CHECKPOINT_END_MARGIN)。例：DeepSeek-V4，P = 40000、hbs = 256、room = 0 → 39936（上方【科普】的表）
+        #   调用方：_evaluate，每次准入都重算（所以deallocate把它清零）
         seq.checkpoint_end_pos = 0
         if not self.state.enabled:
             return
@@ -3047,6 +3660,9 @@ class BlockManager:
         # anchor recorded here anyway would still be cut for — a shortened
         # prefill chunk on every prompt, storing nothing, with no error to
         # show for it. Pinned by `test_interval_zero_anchors_nothing`.
+        # 【译】0是整个checkpoint功能的关闭开关，而不只是关掉网格，`checkpointers_at` 通过拒绝每个位置来执行它。若照样在这里记下
+        #   锚点，调度器仍会为它切chunk——每条prompt都多切一刀prefill chunk，什么都不存，也没有任何报错。
+        #   由 `test_interval_zero_anchors_nothing` 钉住。
         if self.state_checkpoint_interval_tokens == 0:
             return
         room = min(
@@ -3058,6 +3674,9 @@ class BlockManager:
         # A forward resuming there and finishing the prompt with fewer rows
         # than the model's final forward runs would back off below it
         # (`replay_start`), recomputing what the checkpoint saves.
+        # 【译】一个从那里恢复、而结束prompt时的行数少于模型最后一次forward所需行数的forward，会退到它下方（`replay_start`），
+        #   把checkpoint省下的部分又重算一遍。
+        # 解释：min_final_prefill_rows只有DeepSeek-V4.1设（= sliding_window，见config.py），其余模型为0
         room = max(room, self.min_final_prefill_rows)
         # The next turn re-renders this prompt's last few tokens (the chat
         # template's generation prompt), so an anchor must sit before them too.
@@ -3071,6 +3690,15 @@ class BlockManager:
         # wider than a block costs a verbatim resend several blocks, and a
         # prompt shorter than `margin + block` keeps no anchor (`end` below is
         # 0). Pinned by `TestPromptEndAnchorTemplateMargin`.
+        # 【译】下一轮会重新渲染这个prompt的最后几个token（chat template的生成提示），所以锚点也必须落在它们之前。
+        #   在Qwen3.5 AgentX上测得：不留余量时，长度为16k + 1的prompt把分叉点放进了锚点所在的block，它们的后续请求282次里
+        #   只有1次从锚点恢复（其他情况下是95.6%）。
+        #
+        #   取room和余量中较大的一个，而不是两者之和。与不留余量相比，锚点最多后退 `ceil((margin - room) / block)` 个block——
+        #   对Qwen3.5的5、PAGE的room 0来说是一个——所以比一个block还宽的余量，会让原样重发的请求少复用好几个block，
+        #   而短于 `margin + block` 的prompt一个锚点都留不下（下面的 `end` 为0）。由 `TestPromptEndAnchorTemplateMargin` 钉住。
+        # 解释：例（hbs = 16）：P = 16385。不留余量：锚点 = 16385//16×16 = 16384，而下一轮在16380附近就分叉，分叉点落在
+        #   块1023 = [16368, 16384)里，锚点的hash永远对不上；余量5：(16385 − 5)//16×16 = 16368，落在分叉点之前
         room = max(int(room), self.state_checkpoint_end_margin)
         # The rightmost grid position that still leaves `room` behind it.
         #
@@ -3085,6 +3713,16 @@ class BlockManager:
         # of the next turn's reuse and is what makes the anchor exist at all.
         # Measured on the cc-traces, the step-back anchor is worth +0.3 to +0.7
         # points over insisting on the exact end, and is never worse.
+        # 【译】仍给身后留下 `room` 的最右网格位置。
+        #
+        #   不是简单地把 `num_prompt_tokens` 向下取整：在P处的checkpoint要求它之后的forward带上 `room` 个token，而取整后的末尾
+        #   最多只留下 `hash_block_size - 1` 个。所以对于room达到一个block或更多的类——测试里的MIN_FORK 8对block 4、V4的131对256——
+        #   精确的末尾永远存不下，放在那里的锚点会被切出来、然后被 `checkpointers_at` 拒绝。
+        #
+        #   退到最后一个能存下的边界，最多让下一轮少复用一个block，却是让锚点存在的前提。在cc-traces上测得：退一步的锚点
+        #   比坚持精确末尾多+0.3到+0.7个百分点，而且从不更差。
+        # 观察："V4的131"是旧情况：现在DeepSeek-V4声明StateTransfer.copy、走PAGE checkpoint，successor_room = 0
+        #   （deepseek_v4_attn.py、page_unit_checkpoint.py），见checkpointers_at的docstring之后的说明
         end = (
             (seq.num_prompt_tokens - int(room)) // self.hash_block_size
         ) * self.hash_block_size
@@ -3099,6 +3737,12 @@ class BlockManager:
         # rung that would have served the resume, and the hit goes to 0 rather
         # than merely getting no better. Capping costs the continuation at most
         # one block of reuse — the same trade `room` above already takes.
+        # 【译】而且永远不超过任何人能匹配上的最后一个block。`can_allocate` 在prompt之前一个block就停下（prefill必须forward一个block
+        #   才能产出logits），所以归档在最后一个block的hash名下的checkpoint，是任何扫描都不会去查的。对这个锚点瞄准的续写——
+        #   下一轮重发这个prompt并继续往后写——那个block是内部的，能匹配上，这就是为什么这个上限并不显然。但一个*原样重发*的
+        #   prompt最多命中到 `n - 1`，那时不封顶的锚点不只是没用：它会被存下，于是淘汰掉本可服务这次恢复的那一级阶梯，命中直接
+        #   变成0，而不只是没变好。封顶让续写最多少复用一个block——和上面 `room` 已经做的是同一种交换。
+        # 解释：n = _n_hash_blocks(seq) = ceil(P/hbs)；P = 40000、hbs = 16时n = 2500，上限 = 2499×16 = 39984
         end = min(end, (self._n_hash_blocks(seq) - 1) * self.hash_block_size)
         if end > 0:
             seq.checkpoint_end_pos = end
@@ -3124,6 +3768,18 @@ class BlockManager:
         blocks the forward just finished, and this would be a hash pass over the
         whole prompt on every admission, spent on nothing.
         """
+        # 【译】在 `seq` 上缓存prompt *每一个* block的链式hash。
+        #
+        #   `block_hashes` 在第一次缓存未命中处就停了——它是*命中*，门控也把它当命中来读。midstep预留指定的是forward还没到达的
+        #   位置，对每个值得做的预留来说都在那个未命中之后，所以给它取名的链要延伸得更远。
+        #
+        #   用一个单独的列表，而不是原地扩展 `block_hashes`。今天下游没有谁会误读一个更长的列表——`_gated_hit` 和空闲池循环都
+        #   只在 `compressed_hit` 以内索引它——但"命中的block"和"prompt的block"是两个事实，让一个列表同时装两者，意味着它们
+        #   各自的下一个读者都得知道是哪一个。它也便宜：这在门控之后运行，所以拷贝的是一个调用方已经用完的列表。
+        #
+        #   只对会做midstep预留的后端才做。其他情况下，checkpoint归档用的hash由 `hash_blocks` 在遍历forward刚写完的block时算出，
+        #   这里就会变成每次准入都对整个prompt做一遍hash，白白浪费。
+        # 解释：结果存进seq.block_hashes，唯一读者是midstep_positions（给forward里的每个快照位置取hash名）
         if not self._midstep_applies(seq):
             seq.block_hashes = []
             return
@@ -3133,8 +3789,39 @@ class BlockManager:
         # `_chain_to`, run to the full prompt width. Delegate rather than
         # duplicate the loop; the only thing local to this path is the midstep
         # gate above and writing the result to `seq`.
+        # 【译】续算本身——从最后一个*追加进来的*hash接着算（未命中时循环里的 `h` 是那个没匹配上的block的hash，它从没被追加，
+        #   不属于这条链）——恰好就是一直跑到整个prompt宽度的 `_chain_to`。委托给它而不是重复那个循环；这条路径自己的只有
+        #   上面的midstep门槛，以及把结果写到 `seq` 上。
         seq.block_hashes = self._chain_to(seq, block_hashes, self._n_hash_blocks(seq))
 
+    # ════════ 【分支】midstep checkpoint：在一次forward的中间取状态快照，不再为checkpoint切chunk（B级，第4批） ════════
+    # 前置：GDN的prefill用分块（chunk）算法（fla_ops/chunk.py，CHUNK_SIZE = 64）：把本次forward的token每64个分一块，
+    #   块与块之间按顺序递推状态h（块内用矩阵乘法并行），所以kernel本来就会算出"起点 + 64k"每个块边界处的状态，只是用完就丢。
+    #   能把这些中间状态拷出来的后端声明 StateTransfer.readable_midstep = True。目前只有Qwen GDN的PAGE路径在
+    #   ATOM_GDN_STATE_MIDSTEP=1 时这样声明（gdn_attn.py）：midstep_grid = 64；midstep_min_offset = conv_kernel − 1 = 3
+    #   （GDN前面的短卷积窗口要从本次forward自己的输入里切，所以快照位置之前至少要有本forward的3个token）
+    #
+    #   不能中途读（默认）：checkpoint只能取forward末尾的状态 → checkpoint_cut把chunk截到候选位置上，多一次forward
+    #   能中途读：checkpoint_cut返回0，chunk只按预算切；候选位置（同样是阶梯、demand、锚点）由本函数在forward之前列出，
+    #     挪到本forward的64网格上（snap_midstep_position：end原样不动，其余退到"起点 + 64k"中不超过它的最大者，
+    #     最多少复用63个token），在forward里拷出来
+    #
+    #   流程：Scheduler调度完本轮 ─► plan_midstep(seq, start, end) ─► reserve_midstep：每个位置借一个scratch状态槽位
+    #         ─► forward（runner把那一刻的h和卷积窗口拷进scratch）─► postprocess → hash_blocks → commit_midstep
+    #         ─► publish_midstep：排队，下一批构建时begin_store成PAGE checkpoint，归档在该位置的hash名下
+    #         forward不跑了（抢占、取消）─► deallocate → cancel_midstep：scratch原样还回
+    #
+    #   例（Qwen3.5、hbs = 16、interval 8192、预算16384、40000个token的prompt、冷缓存；
+    #     checkpoint_limit = 32768，锚点 = min(40000//16×16, (2500 − 1)×16) = 39984）：
+    #     不开midstep（切chunk，同scheduler.py _chunked_prefill_size上方的情形二）：
+    #       [0, 16384) [16384, 32768) [32768, 39984) [39984, 40000)：4次forward，checkpoint在16384、32768、39984
+    #     开midstep：chunk不切，[0, 16384) [16384, 32768) [32768, 40000)：3次forward
+    #       forward 1、2：阶梯16384、32768正好是end → 原样
+    #       forward 3：锚点39984在(32768, 40000]里但不是end → 退到 32768 + (39984 − 32768)//64×64 = 39936
+    #         （39936是16的倍数、离起点 ≥ 3 → 可读）→ checkpoint在39936，归档在块2495（= 39936/16 − 1）的hash名下
+    #     代价：锚点从39984退到39936，下一轮少复用48个token；收益：少一次forward
+    #   为什么要align_midstep_chunk：快照位置 = 起点 + 64k，只有起点本身在hash block边界上，快照位置才可能是hbs的整数倍
+    #     （才有hash可用），所以非最后一块chunk的终点要对齐到block边界
     def midstep_positions(self, seq: Sequence, start: int, end: int) -> list[tuple]:
         """`(position, hash)` for every checkpoint a forward over `(start, end]`
         can take without being cut short.
@@ -3169,12 +3856,32 @@ class BlockManager:
         one nobody dared remove. `test_interval_zero_reserves_nothing` pins the
         behavior end to end rather than the check.
         """
+        # 【译】一次覆盖 `(start, end]` 的forward在不被截短的情况下能取的每个checkpoint的 `(position, hash)`。
+        #
+        #   `checkpoint_cut` 的midstep孪生版本。候选位置相同——网格上的一级、demand、prompt末尾锚点——但 `checkpoint_cut` 必须
+        #   挑*一个*并把chunk截到那里，这里则全部返回：能读出chunk kernel内部状态的后端在每个位置各取一份快照，forward不必在那里结束。
+        #
+        #   不参考 `checkpointers_at`。那个函数回答的是"forward在这里结束了，存不存"，它的 `successor_room` 测试关心fork的后继
+        #   forward——而midstep快照没有后继，因为什么都不交接，所有者接着在原处写。在这里套用它，恰恰会拒掉锚点要保留的那个
+        #   对齐到block的prompt末尾。
+        #
+        #   每个候选按构造都是 `hash_block_size` 的倍数：间隔在构造时已对齐到这个网格、一级是间隔的倍数，demand是
+        #   `blocks * hash_block_size`，锚点向下取整到它。下面的断言把这点写明而不是信任它，因为一个不在网格上的位置会取到
+        #   错误block的hash——一个以谁都不会算出来的名字归档的checkpoint，下游也没有任何东西能察觉。
+        #
+        #   和它读取的三种放置不同，这里没有 `interval == 0` 的提前返回。三者各自已带着开关——`checkpoint_limit` 对任何非正的间隔
+        #   返回0，`_record_checkpoint_demand` 以 `interval_on` 为门，`_record_checkpoint_end` 在设置锚点之前就返回——所以取0时
+        #   三个候选都是0，循环无可遍历。再加第四个检查，读起来会像是它在执行这个开关，成为没人敢删的那一个。
+        #   `test_interval_zero_reserves_nothing` 端到端地钉住这个行为，而不是钉住某个检查。
+        # 解释：返回按位置排序的[(pos, hash)]；调用方是plan_midstep。例见上方【分支】midstep的说明
         if not self._midstep_applies(seq):
             return []
         interval = self.state_checkpoint_interval_tokens
         hbs = self.hash_block_size
         grid, min_offset = self.midstep_grid, self.midstep_min_offset
         hashes = seq.block_hashes
+        # 网格上的候选：不超过end、也不超过checkpoint_limit的最右一级（和checkpoint_cut同一算法）；
+        #   out用dict按挪动后的位置去重：两个候选可能退到同一个网格点
         rung = 0
         if limit := self.checkpoint_limit(seq):
             rung = min(end, limit)
@@ -3190,6 +3897,8 @@ class BlockManager:
             # still be a block boundary to have a hash, which holds exactly
             # when this forward starts on one -- the scheduler keeps non-final
             # chunk ends on the block grid (`align_midstep_chunk`) for that.
+            # 【译】kernel在 `pos` 处或之前物化出来的那个状态。它必须仍在block边界上才有hash，而这恰好在本forward从block边界开始时
+            #   成立——调度器为此把非最后一块chunk的终点保持在block网格上（`align_midstep_chunk`）。
             snapped = snap_midstep_position(pos, start, end, grid)
             if snapped % hbs or not midstep_target_ok(
                 snapped, start, end, grid, min_offset
@@ -3199,6 +3908,7 @@ class BlockManager:
             nblocks = snapped // hbs
             # A position past the chain is one `_extend_hash_chain` could not
             # name — nothing to file it under, so it cannot be found again.
+            # 【译】超出这条链的位置，是 `_extend_hash_chain` 无法命名的——没有名字可以归档，也就再也找不回来。
             if nblocks > len(hashes):
                 continue
             out[snapped] = hashes[nblocks - 1]
@@ -3212,11 +3922,18 @@ class BlockManager:
         whether they are the anchor compares against this, not the unsnapped
         position, or the anchor it actually filed is ranked as a guess.
         """
+        # 【译】这次forward把prompt末尾锚点归档在哪里，没有则为0。
+        #
+        #   `checkpoint_end_pos` 挪到forward的网格上，和 `midstep_positions` 挪它的方式一样。按"是不是锚点"给checkpoint排优先级的
+        #   那个类拿这个值比较，而不是拿没挪过的位置，否则它真正归档的锚点会被当成一次猜测来排序。
+        # 解释：例（上方midstep的例子）：锚点39984在forward (32768, 40000]里 → 返回39936。plan_midstep把它存进
+        #   seq.midstep_anchor_pos，由StateSlotPool判断"是不是锚点"时读取（state_pool.py）
         anchor = seq.checkpoint_end_pos
         if not (anchor and start < anchor <= end):
             return 0
         return snap_midstep_position(anchor, start, end, self.midstep_grid)
 
+    # 本序列的状态checkpoint类（PAGE协调器或StateSlotPool）能否中途读、且适用于这条序列
     def _midstep_applies(self, seq: Sequence) -> bool:
         cache = self._state_checkpoint_cache
         return cache.readable_midstep and cache.applies(seq)
@@ -3234,6 +3951,15 @@ class BlockManager:
         Unchanged when the chunk finishes the prompt, or when it is shorter
         than reaching the next boundary.
         """
+        # 【译】把 `chunk` 缩短，让非最后一块的prefill chunk结束在block边界上。
+        #
+        #   能中途读的类不需要把chunk切到它的阶梯上，所以只有预算决定chunk在哪里结束——哪里都可能。那样下一块就会从block网格之外
+        #   开始，*它的*网格上的每个位置也都不在block网格上，`midstep_positions` 只能把它们全部丢掉：对一条超过一个batch的prompt，
+        #   锚点也一起丢了。让出本forward预算里不到一个block的量，就能让下一块的起点留在网格上。
+        #
+        #   chunk会结束这个prompt、或短到够不到下一个边界时，原样返回。
+        # 解释：调用方Scheduler._finalize_prefill_chunk / _preview_prefill_chunk（checkpoint_cut返回0时）。
+        #   例（hbs = 16）：start = 0、chunk = 10000（非最后一块）→ 10000//16×16 = 9984；start = 0、chunk = 10 → 对齐后为0 → 原样10
         if not self._midstep_applies(seq) or start + chunk >= seq.num_tokens:
             return chunk
         hbs = self.hash_block_size
@@ -3252,6 +3978,15 @@ class BlockManager:
         one forward, so a second plan for the same seq means the first forward
         never ran — hand its slots back rather than leak them.
         """
+        # 【译】为这次forward覆盖的每个checkpoint预留一个目标槽位。
+        #
+        #   在chunk `(start, end]` 已经确定、batch还没构建时调用，这是两件事同时成立的唯一窗口：位置已知，而空闲列表仍可以被承诺出去，
+        #   不会和同一轮调度里稍后的准入抢资源。
+        #
+        #   覆盖而不是累积。一个预留只对恰好一次forward有效，所以同一条seq的第二次规划意味着第一次forward根本没跑——
+        #   把它的槽位还回去，而不是泄漏掉。
+        # 解释：调用方Scheduler._schedule（本轮所有准入结束之后、构建prefill batch之前，对每条调度到的序列调用）；
+        #   seq.midstep_reservations = [(scratch槽位, 位置, hash), ...]，ScheduledBatch把(槽位, 位置)交给runner
         if not self._state_checkpoint_cache.readable_midstep:
             return
         if seq.midstep_reservations:
@@ -3268,6 +4003,10 @@ class BlockManager:
         and leaving it in place would let the next `plan_midstep` publish a
         position this seq has already moved past.
         """
+        # 【译】把这次forward的预留归档，因为它的字节现在已经存在了。
+        #
+        #   会清空这个列表：这里没提交的都不算checkpoint，留着不动会让下一次 `plan_midstep` 发布一个这条seq早已越过的位置。
+        # 解释：调用方是hash_blocks末尾（forward完成之后）
         if not seq.midstep_reservations:
             return
         self._state_checkpoint_cache.publish_midstep(seq.midstep_reservations, seq)
@@ -3276,6 +4015,8 @@ class BlockManager:
         # forwards end where acceptance puts them — so it still measures from
         # here, and would otherwise re-checkpoint immediately after a prompt
         # that just filed one.
+        # 【译】已发布位置里最右的那个，给 `checkpointers_at` 里decode侧的间距规则用。生成阶段从不中途读——它的forward在接受结果
+        #   决定的地方结束——所以它仍从这里开始量，否则会在一个刚归档过checkpoint的prompt之后立刻又做一次checkpoint。
         seq.last_checkpoint_pos = max(
             seq.last_checkpoint_pos, max(p for _g, p, _h in seq.midstep_reservations)
         )
@@ -3284,6 +4025,8 @@ class BlockManager:
 
     def cancel_midstep(self, seq: Sequence) -> None:
         """Hand back reservations whose forward is not going to run."""
+        # 【译】把那些forward不会再运行的预留交还回去。
+        # 解释：调用方是plan_midstep（重新规划前）和deallocate（抢占 / 结束）；scratch槽位原样空着还回状态池
         if not seq.midstep_reservations:
             return
         self._state_checkpoint_cache.cancel_midstep(seq.midstep_reservations)
@@ -3320,6 +4063,24 @@ class BlockManager:
         every off-grid position it is then handed — zero checkpoints kept, no
         error, no warning, and a hit rate that quietly collapses.
         """
+        # 【译】`(start, end]` 里最早的阶梯位置，没有则返回0。
+        #
+        #   prefill chunk就截在这里，让它的forward恰好落在某一级上。它是 `checkpointers_at` 的对应物，后者决定结束在那里的forward
+        #   存什么：两者必须逐个位置一致，所以网格算术放在这里，而不放在调度器的调用处。
+        #
+        #   取最早而不是最晚，因为一条prompt现在可能想要两个位置，而chunk循环只有先被交给第一个，才能走到第二个。在网格内部，
+        #   靠后的一级仍然支配靠前的一级——一个类、一个恢复点，取最右的——所以网格在做选择之前先收缩成一个候选。prompt末尾锚点是
+        #   迫使这个循环存在的例外：它不支配那一级，那一级也不支配它。见 `_record_checkpoint_end`。
+        #
+        #   一旦所有适用的类都在midstep读取它们的checkpoint，就返回0。截断只是为了把forward的*终点*放到一级上，而能中途读的类不需要
+        #   终点——`midstep_positions` 会把同样的位置交给它，在一个完整长度的chunk里取快照。是"所有"而不是"任一"：只要有一个不能
+        #   中途读的类，forward就仍要落在那里，而能中途读的类拿到一个它本来也会取的位置，什么也不损失。
+        #
+        #   这道门和 `checkpointers_at` 里的那道是一对，要一起改。只去掉这里的截断，会让 `checkpointers_at` 拒掉随后交给它的每一个
+        #   不在网格上的位置——存下零个checkpoint，没有错误，没有警告，命中率悄悄崩塌。
+        # 解释：调用方Scheduler._finalize_prefill_chunk（record=True）和_preview_prefill_chunk（record=False：只估计，不计数）；
+        #   返回target时调用方把chunk改成 target − start。没有任何状态类适用（普通模型）时 all([]) 为True，也返回0。
+        #   数字例子见上方checkpoint_limit处【科普】的表（请求A步3截到锚点39936、请求B步1截到demand 29952）
         applicable = [c for c in self.state_caches if c.applies(seq)]
         if all(c.readable_midstep for c in applicable):
             return 0
@@ -3327,6 +4088,8 @@ class BlockManager:
         if limit := self.checkpoint_limit(seq):
             # `limit` is itself a multiple of the interval, so a chunk cut at
             # it needs no special case.
+            # 【译】`limit` 本身就是间隔的倍数，所以截在它上面的chunk不需要特殊处理。
+            # 解释：rung = 不超过end、也不超过limit的最右一级，例：end = 16384 → 16384（8192被它覆盖，不再是候选）
             rung = min(end, limit)
             rung -= rung % self.state_checkpoint_interval_tokens
         # A demand is capped by neither the grid nor `limit`. `limit` is the
@@ -3334,10 +4097,14 @@ class BlockManager:
         # demand carries that room by construction, so it may sit to the right
         # of the last rung — or, on a prompt too short for the grid to place a
         # rung at all, be the only position either side has.
+        # 【译】demand既不受网格约束，也不受 `limit` 约束。`limit` 是*网格*上仍给伸得最远的类留出room的最后一个位置；demand按构造
+        #   就带着那份room，所以它可以在最后一级的右边——或者，在一个短到网格放不下任何一级的prompt上，成为两边唯一的位置。
         demand = seq.checkpoint_demand_pos
         # The prompt-end anchor sits outside the grid for the same reason and
         # on the same terms — see `_record_checkpoint_end`, which applies the
         # `successor_room` test that makes it keepable.
+        # 【译】prompt末尾锚点出于同样的理由、按同样的条件也在网格之外——见 `_record_checkpoint_end`，它做了让锚点能被存下的
+        #   `successor_room` 测试。
         anchor = seq.checkpoint_end_pos
         # The earliest candidate strictly inside the chunk. Taking the latest
         # instead is what a single-position ladder could afford and this one
@@ -3349,6 +4116,10 @@ class BlockManager:
         # request: reuse falls to zero and stays there while the demand counter
         # climbs. Pinned by
         # `test_reuse_another_class_declines_is_not_charged_to_the_ladder`.
+        # 【译】chunk内部（严格在起点之后）最早的候选。取最晚的是只有一个位置的阶梯才负担得起的做法，这个阶梯负担不起：锚点在36、
+        #   一级在32时，`max` 截在36，forward永远不会结束在32，所以那一级不只是被推迟——它根本不会被存下。对锚点够不着的类来说，
+        #   它就永久失去了原本用来恢复的那一级，而顶替它触发的demand在之后的每个请求上都输掉同样的比较：复用跌到零并一直停在那里，
+        #   demand计数器却不断上涨。由 `test_reuse_another_class_declines_is_not_charged_to_the_ladder` 钉住。
         candidates = [p for p in (rung, demand, anchor) if p and start < p <= end]
         if not candidates:
             return 0
@@ -3365,6 +4136,12 @@ class BlockManager:
         # `chunks_cut_for_demand` would swamp the convergence signal that
         # counter exists to expose. The demand is checked first because when
         # the two coincide it is the demand that evidenced the position.
+        # 【译】"胜过网格"意味着是一个网格之外的位置选中了这一刀，而网格本来不会这么切。`target < end` 是另一半条件：在 `end` 处
+        #   chunk没被缩短，这一刀不花任何代价，把这种也计进去，曾让漏斗报出从未发生的截断——而这个数字正是用来暴露"每个请求都付
+        #   代价、却永不收敛"那种形状的。
+        #
+        #   归到真正选中 `target` 的那个网格外位置名下：锚点几乎在每条prompt上都会触发，把它的截断并进 `chunks_cut_for_demand`，
+        #   会淹没那个计数器要暴露的收敛信号。先检查demand，因为两者重合时，是demand证明了这个位置。
         if record and target != rung and target < end:
             if target == demand:
                 self.chunks_cut_for_demand += 1
@@ -3382,6 +4159,12 @@ class BlockManager:
         a second state class is automatically included — calling
         ``self.state.checkpoint_fates()`` directly would miss it.
         """
+        # 【译】一个想要的checkpoint依次经过的每个阶段。
+        #
+        #   在这里汇总，是因为这些阶段分布在两个对象里——阶梯决定要什么，池子决定什么能留下——读者要把它们并排放着，才能看出是
+        #   哪个阶段丢了它。池子一级的结局通过 ``state_checkpoint_fates()`` 收集，这样第二个状态类会被自动包括进来——直接调用
+        #   ``self.state.checkpoint_fates()`` 会漏掉它。
+        # 解释：读取方是EngineCore的get_cache_statistics工具命令和指标快照（engine_utility.py）
         return {
             "demands_recorded": self.demands_recorded,
             "demands_declined_no_room": self.demands_declined_no_room,
@@ -3416,16 +4199,37 @@ class BlockManager:
         fires. Occupancy stays on `self.state`: that is the slot pool either
         way, and the coordinator has none.
         """
+        # 【译】两个池子的淘汰计数和占用，并排列出。
+        #
+        #   重点就在"成对"。命中率只说明复用丢了，却不说是哪个池子丢的，而两个池子是从同一份预算里互相对照着分出来的
+        #   （`plan_pools`）——所以可操作的读法总是一次对比：分页池在淘汰而状态池大半空着，说明划分不对；两个都在淘汰，说明总预算不够。
+        #
+        #   结局来自聚合器 `state_checkpoint_fates()`，而不是 `self.state`，也不是单个 `_state_checkpoint_cache`。在PAGE下 `self.state`
+        #   是用 `StateTransfer.none()` 建的，从来收不到 `checkpoint()`，所以在这里读它，会在整个服务器生命周期里打印四个0；
+        #   只读 `_state_checkpoint_cache` 又会漏掉聚合器纳入的任何第二个状态类。无论哪种，这个数都会和 `checkpoint_funnel`
+        #   那一行对不上——那一行已经走聚合器了——而两个指标名相同的输出互相矛盾，正是一次调优得出"checkpoint从来没触发过"这种
+        #   结论的原因。占用仍取自 `self.state`：无论哪种情况它都是那个槽位池，协调器没有槽位。
+        # 解释：读取方是EngineStats的周期性日志（Scheduler构造EngineStats时把它作为pool_pressure回调传入）
         # `state_checkpoint_fates()`, matching `checkpoint_funnel`: it sums
         # every state class, so a build with a second class is not silently
         # undercounted here while the funnel line reports the full total.
         # `occupancy()` stays on the pool, which is the thing that has slots.
+        # 【译】`state_checkpoint_fates()`，与 `checkpoint_funnel` 一致：它把每个状态类加总，所以有第二个类的构建不会在这里被悄悄少算，
+        #   而漏斗那一行报的是全部总数。`occupancy()` 仍取自池子，有槽位的是它。
         return (
             self.kv.eviction_stats()
             | self.state.occupancy()
             | self.state_checkpoint_fates()
         )
 
+    # 【分支】forward结束在pos时，哪些状态类在这里存checkpoint（数字例子见上方checkpoint_limit处【科普】的表）
+    # 调用方：hash_blocks末尾（prefill：aimed=True，next_forward_tokens默认 = prompt剩余长度；decode经hash_decode_blocks：
+    #   aimed=False，next_forward_tokens = Scheduler._checkpoint_room = 0或1）
+    # 判定顺序：
+    #   interval == 0 或 pos ≤ 0 → 不存
+    #   aimed（prefill，chunk已被checkpoint_cut截到候选上）：pos必须在网格上，或等于这条seq的demand / 锚点
+    #   unaimed（decode）：interval = −1 → 不存；否则pos要在hash block边界上，且 pos − last_checkpoint_pos ≥ interval
+    #   最后逐个状态类筛：不是"prefill + 能中途读"（那种由midstep负责）、适用于这条seq、且 next_forward_tokens ≥ successor_room
     def checkpointers_at(
         self,
         seq: Sequence,
@@ -3500,6 +4304,44 @@ class BlockManager:
         reason: it is the prompt's end stepped back to the grid, and an unaimed
         position at or past the prompt end is past it too.
         """
+        # 【译】应该在 `pos` 处保留一个checkpoint的状态类，按类的顺序。
+        #
+        #   一架恢复点的阶梯，每 `state_checkpoint_interval_tokens` 个token的上下文一级，所有类共用。存一份对rolling类是容量中性的
+        #   （交出去的槽位由空闲列表补上），对不可变类是受容量约束的（一个有LRU上限的pin），但无论哪种，都要*存的一方*多付一次
+        #   forward——它的prompt会在这一级被截开——所以正是间隔让这个代价被摊薄，而不是每个请求都付。
+        #
+        #   `next_forward_tokens` 是紧接这次之后的forward带多少token，拿来和每个类的 `successor_room` 比较。不传表示prompt的剩余部分，
+        #   即prefill的答案；decode传1。其余一切都由这一个数推出——需要长交接的类（V4的环形缓冲，131）在生成过程中永远不合格，
+        #   什么都不交接的类（保留式的SWA池，0）总是合格，根本不能存checkpoint的类（`inf`）永远不合格，而在这一步停止的请求传0，
+        #   不保留任何永远不会有人从那里恢复的东西。
+        #
+        #   位置必须精确。checkpoint保存的是forward最后一个token时的状态，所以越过某一级的forward已经跑到了它要归档的那个hash前面；
+        #   调度器把prefill chunk截到这里，没做到这一点的路径就什么都不存。
+        #
+        #   在网格之上还有这条seq自己的两级。`checkpoint_demand_pos` 是这条seq因缺checkpoint而被拒绝的一个边界
+        #   （`_record_checkpoint_demand`）；`checkpoint_end_pos` 是本prompt自己的末尾，也就是agentic流量实际恢复的位置
+        #   （见 `_record_checkpoint_end`）。两者按同样的条件准入：不在网格上，仍要通过下面的 `successor_room` 测试——
+        #   `_record_checkpoint_end` 事先检查过它，所以切和存不会打架。`checkpoint_cut` 读的是同样两个字段，所以两者不会漂移开。
+        #
+        #   `aimed` 表示调用方能否决定forward在哪里结束。prefill能——`checkpoint_cut` 会截短chunk——所以它被要求精确落在网格上，
+        #   两者逐个位置一致。投机decode步不能：它提交 `1 + accepted` 个token，会跨过大多数级，要求它落在网格上曾让decode
+        #   checkpoint成了"每 `toks/fwd` 次才中一次"的事。限制草稿数可以让它落上去，代价是丢掉投机、并低报接受率——
+        #   接受率不管怎样都按提供了 `mtp_k` 个草稿来算。
+        #
+        #   没有什么需要付这个代价。网格存在是为了把checkpoint隔开，而落在任何一个离上一个足够远的hash block边界上的一步，同样能
+        #   达到目的——位置只需要能被*找到*，而恢复的一方靠hash找它，从不靠算术。所以unaimed的调用方只受间距约束，不受网格约束。
+        #
+        #   这能换来多少，取决于一级跨了多少个边界。一步落在某个给定边界上的概率是 `1 / toks_per_forward`，所以每一级能存下checkpoint
+        #   的概率是 `1 - (1 - 1/toks_per_forward) ** (interval / hash_block_size)`：在DeepSeek-V4的256-token block、每次forward
+        #   4.3个token时，间隔为一个block时是23%，在默认的8192时实际上是必然。间隔*就是*block时两条规则完全重合，这也是V4允许的
+        #   最细网格——所以在那个设置下的测试什么都没测到，`demand_config` 就是为了避开它而存在。
+        #
+        #   demand那一级在这个分支里缺席是按构造，而不是遗漏：demand至多是prompt自己的命中上限，而每个unaimed位置都在prompt末尾
+        #   或之后，所以生成永远到不了它。`checkpoint_end_pos` 缺席的理由几乎一样：它是退到网格上的prompt末尾，而在prompt末尾
+        #   或之后的unaimed位置也在它之后。
+        # 观察："V4的环形缓冲，131"是旧情况：现在DeepSeek-V4声明的是StateTransfer.copy（deepseek_v4_attn.py），走PAGE checkpoint，
+        #   PagedStateCheckpointCoordinator.successor_room = 0（page_unit_checkpoint.py）；fork类的successor_room = fork_tokens
+        #   （GDN为1），replay / none类为inf
         interval = self.state_checkpoint_interval_tokens
         if interval == 0 or pos <= 0:
             return []
@@ -3507,6 +4349,8 @@ class BlockManager:
         # would be a ZeroDivisionError's less honest cousin — -1 divides
         # everything, admitting every position as a rung. The demand and the
         # anchor are then the only two placements, which is the whole point.
+        # 【译】-1：没有网格，所以 `pos % interval` 说明不了什么，硬要问它就是ZeroDivisionError那位不那么诚实的表亲——-1能整除一切，
+        #   会把每个位置都当成一级。此时demand和锚点是仅有的两种放置，这正是-1的意义所在。
         on_grid = interval > 0 and not pos % interval
         if aimed:
             if (
@@ -3519,9 +4363,13 @@ class BlockManager:
             # Decode-side spacing has no grid to fall back on either. The two
             # aimed placements are both prompt positions, so nothing here is
             # reachable and generation keeps no checkpoints under -1.
+            # 【译】decode侧的间距规则也没有网格可依。两种aimed放置都是prompt里的位置，所以这里什么都够不到，-1下生成阶段不存checkpoint。
             return []
+        # unaimed（decode）：pos要在hash block边界上（才有hash可归档），且离上一个checkpoint至少一个interval。
+        #   例（hbs = 256、interval 8192）：prompt最后一个checkpoint在39936 → 下一个在48128
         elif pos % self.hash_block_size or pos - seq.last_checkpoint_pos < interval:
             return []
+        # 不传next_forward_tokens（prefill）：后继forward最多能带上prompt剩下的这么多token
         if next_forward_tokens is None:
             next_forward_tokens = seq.num_prompt_tokens - pos
         return [
@@ -3539,11 +4387,26 @@ class BlockManager:
             # positions, so generation is where `aimed=False` puts every class
             # back on this one. The twin of the `checkpoint_cut` gate; see
             # there for why the two cannot move separately.
+            # 【译】能中途读的类通过 `plan_midstep`/`commit_midstep` 给它的prompt做checkpoint，在这里再存一次，同一个边界就被存了两次。
+            #   两半都是损害：两个槽位花在一个hash上，输家空着、却没被索引，成了孤儿——而在 `fork` 下，seq会把它的活槽位交出去、
+            #   换一个新的，迫使下一次forward去重新填一个它本不需要的替代品。
+            #
+            #   只在aimed路径上这样。midstep位置全都是prompt里的位置，所以在生成阶段 `aimed=False` 让每个类都回到这条路上。
+            #   这是 `checkpoint_cut` 那道门的孪生；两者为什么不能分开动，见那里。
             if not (aimed and c.readable_midstep)
             and c.applies(seq)
             and next_forward_tokens >= c.successor_room
         ]
 
+    # ════════ 【分支】外部来源的KV登记进HBM前缀缓存：offload加载回来的（publish_loaded_prefix）、
+    #   PD传过来的（register_received_prefix）——都见第9批 ════════
+    # 前置：这两条路径上，KV不是本机prefill forward算出来的，而是被直接写进已分配好的物理block：
+    #   KV offload（第9批kv_transfer/offload）：GPU里早被淘汰的前缀，从CPU内存 / LMCache读回显存
+    #     （概念见arg_utils.py _KV_OFFLOAD_MODES上方的【科普】KV offload）
+    #   PD分离（第9批kv_transfer/disaggregation）：decode节点不做prefill，prompt的KV经RDMA从prefill节点写进来
+    #     （概念见arg_utils.py EngineArgs.kv_transfer_config上方的【科普】PD分离）
+    #   它们都不经过hash_blocks。不补登记的话，本请求能用这些KV，以后的请求却查不到，还会再从CPU / 远端读一遍
+    #   对比nano-vllm：nano-vllm没有这两种外部来源
     def publish_loaded_prefix(
         self,
         seq: Sequence,
@@ -3563,6 +4426,17 @@ class BlockManager:
         into different physical blocks, and replacing the canonical mapping
         would make its eventual eviction remove the wrong cache entry.
         """
+        # 【译】把一段成功加载回来的offload前缀发布进GPU缓存索引。
+        #
+        #   LMCache把KV直接恢复进已经分配好的物理block，所以这些block不会经过 ``hash_blocks()``。不在这里显式发布的话，当前请求
+        #   能用上恢复的KV，但以后的请求无法通过 ``can_allocate()`` 发现它，会一再从CPU加载同一段前缀。
+        #
+        #   只发布完整的、按hash block对齐的已加载block。已有的规范映射胜出：并发的请求可能把同一段前缀加载进不同的物理block，
+        #   替换规范映射会让它日后被淘汰时删掉错误的缓存条目。
+        # 解释：调用方Scheduler._mark_offload_load_ready（offload加载完成时）。例（hbs = 16）：prompt 20000个token，准入时HBM
+        #   命中4096，LMCache加载回[4096, 12288) → 登记块256~767共512块，父hash取块255上的；返回8192（登记的token数）。
+        #   规则和hash_blocks相反：hash_blocks里后发布的block接管索引；这里已有同hash的block时只给本block打标注（block.update），
+        #   不动索引——两份内容相同的物理block，索引只指向原来那一份
         if not self.enable_prefix_caching:
             return 0
 
@@ -3570,6 +4444,7 @@ class BlockManager:
         end_token = min(int(end_token), int(seq.num_prompt_tokens))
         if end_token <= start_token:
             return 0
+        # 起点必须对齐到hash block（否则算不出链上的hash）；终点向下取整，尾部半满的block不发布（同hash_blocks）
         hbs = self._hash_block_size()
         if start_token % hbs != 0:
             logger.warning(
@@ -3607,6 +4482,7 @@ class BlockManager:
             block_hash = self.compute_hash(token_ids, parent_hash)
             canonical_id = self.kv.lookup(block_hash)
 
+            # 这个block已挂着另一个hash：不覆盖、停下（发布过的内容不会变）；索引里同hash的block内容不同 = hash碰撞，也停下
             if block.hash not in (-1, block_hash):
                 logger.warning(
                     "Refusing to overwrite indexed block during offload "
@@ -3634,6 +4510,9 @@ class BlockManager:
                 # separates `Block.update` from `BlockPool.publish` here, and it
                 # is safe because `_unindex` only drops an entry that still
                 # points at the block being reused.
+                # 【译】保留规范的索引条目，但也给本请求这份重复的物理block打上标注：`hash_blocks()` 发布新算出的后缀时，需要最后一个
+                #   加载block的hash作为父hash。"只标注、不索引"正是这里 `Block.update` 和 `BlockPool.publish` 的区别，而这样做是安全的，
+                #   因为 `_unindex` 只删除仍指向被复用block的条目。
                 block.update(block_hash, token_ids)
             else:
                 self.kv.publish(block_id, block_hash, token_ids)
@@ -3644,6 +4523,8 @@ class BlockManager:
                             # The only BlockStored site fed straight from
                             # `_hash_block_tokens`; the other two accumulate
                             # into a list already. See `_make_block_stored`.
+                            # 【译】唯一一处直接由 `_hash_block_tokens` 喂数据的BlockStored；另外两处本来就累加成list了。
+                            #   见 `_make_block_stored`。
                             list(token_ids),
                             parent_hash if parent_hash != -1 else None,
                             hbs,
@@ -3674,6 +4555,20 @@ class BlockManager:
         hash, so it is neither the total number of hashed prompt blocks nor
         necessarily the number of newly inserted hash-index entries.
         """
+        # 【译】把收到的prompt block登记进前缀缓存，让后续几轮能在本地匹配上它们、只传增量。
+        #
+        #   DCP下，一个block-table条目代表 ``dcp_world_size`` 个物理block，因此是 ``hash_block_size`` 个全局token。按物理的
+        #   ``block_size`` 来hash，会把好几段互不相容的token范围挂到同一个虚拟block上。
+        #
+        #   ``num_cached_tokens`` 之前的block已经在本地登记过；只有收到的后缀需要登记。末尾不满的hash block保持不发布，与
+        #   ``hash_blocks`` 一致。
+        #
+        #   返回这条序列被处理的、完整的已接收后缀block数。其中包括按已有规范hash打标注的block，所以它既不是已登记的prompt block
+        #   总数，也不一定是新插入的hash索引条目数。
+        # 解释：调用方Scheduler._update_waiting_for_remote_kv（PD consumer收完KV、不是offload路径时）。
+        #   例（hbs = 16）：prompt 1000个token，本地命中320（num_cached_tokens = 320）→ num_full = 1000//16 = 62，start = 20
+        #     → 登记块20~61，返回42；[992, 1000)半满不登记。和publish_loaded_prefix的区别：hash碰撞时这里直接抛RuntimeError
+        #     （那边记日志后停下）；最后把prefix_hashes_published置True，postprocess就不会再登记一遍
         if not self.enable_prefix_caching:
             return 0
 
@@ -3706,9 +4601,21 @@ class BlockManager:
         # The decode consumer has no local prefill postprocess to publish these
         # prompt blocks. Mark that one-shot work complete so its first decode
         # output does not publish the same physical blocks again.
+        # 【译】decode consumer没有本地prefill的postprocess来发布这些prompt block。把这项一次性的工作标为已完成，这样它第一次decode
+        #   输出时就不会再发布一遍同样的物理block。
         seq.prefix_hashes_published = True
         return num_full - start
 
+    # ════════ 【分支】KV offload的"租约"：后台保存还在读的block先别回收（第9批kv_transfer/offload） ════════
+    # 前置：offload把算好的KV异步存到CPU / LMCache。请求结束时，后台保存可能还没读完它的block；这时把block放回空闲池，下一次
+    #   _fresh_block就可能把它分给别人、覆盖掉还没存走的KV。原做法是把整条请求挂进deferred_free_blocks，等保存完成再deallocate；
+    #   租约只扣住保存真正要读的那几个block：
+    #     deallocate_partial：对受保护的block各claim一次（ref + 1，这份引用归"保存"所有），再正常deallocate整条请求
+    #     free_leased_blocks：保存完成（或卡住超时被回收）后，把这份引用还掉
+    #   例：block_table = [7, 3, 12, 20]，保存要读 {7, 3}
+    #     claim 7、3 → ref 2；deallocate → 20、12归零回池（立刻能给别人），7、3降到1（租约还拿着）
+    #     保存完成 → free_leased_blocks([7, 3]) → 归零回池（hash还在，进_cached，仍可被命中）
+    #   acquire_offload_prefix是"晚保存"：请求结束、block_table没了之后才开始保存，按内容hash把仍驻留的前缀block找回来再claim
     def deallocate_partial(
         self,
         seq: Sequence,
@@ -3737,6 +4644,20 @@ class BlockManager:
         released here only when the connector explicitly confirms that every
         state source needed after request teardown has an independent lease.
         """
+        # 【译】现在就释放 `seq`，但保留一次待执行的offload保存要读的block ID。
+        #
+        #   由offload的"提前释放block"路径使用（见 `DenseOffloadScheduler.protected_block_ids`），取代把整条请求挂在
+        #   `deferred_free_blocks` 后面：`seq.block_table` 里所有*不在* `protected_block_ids` 中的block——decode block、没对齐的
+        #   prompt尾部、已经保存完的区段，或任何在途保存从不读取的block——都立刻还给 `BlockPool`，和 `deallocate` 一样。
+        #   `protected_block_ids` 必须在本函数清空 `seq.block_table` 之前，由调用方（根据connector给出的、在途 `SaveOperationId`
+        #   的精确block范围）冻结好。
+        #
+        #   每个受保护的block先为保存租约 ``claim`` 一次，然后照常释放这条请求。这让所有权变得明确：共享的前缀block保留它们的其他
+        #   主人，而保存恰好拥有一份引用计数，直到 ``free_leased_blocks`` 释放它。
+        #
+        #   每请求的递归状态采取"失败即关闭"：只有connector明确确认请求拆除之后还需要的每个状态源都有独立的租约时，
+        #   才可以在这里释放它的活跃槽位。
+        # 解释：调用方Scheduler.postprocess的请求结束路径（connector要求推迟释放、又能给出精确的受保护block集合时）
         if seq.has_per_req_cache and not per_request_state_safe:
             raise RuntimeError(
                 "partial PAGE deallocation is unsupported for per-request "
@@ -3765,6 +4686,13 @@ class BlockManager:
         token-checked before it is claimed. The scan stops at the first gap so
         the returned range can never describe a cache object with a hole.
         """
+        # 【译】认领一次"晚保存"要用的、仍驻留在显存里的连续前缀。
+        #
+        #   已结束的请求不再拥有它原来的物理block table。所以每个block都要通过内容hash索引重新解析一遍，核对token之后再认领。
+        #   扫描在第一个缺口处停下，这样返回的范围永远不会描述一个中间有洞的缓存对象。
+        # 解释：调用方kv_transfer/offload/chunked_scheduler.py的_late_save_source。从块0开始按cache_seed重算整条链（block_table
+        #   已没了，只能靠内容找），[start, end)里逐块lookup + 核对 + claim。返回 (每块的block id，没找到的为-1；连续可用的
+        #   终点token；已claim的id元组)，调用方用不上的部分再用free_leased_blocks还掉
         hbs = self._hash_block_size()
         if (
             start_tokens < 0
@@ -3801,6 +4729,8 @@ class BlockManager:
         # The caller may have to trim a partial LMCache chunk from the tail.
         # Preserve token order until that trim is complete; a set is suitable
         # only after the exact ordered prefix has been selected.
+        # 【译】调用方可能要从尾部裁掉一个不完整的LMCache chunk。在裁剪完成之前保持token顺序；只有选定了精确的有序前缀之后，
+        #   才适合用set。
         return block_ids, available_end, tuple(claimed)
 
     def free_leased_blocks(self, block_ids) -> None:
@@ -3814,21 +4744,61 @@ class BlockManager:
         one lease -- calling this twice for the same ID double-frees the block,
         same as calling `BlockPool.free` twice would.
         """
+        # 【译】把被 `deallocate_partial` 租约扣住的block ID还给池子。
+        #
+        #   在offload connector报告读取 `block_ids` 的那一代保存已经"源安全"（`take_source_safe_releases`）、或在卡住之后回收它
+        #   （`reclaim_stale_leases`）时调用。"幂等"只在这个意义上成立：connector保证对一份租约，每个block ID只会经由
+        #   `take_source_safe_releases` / `reclaim_stale_leases` 两者之一出现恰好一次——对同一个ID调用两次会重复释放这个block，
+        #   和调用两次 `BlockPool.free` 一样。
+        # 解释：kv.free = 引用计数 − 1，归零才回空闲池（见下方deallocate的图）。调用方Scheduler（排空租约释放、超时回收）和
+        #   chunked_scheduler.py（晚保存用不上的block）
         for block_id in block_ids:
             self.kv.free(block_id)
 
+    # ═══════════════ deallocate：请求结束或被抢占，归还它持有的全部资源（A级） ═══════════════
+    # 调用方（grep核对，scheduler.py）：postprocess（请求结束；connector还在读这些block时改走deferred_free_blocks，之后由
+    #   _maybe_release_deferred调用，或走deallocate_partial）、preempt（重算式抢占，之后整条重新prefill）、_schedule里
+    #   准入之后回滚的几条路径、_consume_failed_remote_kv、allocate_waiting
+    #
+    # 核心是"引用计数 − 1，归零才回空闲池，hash和KV内容原样保留"（惰性淘汰）。例：hbs = 16，
+    #   A.block_table = [7, 3, 12]：块0、1已登记（7 ↔ h0、3 ↔ h1），块2是半满的尾块（hash = −1）；block 7还被B共享（ref = 2）
+    #   逆序释放 12 → 3 → 7（kv.free，block_pool.py）：
+    #     block 12：ref 1→0，没有hash → 进 _vacant（按id排序的最小堆："空白"block，分配时最先被取走）
+    #     block 3 ：ref 1→0，有hash   → 进 _cached 队尾（按释放先后排序的LRU）；索引 h1 → 3 不动，显存里的KV也不动
+    #     block 7 ：ref 2→1，B还在用   → 什么都不变
+    #
+    #     空闲池   _vacant（最小堆）   { …, 12, … }            先取：拿走它什么都不损失
+    #             _cached（LRU）      [ 最早释放 … , 3 ]       _vacant取空之后，才从最早释放的一端取
+    #             _protected（SLRU）  只在ATOM_PREFIX_CACHE_POLICY=slru时用：被命中复用过的block放这里，最后才取
+    #     hash索引 { h0:7, h1:3, … }    ← 不变：block 3虽然空闲，仍可被命中
+    #
+    #   之后block 3的两种命运：
+    #     ① 新请求C的前缀命中h1 → kv.claim(3)：从_cached摘下、ref = 1，KV原样复用，不用重算
+    #     ② 一直没人命中，某次_fresh_block（allocate未命中的部分 / may_append）把_vacant取空后轮到它 → kv.allocate(3)：
+    #        _unindex删掉 h1 → 3，回调_record_evicted（计数、发BlockRemoved事件、作废挂在h1名下的状态checkpoint），
+    #        block.reset()——这时h1才真正消失。另外几处也会抹掉hash：clear_cache（清空整个索引）、池子缩小时的retire_top
+    #   为什么逆序释放：链是从前往后匹配的，块0没了块1就再也走不到；逆序释放让靠前的块后进LRU、最后被淘汰（同nano-vllm）
+    # 对比nano-vllm：nano-vllm只有ref_count − 1和一个free deque（释放放队尾、分配从队头取），所以一个有hash的block可能
+    #   在空白block之前就被拿走；ATOM把空闲block分成空白 / 可复用两半，空白的先用。函数后半部分重置的是ATOM多出来的每请求状态：
+    #   checkpoint的demand / 锚点 / midstep预留、线性注意力的状态槽位（含正在加载中的槽位）、offload的联合边界
     def deallocate(self, seq: Sequence):
+        # 逆序：链尾先进LRU、先被淘汰；kv.free = ref − 1，归零才回空闲池（hash和内容保留，见上图）
         for block_id in reversed(seq.block_table):
             self.kv.free(block_id)
         seq.num_cached_tokens = 0
         # The block table is gone, so nothing of this seq is hashed any more.
         # Covers preemption too, which frees through here and re-prefills.
+        # 【译】block table没了，这条seq就不再有任何已登记hash的部分。抢占也包括在内：它通过这里释放，然后重新prefill。
+        # 解释：block本身的hash仍留在池子里（上图），清零的只是这条seq的水位线；重新准入时can_allocate会重新命中它们
         seq.num_hashed_tokens = 0
+        # 有界重放的记录只描述这一次准入（sequence.py Replay类）
         seq.replay = None
         seq.replays_hit = seq.replay_kv_load = False
         # Likewise the demand: it describes one admission against one cache
         # state, and a re-admitted seq gets a fresh answer from `can_allocate`
         # — including a fresh place in both funnel counters.
+        # 【译】demand也一样：它描述的是某一次准入面对某一个缓存状态，重新准入的seq会从 `can_allocate` 得到新的答案——
+        #   包括在两个漏斗计数器里的新位置。
         seq.checkpoint_demand_pos = 0
         seq.checkpoint_demand_counted = False
         seq.checkpoint_demand_declined = False
@@ -3837,10 +4807,13 @@ class BlockManager:
         # unconditionally in `can_allocate`, and leaving a stale value here
         # would let a seq that never reaches that path keep a position nothing
         # re-validated against the current `state_caches`.
+        # 【译】锚点只由 `num_prompt_tokens` 推出，所以重新准入时它仍然正确——但 `_record_checkpoint_end` 在 `can_allocate` 里无条件运行，
+        #   这里留下旧值的话，一条从未走到那条路径的seq就会保留一个没人针对当前 `state_caches` 重新验证过的位置。
         seq.checkpoint_end_pos = 0
         seq.last_checkpoint_pos = 0
         # An uncommitted checkpoint describes state in a slot that is about to
         # go back on the free list, so the intent dies with it.
+        # 【译】一个还没提交的checkpoint描述的是一个马上要回到空闲列表的槽位里的状态，所以这个意图随之作废。
         if self.paged_state_checkpoints is not None:
             self.paged_state_checkpoints.forget_pending(seq)
         # A midstep reservation is the same intent one step earlier: a slot
@@ -3848,8 +4821,16 @@ class BlockManager:
         # publishing it would file a hash over bytes nobody wrote. Before the
         # block table is cleared, because a preempted seq re-prefills through
         # `can_allocate` and would otherwise re-plan on top of a live list.
+        # 【译】midstep预留是早一步的同一种意图：为一次现在不会再运行的forward保留的槽位。空着交回——发布它，等于把一个hash归档到
+        #   一份没人写过的字节上。要在清空block table之前做，因为被抢占的seq会经 `can_allocate` 重新prefill，否则会在一张仍然
+        #   有效的列表之上重新规划。
         self.cancel_midstep(seq)
+        # 【译】（行尾注释）main分支上的 `array("i")` 没有 `.clear()`
+        # 解释：block_table是BlockTable（array("i")的子类，sequence.py）。array在Python 3.13之前没有clear()（本项目要求 ≥ 3.10）；
+        #   del bt[:] 还会让BlockTable重新取一个version（不是追加的修改都会换version）
+        # 对比nano-vllm：nano-vllm在这里结束（block_table.clear()）；下面是ATOM的每请求状态槽位
         del seq.block_table[:]  # main's `array("i")` has no `.clear()`
+        # 【分支】每请求状态（GDN的递归状态、V4的压缩器状态等，第4批state_pool.py）：state_slots = [已提交槽位, 投机回滚槽位…]
         if seq.has_per_req_cache and seq.state_slots:
             # Every slot the seq held — the committed one and its speculation
             # scratch, which is this request's alone and has no meaning to the
@@ -3864,6 +4845,14 @@ class BlockManager:
             # already true over it. Held until `settle_state_load`, which always
             # comes: the worker reports every load either way. The rollback
             # scratch is nobody's destination and goes back regardless.
+            # 【译】这条seq持有的每个槽位——已提交的那个，以及它的投机scratch，后者只属于这个请求，对下一个请求毫无意义。它做过的
+            #   checkpoint已经挂在状态索引下回到空闲列表；它本要fork的源在这里丢掉，而不是留给 `release_pins`，因为欠着那次读取的
+            #   forward不会发生了，这个槽位不该为一个已经不存在的读者再空等一轮。
+            #   除非有一次状态加载正在写进已提交槽位——一个worker正在写它，现在交回去，就会把一个别人正在填的缓冲区交给下一个请求，
+            #   而它上面的 `has_initial_state` 已经是true。扣住直到 `settle_state_load`，它总会来：worker无论成败都会报告每次加载。
+            #   回滚scratch不是任何人的目标，照常交回。
+            # 解释：状态加载 = 【分支】KV offload的状态层（从CPU把一份状态镜像读回这个槽位，第9批state_offload.py）；
+            #   _orphan_load_slots登记的槽位由settle_state_load / abandon_state_load / reconcile_orphan_load_slots最终释放
             if seq.offload_joint.load_hash != -1 and self.state_offload is not None:
                 self._orphan_load_slots.setdefault(seq.id, []).append(
                     (seq.state_slot, monotonic())
@@ -3871,6 +4860,7 @@ class BlockManager:
                 # Abandoned, not failed: an abort says nothing about the bytes,
                 # and forgetting the hash would cost the next request over this
                 # prefix a full recompute.
+                # 【译】是"放弃"而不是"失败"：取消并不说明那些字节有什么问题，忘掉这个hash会让下一个使用该前缀的请求付出一次完整重算。
                 self.state_offload.abandon_load(seq.id)
                 # Drop any not-yet-taken load queued for this request, exactly as
                 # `cancel_state_load` does (finding #3). Without this, a requeued
@@ -3882,18 +4872,30 @@ class BlockManager:
                 # the wrong generation silently. A no-op once the load was taken
                 # (in flight): the entry is already gone and the orphan-slot path
                 # above holds the slot until `settle_state_load`.
+                # 【译】丢掉为这个请求排队、还没被取走的任何加载，和 `cancel_state_load` 的做法完全一样（finding #3）。不这样做的话，
+                #   一次重新排队或被抢占的准入会把它的条目留在 `_state_loads` 里，之后 `_publish_state_loads` 会把一个已不在
+                #   `metadata.requests` 中的请求的加载交给connector——层把数据写进一个已释放或孤儿化的槽位，而完成报告可能结算掉
+                #   这个请求*下一代*的停靠，把一次状态恢复悄悄算到错误的那一代上。加载一旦被取走（在途），这就是空操作：条目已经不在了，
+                #   上面的孤儿槽位路径会扣住槽位直到 `settle_state_load`。
                 self._state_loads = [e for e in self._state_loads if e[0] != seq.id]
                 self.state.release_many(seq.state_slots[1:])
             else:
                 self.state.release_many(seq.state_slots)
             # No next forward will read a pending fork source after deallocation.
+            # 【译】释放之后，不会再有下一次forward去读一个待执行的fork源。
+            # 解释：drop_reader：减掉这个读者的pin，没有别的读者了就把源槽位放回空闲列表（fork见cancel_state_fork上方）
             self.state.drop_reader(seq.state_fork_src)
             seq.state_slots = []
             seq.state_fork_src = -1
 
+        # 【分支】KV offload的联合边界（KV + 状态一起从CPU层恢复，第9批）：清掉状态加载的hash和联合加载的范围
         seq.offload_joint.load_hash = -1
         seq.offload_joint.reset_joint()
 
+    # ═══════════ can_append / may_append：decode（以及投机解码的草稿）要写KV的位置都得有block（A级） ═══════════
+    # 调用方：Scheduler._schedule的decode循环——先 while not can_append(...) 抢占队尾直到够用，再may_append真正分配；
+    #   准入之后Scheduler._allocate_prefill_draft_lookahead调 may_append(seq, 0, lookahead=draft_lookahead) 补草稿要写的块
+    # ebs = _effective_block_size() = block_size × DCP：一个block_table条目覆盖的全局token数（不开DCP时就是block_size）
     def can_append(
         self, seq: Sequence, num_new_tokens: int = 1, lookahead: int = 0
     ) -> bool:
@@ -3904,6 +4906,16 @@ class BlockManager:
         (`mtp_k - 1`), so the lookahead never raises the bar there; it is
         passed so the check states what it covers.
         """
+        # 【译】池子能否供得起 `may_append` 这一步要拿的block。
+        #
+        #   按 `len(seq) + max(num_new_tokens, lookahead)` 估算。decode一步的 `num_new_tokens`（`1 + mtp_k`）总是大于它的草稿前瞻
+        #   （`mtp_k - 1`），所以前瞻在那里从不抬高门槛；传进来是为了让这个检查写明它覆盖了什么。
+        # 解释：needed_blocks = ceil(reach / ebs)，减去已有的块数；_has_page_units：没有PAGE checkpoint时就是"空闲block ≥ n"，
+        #   有PAGE checkpoint时还把可以淘汰掉的checkpoint单元算作可用
+        # 观察：may_append实际只按 len(seq)（目标写到 len(seq) − 1）和 len(seq) + lookahead 分配，这里却按 len(seq) + num_new_tokens 估，
+        #   多估了num_new_tokens个位置。例（ebs = 16、不开MTP）：len = 32 时位置31是块1的最后一格，may_append不分配，这里却算出
+        #   需要 ceil(33/16) = 3 块、要求1个空闲block——池子正好用满时会多抢占一条请求。偏保守，不会少分配
+        # 对比nano-vllm：nano-vllm是 len(free) >= (len(seq) % block_size == 1)，和它的may_append逐位一致
         seq_len = len(seq)
         current_blocks = len(seq.block_table)
         ebs = self._effective_block_size()
@@ -3921,14 +4933,37 @@ class BlockManager:
         position past the last allocated block reads block id 0 from the zeroed
         block-table tail, and the write lands in whoever owns physical block 0.
         """
+        # 【译】为这一步的KV写入会落到的每个block分配好。
+        #
+        #   目标模型写到 `len(seq) - 1`；草稿轮再往后写 `lookahead` 个位置（`draft_kv_lookahead`）。检查池子有空间（`can_append`）
+        #   和真正分配它不是一回事：一个超出最后已分配block的位置，会从block table被清零的尾部读到block id 0，写入就落进物理block 0
+        #   的主人那里。
+        # 解释（ebs = 16，即block_size 16、不开DCP）：
+        #   不开MTP（num_new_tokens = 1，lookahead = 0），本步算位置 len − 1：
+        #     len = 33：33 % 16 = 1 → 位置32是新块的第一格 → needed = ceil(33/16) = 3，block_table从2块补到3块
+        #     len = 34：34 % 16 = 2 > 1 → 位置33落在已有的块2里，不分配；len = 48：48 % 16 = 0 → 不分配（位置47是块2的最后一格）
+        #   开MTP k = 3（num_new_tokens = 1 + k = 4，lookahead = draft_kv_lookahead(3) = k − 1 = 2）：
+        #     len里已含本步要验证的草稿占位，目标写位置 len−4 ~ len−1；草稿模型在forward里还要跑k − 1个中间步，
+        #     每步往后多写1个位置，最远写到 len + k − 2
+        #     len = 34：34 % 16 = 2 ≤ 4 → 位置30~33跨进块2 → needed = 3；lookahead：ceil((34 + 2)/16) = 3 → 补到3块
+        #     len = 47：47 % 16 = 15 > 4 → 目标的位置43~46都在块2里；但草稿写到 47 + 3 − 2 = 48 → 块3
+        #       → lookahead：ceil((47 + 2)/16) = 4 → 补块3。没有lookahead的话，位置48会从block table清零的尾部读到block id 0，
+        #       把草稿KV写进别人的block 0（draft_kv_lookahead的docstring）
+        # 对比nano-vllm：nano-vllm只在 len(seq) % block_size == 1 时补一块；ATOM一步可能写多个位置（MTP验证1 + k个、草稿再多写
+        #   k − 1个），所以条件放宽成"本步写的位置跨进了新块"，再用lookahead兜住草稿写的位置
         # Note: in disaggregated (P/D) mode the scheduler skips the
         # `num_new_tokens` half on the first decode step after remote prefill,
         # because those blocks were already allocated during the KV transfer.
+        # 【译】注意：在分离式（P/D）模式下，远端prefill之后的第一个decode步，调度器会跳过 `num_new_tokens` 那一半，
+        #   因为那些block在KV传输期间已经分配好了。
+        # 【分支】PD分离（第9批）：调度器此时传 num_new_tokens = 0（注入了首token T0时除外），只靠lookahead补草稿要写的块
         block_table = seq.block_table
         seq_len = len(seq)
         # Check if we need to allocate a new block
         # When len(seq) % block_size == 1, we need a new block for the next token
         # When block_size == 1, every token needs a new block
+        # 【译】检查是否需要分配新block：len(seq) % block_size == 1 时，下一个token需要一个新block；block_size == 1 时，每个token都需要新block。
+        # 解释：代码已推广成 0 < len % ebs ≤ num_new_tokens（本步写的num_new_tokens个位置跨进了新块），例子见上面
         ebs = self._effective_block_size()
         needed_blocks = 0
         if 0 < seq_len % ebs <= num_new_tokens or ebs == 1:
@@ -3939,6 +4974,9 @@ class BlockManager:
             # Decode-generated blocks: token not finalized yet (depends on
             # sampling / speculative verification), so we cannot compute a
             # correct hash here.  Just allocate the block without hashing.
+            # 【译】decode生成的block：token还没定下来（取决于采样 / 投机验证），所以这里算不出正确的hash，只分配、不登记hash。
+            # 解释：登记留给hash_decode_blocks。_fresh_block = 必要时先腾出PAGE单元，再kv.pop()（空白block优先，其次是最久没用的
+            #   可复用block——这时它的旧hash才被淘汰）+ kv.allocate()
             block_table.append(self._fresh_block())
 
     def draft_writes_allocated(self, seq: Sequence) -> bool:
@@ -3947,14 +4985,31 @@ class BlockManager:
         `len(seq) + draft_lookahead` positions, the bound `draft_kv_lookahead`
         derives. The scheduler checks it on every sequence it schedules.
         """
+        # 【译】`seq` 的block是否覆盖到这次forward草稿轮写的终点。
+        #
+        #   即 `len(seq) + draft_lookahead` 个位置，这是 `draft_kv_lookahead` 推出的上界。调度器对它调度的每条序列都检查一次。
+        # 解释：调用方Scheduler._check_draft_writes_allocated（不满足就报错，免得草稿KV写进block 0）。例：ebs = 16、len = 47、
+        #   draft_lookahead = 2 → 需要 4×16 = 64 ≥ 49，即block_table至少4块
         ebs = self._effective_block_size()
         reach = len(seq) + self.draft_lookahead
         return len(seq.block_table) * ebs >= reach
 
     # ---------------- KV event API ---------------- #
+    # 【译】---------------- KV事件API ----------------
+    # 【分支】KV事件（第4批distributed/kv_events.py；配置见config.py KVEventsConfig上方的说明，只由ATOM_KV_EVENTS_*环境变量打开）
+    # 前置：外部组件（例如按前缀命中情况路由请求的KV感知路由器、LMCache）想知道"哪台实例的GPU里缓存着哪些前缀block"。
+    #   BlockManager在这几处往_event_log追加事件（消息格式兼容vLLM的kv_events）：
+    #     存入：BlockStored(block_hashes, parent_block_hash, token_ids, block_size = hbs, medium, token_offset)
+    #       hash_blocks、publish_loaded_prefix登记新block时（medium = GPU）；record_remote_store（PD decode端收到远端KV，REMOTE）
+    #     淘汰：BlockRemoved([h])     _record_evicted：block被重新分配、它的hash被淘汰时
+    #     清空：AllBlocksCleared()    clear_cache
+    #   Scheduler.publish_kv_events在每个调度步结束时调take_events取走，交给发布器经ZMQ发出
+    #   例（hbs = 16）：一个chunk登记了块2、3、4 → 一条 BlockStored(hashes=[h2, h3, h4], parent=h1, token_offset=2×16=32)
 
     def take_events(self) -> list[KVCacheEvent]:
         """Drain and return events accumulated since the last call."""
+        # 【译】取走并返回自上次调用以来累积的事件。
+        # 解释：直接换成一个新的空列表再返回旧的，不拷贝
         if self._event_log is None or not self._event_log:
             return []
         self._event_log, events = [], self._event_log
@@ -3965,6 +5020,10 @@ class BlockManager:
         admin APIs. Does NOT touch blocks currently held by live sequences —
         they remain valid via their block_table refs, just unhashable for
         future requests."""
+        # 【译】丢掉所有前缀缓存条目。供 `/reset_prefix_cache` 一类的管理API使用。*不*影响活着的序列当前持有的block——它们通过
+        #   block_table引用仍然有效，只是以后的请求无法再按hash命中它们。
+        # 解释：同时清掉状态checkpoint的索引；_index_clears + 1 让can_allocate_memoized缓存的prefix walk全部失效
+        # 观察：atom/下没有调用方（也没有 /reset_prefix_cache 这个HTTP接口），只有tests/里调用
         self.kv.clear_index()
         self._state_checkpoint_cache.clear_index()
         self._index_clears += 1
@@ -3974,6 +5033,7 @@ class BlockManager:
     @property
     def kv_events_enabled(self) -> bool:
         """True iff KV events are being recorded."""
+        # 【译】当且仅当正在记录KV事件时为True。
         return self._event_log is not None
 
     def record_remote_store(
@@ -3989,6 +5049,12 @@ class BlockManager:
         consumers (LMCache, etc.) can track remote-resident blocks.
 
         `token_offset` is the sequence position of the first remote block."""
+        # 【译】为从远端KV传输producer那里收到的block（Mooncake / MoriIO的decode端）发出一个 BlockStored(medium=REMOTE)。
+        #   由KVConnector的worker在传输完成后调用，让外部的KV cache消费者（LMCache等）能追踪驻留在远端的block。
+        #
+        #   `token_offset` 是第一个远端block在序列中的位置。
+        # 观察：docstring说由KVConnector的worker调用，实际唯一的调用方是Scheduler._update_waiting_for_remote_kv
+        #   （PD consumer收完KV之后，紧接在register_received_prefix之后）
         if self._event_log is None or not block_hashes:
             return
         self._event_log.append(

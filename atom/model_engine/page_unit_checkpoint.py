@@ -785,7 +785,8 @@ class PageUnitCheckpointStore:
         #
         #   每次交出都有它自己的 generation，所以一个在淘汰之后被再次存储的前缀，和之前存它的那次是不同的操作。同一个 hash 的两次尝试
         #   不能同时在途——_hash_in_flight 会拒绝——但它们可能紧挨着发生，以至于较早那次的报告还在路上。
-        # 调用方：协调器 take_offload_stores ← BlockManager.take_state_stores（max_inflight 来自 OFFLOAD_MAX_PENDING_SAVES）
+        # 调用方：协调器 take_offload_stores ← BlockManager.take_state_stores ← Scheduler（max_inflight = _state_store_pending_cap，
+        #   即 connector 的 max_pending_saves，由 OFFLOAD_MAX_PENDING_SAVES / OFFLOAD_COPY_WORKERS 算出）
         out: list[tuple[StateStoreOperationId, tuple[int, ...]]] = []
         # Nominations whose hash is transiently in flight: held aside and
         # re-queued after the pass, NOT dropped (see below).
@@ -1073,8 +1074,8 @@ class PageUnitCheckpointStore:
 
     def was_reclaimed(self, op) -> bool:
         """Whether this store's source was taken back before it reported."""
+        # 【译】这次存储的源是否在它报告之前就被收回了。调用方：协调器 ← BlockManager.settle_state_store
         return op in self._offload_reclaimed
-        # 【译】（上面的 docstring）这次存储的源是否在它报告之前就被收回了。调用方：协调器 ← BlockManager.settle_state_store
 
     def _release_offload_pin(self, checkpoint_id: int) -> None:
         record = self.records.get(checkpoint_id)
@@ -1166,6 +1167,19 @@ class PageUnitCheckpointStore:
 class PagedStateCheckpointCoordinator:
     """Schedules PAGE-backed checkpoints for per-request state."""
 
+    # 【译】为每请求状态安排 PAGE 承载的 checkpoint。
+    # 它实现 state_cache.py 的 StateCheckpointCache 协议，copy 方式下是 BlockManager.state_caches 的唯一成员
+    #   （BlockManager.__init__：PagedStateCheckpointCoordinator(self.kv, checkpoint_spec, enabled=..., readable_midstep=...)，
+    #    之后 attach_midstep_scratch(self.state, ...)；有 CPU 层时再 attach_offload(state_offload, sink=can_store_state)）
+    # 每轮被调用的顺序（Scheduler.schedule 一轮）：
+    #   开头   complete_previous_batch（上一批的存 → READY、取 → 放 pin、midstep scratch 槽位还回）
+    #   准入   resumable_hit（门控）、begin_restore（命中时排恢复）、has_available_units（KV 与快照共用池的准入门）
+    #   构造   take_checkpoint_ops（把待存的边界变成 CheckpointStoreOp，连同排队的恢复一起交给本批）
+    #   之后   postprocess 里 checkpoint（记意图）、publish_midstep（midstep 时）；被淘汰的 KV 触发 unindex
+    # 和 StateSlotPool 的分工：本类管"快照"（住在 KV 池的页单元里）；活跃槽位、以及 midstep 用的临时 scratch 槽位仍由 StateSlotPool 分配
+
+    # copy 方式交接时拥有者不动，checkpoint 之后的 forward 不欠任何东西，所以 successor_room = 0（任何位置都能保存，
+    #   见 state_cache.py successor_room；对比 fork(1) 的 1）
     successor_room = 0.0
 
     # ------------------------- midstep checkpointing ------------------------ #
@@ -1196,6 +1210,26 @@ class PagedStateCheckpointCoordinator:
     #
     # A scratch slot is never a request's runtime slot, so nothing the owner
     # does next can overwrite it before its store is issued.
+    # 【译】midstep checkpoint
+    #
+    #   一份 PAGE 镜像由 runner 在之后某个 batch 之前发起的一次拷贝写成，源是一个槽位。默认不可读：镜像来自某次 forward
+    #   "结束"时所在的槽位，所以引擎把 prefill chunk 切在阶梯上。
+    #
+    #   kernel 暴露内部状态的后端（GDN 的 h）可以声明 readable_midstep，于是 forward 内部的某个位置通过一个从状态池借来的
+    #   scratch 槽位到达镜像：
+    #     reserve_midstep          forward 之前，为每个位置借一个 scratch 槽位。runner 把内部状态拷进去。
+    #     publish_midstep          forward 之后，把 (hash, scratch) 排队等待存储。
+    #     take_checkpoint_ops      构造下一个 batch 时，对每个排队的 scratch 调 begin_store，与 checkpoint 的待存边界被开始的方式完全一样。
+    #                              不在 publish 时做：begin_store 会进入存储的在途列表，由"下一次" complete_previous_batch 变成 READY，
+    #                              所以若在 publish 时开始，镜像会在它的拷贝运行之前一个 batch 就 READY——并且可被恢复。
+    #     complete_previous_batch  携带这些拷贝的 batch 已经发出，所以 scratch 回到状态池。这个槽位之后的写者会在同一个流上排在它后面。
+    #
+    #   scratch 槽位永远不是某个请求的运行时槽位，所以拥有者接下来做的任何事都不可能在它的存储发出之前覆盖它。
+    # 【分支】只有 Qwen GDN 在 ATOM_GDN_STATE_MIDSTEP=1 时声明 readable_midstep=True（gdn_attn.py state_transfer）；默认关闭，
+    #   这时下面 reserve / publish / cancel_midstep 都是空操作，prefill 照常被 checkpoint_cut 切在阶梯上
+    # 时间线（midstep，一格 = 一轮）：第 N 轮 plan_midstep → reserve_midstep 借 scratch → 第 N 批 forward 中 runner 把 h 切片拷进 scratch
+    #   → 第 N 轮 postprocess commit_midstep → publish_midstep 排队 → 第 N+1 轮构造 batch 时 _take_scratch_stores → begin_store（COPYING）
+    #   → 第 N+2 轮开头 complete_previous_batch：READY，scratch 还回状态池
 
     def __init__(
         self,
@@ -1205,23 +1239,31 @@ class PagedStateCheckpointCoordinator:
         offload=None,
         readable_midstep: bool = False,
     ) -> None:
+        # pool：KV 的 BlockPool（页单元从这里借）；spec：页单元几何；enabled = 开了前缀缓存且状态池有槽位；
+        # offload：CPU 层索引（构造时总是 None，由 attach_offload 接上）；readable_midstep：后端是否能 midstep 拍快照
         self.enabled = enabled
         self.readable_midstep = bool(readable_midstep)
         # The state pool scratch slots are borrowed from, and how many stores
         # one batch's copy descriptor has room for. Set by
         # `attach_midstep_scratch`; a readable coordinator without them
         # reserves nothing.
+        # 【译】借 scratch 槽位的那个状态池，以及一个 batch 的拷贝描述符能装多少次存储。由 attach_midstep_scratch 设置；
+        #   没有它们的可读协调器什么都不预留。
         self._scratch = None
         self._max_ops_per_batch = 0
         # Published `(hash, scratch slot)` not yet begun, oldest first.
+        # 【译】已发布、尚未开始的 (hash, scratch 槽位)，最老的在前。
         self._scratch_queued: list[tuple[int, int]] = []
         # Scratch slots whose store rides the batch built last pass.
+        # 【译】其存储搭在上一轮构造的 batch 上的 scratch 槽位。
         self._scratch_issued: list[int] = []
         # The CPU tier beneath this one, or None. Not a member of
         # `BlockManager.state_caches`: every one of those is a veto over where a
         # prefix may resume, and this does the opposite -- it makes MORE
         # boundaries reachable. It is consulted in exactly two places,
         # `resumable_hit` (the vote) and `take_offload_stores` (the sink).
+        # 【译】这一层下面的 CPU 层，或 None。不是 BlockManager.state_caches 的成员：那里的每一个都是对"前缀可以在哪里恢复"的否决，
+        #   而它做的恰恰相反——让"更多"边界变得可达。它只在两个地方被询问：resumable_hit（投票）和 take_offload_stores（接收端）。
         self.offload = offload
         self.store = PageUnitCheckpointStore(
             pool, spec, offload_sink=offload is not None
@@ -1231,16 +1273,24 @@ class PagedStateCheckpointCoordinator:
         # one overwrite the earlier before either was stored. Re-reaching the
         # *same* hash still collapses, which is what the hash in the key is
         # for -- that is one boundary reached twice, not two boundaries.
+        # 【译】以 (seq id, prefix hash) 为键而不是以 seq 为键：一个 prompt 的两个边界是两个 checkpoint，只以 seq 为键会让后一个
+        #   在两者都还没存之前就覆盖前一个。再次到达"同一个" hash 仍然会合并，这就是键里放 hash 的用处——那是一个边界到达了两次，
+        #   而不是两个边界。
+        # id(seq)：Python 内置函数，返回对象在其生命周期内唯一的整数标识（CPython 里是内存地址）
         self._pending: dict[tuple[int, int], tuple[Sequence, int]] = {}
         self._store_ops: list[CheckpointStoreOp] = []
         # External loads write temporary PAGE images before a runner gathers
         # them into an Active Slot. Owners include a transfer generation, so a
         # late release can never release a newer reservation.
+        # 【译】外部加载会先写临时的 PAGE 镜像，之后再由 runner 把它们 gather 进一个活跃槽位。所有者里包含传输的 generation，
+        #   所以一次迟到的释放永远不会释放一个更新的预留。
+        # 【分支】reserve / release / adopt_transfer_units 只被 kv_transfer/offload/mp/native_state_scheduler.py 使用，见第9批
         self._transfer_units: dict[Hashable, tuple[int, ...]] = {}
         self.checkpoints_kept = 0
         self.checkpoints_dropped = 0
         self.checkpoints_orphaned = 0
 
+    # applies：本类是否管这条 seq（开启且 seq 有每请求状态）；含义同 StateSlotPool.applies
     def applies(self, seq: Sequence) -> bool:
         return self.enabled and seq.has_per_req_cache
 
@@ -1254,6 +1304,11 @@ class PagedStateCheckpointCoordinator:
         own; `take_checkpoint_ops` begins only what fits and leaves the rest
         queued, still held in their scratch slots, for the next batch.
         """
+        # 【译】scratch 槽位从哪里来，以及每个 batch 的拷贝预算。
+        #   max_ops_per_batch 是 runner 的描述符暂存区能装的量，存与取合计（AttentionMetadataBuilder._checkpoint_staging）。
+        #   一个序列现在可以在一次 forward 里发布好几个位置，所以"每序列一次存储"的上界单靠它自己已经不成立；
+        #   take_checkpoint_ops 只开始装得下的那些，其余的留在队列里、仍占着各自的 scratch 槽位，等下一个 batch。
+        # 调用方：BlockManager.__init__（slot_pool = self.state，max_ops_per_batch = checkpoint_copy_ops_per_batch(max_num_seqs)）
         self._scratch = slot_pool
         self._max_ops_per_batch = int(max_ops_per_batch)
 
@@ -1265,6 +1320,10 @@ class PagedStateCheckpointCoordinator:
         on its way, is skipped -- writing it again would be refused by
         `begin_store` after spending the slot and the copy.
         """
+        # 【译】为这次 forward 覆盖到的每个 (position, hash) 借一个 scratch 槽位。
+        #   尽力而为、保持顺序，和槽位池的一样：在第一个借不到空闲槽位的位置停下。已经存好、或已经在路上的 hash 被跳过——
+        #   再写一次会在花掉槽位和拷贝之后被 begin_store 拒绝。
+        # 调用方：BlockManager.plan_midstep；返回的 (slot, pos, h) 存进 seq.midstep_reservations，runner 据此拷贝
         if not (self.readable_midstep and self.applies(seq)):
             return []
         if self._scratch is None:
@@ -1287,17 +1346,22 @@ class PagedStateCheckpointCoordinator:
         `take_checkpoint_ops` and READY one batch after that, the same two
         steps `checkpoint`'s boundaries take.
         """
+        # 【译】把每个已写好的 scratch 槽位排队，等待以它的 hash 存储。
+        #   此时还什么都找不到：镜像在下一次 take_checkpoint_ops 时开始，再过一个 batch 才 READY——和 checkpoint 的边界走的是同样两步。
+        # 调用方：BlockManager.commit_midstep（hash_blocks 末尾）
         del seq
         for slot, _pos, h in reservations:
             self._scratch_queued.append((h, slot))
 
     def cancel_midstep(self, reservations: list[tuple]) -> None:
         """Hand back scratch slots whose forward never ran."""
+        # 【译】还回那些 forward 从没跑过的 scratch 槽位。调用方：BlockManager.cancel_midstep（重新规划、deallocate 时）
         for slot, _pos, _h in reservations:
             self._scratch.release(slot)
 
     def _take_scratch_stores(self, budget: int) -> None:
         """Begin queued scratch stores, at most `budget` of them."""
+        # 【译】开始排队中的 scratch 存储，最多 budget 个。超出预算的留在队列里（仍占着 scratch 槽位）等下一个 batch
         queued, self._scratch_queued = self._scratch_queued, []
         for i, (h, slot) in enumerate(queued):
             if budget <= 0:
@@ -1310,6 +1374,7 @@ class PagedStateCheckpointCoordinator:
                 # Already stored, or no units for it: the scratch holds
                 # nothing anybody will read, and the forward that wrote it has
                 # completed, so it can go back now.
+                # 【译】已经存过了，或者没有单元可用：这个 scratch 里装的东西没人会读，而写它的 forward 已经完成，所以现在就可以还回去。
                 self._scratch.release(slot)
                 self.checkpoints_dropped += 1
                 continue
@@ -1318,6 +1383,10 @@ class PagedStateCheckpointCoordinator:
             self.checkpoints_kept += 1
             budget -= 1
 
+    # resumable_hit（协议方法，见 state_cache.py）：从 hit-1 往左扫，返回第一个"镜像能拿到"（_reachable：HBM 里有 READY 的，
+    #   或 CPU 层可能有）的边界 + 1；都没有返回 0。与 StateSlotPool 不同，这里没有 min_fork_tokens 测试——copy 不欠后继 token。
+    #   assume_checkpointed=True 时直接返回 hit（反事实：每个边界都有快照），供 _record_checkpoint_demand 算按需位置
+    # 调用方：BlockManager._gated_hit
     def resumable_hit(
         self,
         seq: Sequence,
@@ -1352,6 +1421,16 @@ class PagedStateCheckpointCoordinator:
         it would then refuse strands the scan at the tier rung -- skipping a
         still-resident HBM rung -- and forfeits the checkpoint to a recompute.
         """
+        # 【译】h 的镜像能否被"产生"出来，在 HBM 里或从 CPU 层。
+        #   扫描从右往左、停在它接受的第一个边界，所以接受一个谁也交付不了的边界，代价是整段回退——它会把每个仍在 HBM 里的更短 checkpoint
+        #   都挡住。不需要优先级规则：两层都以同一个内容 hash 为键，而 _attach_state_slots 无论如何都先试 HBM。
+        #
+        #   这一层的那一半是故意乐观的——hashes 意味着"曾经存过一次"，绝不是"现在还在"。假阳性的代价是一次停车加一次重算，
+        #   并且会自我撤回（fail_load -> forget）；要做到确定，就得在准入路径上做一次同步的跨进程查找。
+        #
+        #   这一层的那一半走 could_serve 而不是裸的 h in hashes，所以它也遵守 can_load：只存的角色（kv_producer）用自己的存储填充
+        #   hashes，却不能把它们加载回来；投出一个它随后会拒绝的命中，会让扫描卡在这一层的那一级——跳过一个仍在 HBM 里的级——
+        #   并把这个 checkpoint 丢给一次重算。
         if self.store.contains(h):
             return True
         return self.offload is not None and self.offload.could_serve(h)
@@ -1388,6 +1467,25 @@ class PagedStateCheckpointCoordinator:
         the bytes allow: the newer boundary is the one the slot actually holds,
         so it wins and the older is dropped rather than mis-stored.
         """
+        # 【译】登记一个待存的边界，以 hash 而不是以 seq 为键。
+        #   一个 seq 到达的每个边界都会保留下来，而不只是最后一个：一个锚点，和它之后一个 chunk 才到的 prompt 末尾 checkpoint，
+        #   是两个独立的条目。只以 seq 为键会让第二个在两者都没存之前就覆盖第一个，这会让每个 prompt 都付出一个被截短的 prefill chunk，
+        #   却什么也换不来。让"两个都保留"付得起的，是镜像的价格相对于 fork 下一整个活跃槽位而言很便宜。
+        #
+        #   锚点是会带来回报的放置，阶梯不是（见 BlockManager._record_checkpoint_end），所以 --state-checkpoint-interval-tokens -1
+        #   会去掉网格，只留锚点和按需一级这两种放置。
+        #
+        #   不过是"每个 seq 每次排空一个条目"，这和"每个 seq 一个"不是一回事。一个待存边界指明了一个 hash 和将被读取的槽位，
+        #   而槽位是在排空时才读的——所以如果两个边界都活到同一次排空，它们都会从"最后一次" forward 留在那里的东西存起来，
+        #   把较早的 hash 登记在较晚的状态上。从它恢复的请求会从一个"超前于它自己前缀"的点继续，而下游没有任何东西能察觉：
+        #   _validate_paged_state_op 检查的布局、大小和单元数都仍然对得上。
+        #
+        #   通常每次 forward 之后都有一次排空，所以一个 prompt 的两个边界通常从各自不同的槽位状态正确地存下来。例外是一个什么都没调度的轮次
+        #   （scheduler.py:1828 在空 batch 上传 state_maintenance_ops=None），它把 _pending 带进下一次排空。_supersede 用字节唯一允许的方式
+        #   解决：较新的边界才是槽位里实际装着的，所以它胜出，较老的被丢弃而不是被存错。
+        # 观察：docstring 里的 scheduler.py:1828 是旧行号；v0.1.8 中对应的是 Scheduler._schedule 构造 decode batch 处
+        #   state_maintenance_ops=(take_state_maintenance_ops() if scheduled_seqs else None)
+        # 调用方：BlockManager.hash_blocks（checkpointers_at 认可本类时）；boundary_blocks 不用（del 掉），位置已经编码在 h 里
         del boundary_blocks
         if self.applies(seq) and seq.state_slot >= 0:
             self._supersede(id(seq))
@@ -1400,6 +1498,8 @@ class PagedStateCheckpointCoordinator:
         asked for and did not get, and it is the only signal that empty passes
         are costing checkpoints.
         """
+        # 【译】丢掉这个 seq 更早的待存边界；槽位已经往前走了。
+        #   计为 dropped，而不是悄悄忘掉：这是放置要求了却没得到的复用，也是"空轮次正在让我们损失 checkpoint"的唯一信号。
         stale = [k for k in self._pending if k[0] == seq_id]
         for key in stale:
             del self._pending[key]
@@ -1411,6 +1511,9 @@ class PagedStateCheckpointCoordinator:
         A seq can now hold several. All of them describe state in the slot
         that is about to go back on the free list, so all of them die with it.
         """
+        # 【译】丢掉这个 seq 所有待存的边界，而不只是最后一个。
+        #   一个 seq 现在可以有好几个。它们描述的都是那个马上要回到空闲表的槽位里的状态，所以全部随它一起死掉。
+        #   （同时取消写这个槽位的排队恢复）调用方：BlockManager.deallocate
         seq_id = id(seq)
         for key in [k for k in self._pending if k[0] == seq_id]:
             del self._pending[key]
@@ -1422,11 +1525,18 @@ class PagedStateCheckpointCoordinator:
         The evidence that a PAGE checkpoint really is behind a boundary the
         request has claimed; see `BlockManager._state_leg_secured`.
         """
+        # 【译】是否有一个排队中的恢复会在下一个 batch 写 dst_slot。
+        #   这是"一个 PAGE checkpoint 确实在这个请求认领的边界后面"的证据；见 BlockManager._state_leg_secured。
         return self.store.restore_queued_for(dst_slot)
 
+    # begin_restore：命中时排一次恢复（见 store.begin_restore）；调用方 BlockManager._attach_state_slots，False 时再试 CPU 层加载
     def begin_restore(self, h: int, dst_slot: int) -> bool:
         return self.store.begin_restore(h, dst_slot) is not None
 
+    # take_checkpoint_ops：构造 batch 时调用一次（BlockManager.take_state_maintenance_ops），返回 (本批要执行的存, 本批要执行的取)
+    #   1. 把 _pending 里每个边界变成 begin_store(h, seq.state_slot)（槽位此刻装的正是那个边界的状态，见 checkpoint 的 docstring）
+    #   2. 取走排队的恢复（store.take_restore_ops）
+    #   3. 用剩下的描述符预算（max_ops_per_batch − 存 − 取）开始排队中的 midstep scratch 存储
     def take_checkpoint_ops(
         self,
     ) -> tuple[tuple[CheckpointStoreOp, ...], tuple[CheckpointRestoreOp, ...]]:
@@ -1435,6 +1545,7 @@ class PagedStateCheckpointCoordinator:
             # Safe to read now because `checkpoint` keeps at most one pending
             # boundary per seq: this slot holds the state as of that boundary
             # and no other. See `_supersede`.
+            # 【译】现在读是安全的，因为 checkpoint 对每个 seq 最多只保留一个待存边界：这个槽位装的就是那个边界时的状态，没有别的。见 _supersede。
             src_slot = seq.state_slot
             if src_slot < 0 or self.store.contains_or_pending(h):
                 continue
@@ -1452,13 +1563,16 @@ class PagedStateCheckpointCoordinator:
         stores, self._store_ops = self._store_ops, []
         return tuple(stores), restores
 
+    # complete_previous_batch：每轮开头（BlockManager.complete_previous_state_batch）结算上一批：存 → READY、取 → 放 pin、scratch 还回状态池
     def complete_previous_batch(self) -> None:
         self.store.complete_inflight()
         # The batch that carried these stores has been issued.
+        # 【译】携带这些存储的 batch 已经发出。
         issued, self._scratch_issued = self._scratch_issued, []
         for slot in issued:
             self._scratch.release(slot)
 
+    # 下面两个直接转给 store：BlockManager 的 _has_page_units / _checkpoint_has_room / _ensure_page_units 用它们做 KV 池的准入与分配
     def has_available_units(
         self, count: int, protected_hash: int | None = None
     ) -> bool:
@@ -1475,6 +1589,9 @@ class PagedStateCheckpointCoordinator:
         are refused. The caller releases these units only after both the
         transfer and restore stop using them. No checkpoint is published and no Active Slot is touched.
         """
+        # 【译】为一次已准入的外部加载预留一份原始 checkpoint 镜像的单元。
+        #   owner 必须唯一地标识这次传输尝试，包括它的 generation。重复的活跃所有者、或可用单元不足都会被拒绝。
+        #   调用方只有在传输和恢复都不再使用这些单元之后才释放它们。不发布任何 checkpoint，也不碰任何活跃槽位。
         if owner is None:
             raise ValueError("a transfer reservation needs an owner")
         if owner in self._transfer_units:
@@ -1491,6 +1608,7 @@ class PagedStateCheckpointCoordinator:
 
     def release_transfer_units(self, owner: Hashable) -> None:
         """Release a completed or safely cancelled load reservation, once."""
+        # 【译】释放一个已完成或已安全取消的加载预留，只释放一次。
         units = self._transfer_units.pop(owner, None)
         if units is not None:
             self.store.pool.release_units(units, ("state-transfer", owner))
@@ -1503,14 +1621,19 @@ class PagedStateCheckpointCoordinator:
         units are released and ``False`` is returned. The adopted checkpoint is
         deliberately not nominated for offload: it just arrived from that tier.
         """
+        # 【译】发布一份已完成的外部镜像，同时不让它在中途暴露给复用。
+        #   当这次传输的单元成为规范的 READY checkpoint 时返回 True。如果同一个 hash 被并发发布了，进来的单元被释放并返回 False。
+        #   被收养的 checkpoint 故意不提名去 offload：它就是刚从那一层来的。
         units = self._transfer_units.get(owner)
         if units is None:
             return False
         adopted = self.store.adopt_units(units, ("state-transfer", owner), prefix_hash)
         # Only now: if adoption raised, the units stay reachable for release.
+        # 【译】只在现在才删：如果收养抛了异常，这些单元仍然能被找到并释放。
         del self._transfer_units[owner]
         return adopted
 
+    # 下面三个挂起 / 恢复 / 释放排队恢复的方法直接转给 store（【分支】native_state_scheduler.py 用，见第9批）
     def suspend_queued_restore(
         self, dst_slot: int
     ) -> SuspendedCheckpointRestore | None:
@@ -1529,6 +1652,9 @@ class PagedStateCheckpointCoordinator:
         answers "would a resume be free", and is what the `state_hbm` /
         `state_tier` split reports.
         """
+        # 【译】HBM 现在是否持有 h 的一份 READY 镜像。
+        #   与 _reachable 不同，那个还算上了 CPU 层：这个回答的是"一次恢复是否免费"，也是 state_hbm / state_tier 划分所报告的。
+        # 调用方：BlockManager._joint_kv_boundary（state_from_hbm）
         return self.store.contains(h)
 
     def attach_offload(self, index, *, sink: bool = True) -> None:
@@ -1542,50 +1668,68 @@ class PagedStateCheckpointCoordinator:
         separately, which would either vote for hashes nothing stores or pin
         units nothing releases.
         """
+        # 【译】在两个对象都存在之后，把 CPU 层接进来。
+        #   不作为构造参数，是因为两者的构造顺序是反的：本类需要 checkpoint_spec，它来自 state_runtime；而索引需要 connector 配置。
+        #   一次调用设置两半——投票（_reachable）和接收端（一个 READY checkpoint 到底要不要被提名）——所以它们不能被分开打开，
+        #   否则要么为没人存的 hash 投票，要么钉住没人释放的单元。
+        # 调用方：BlockManager.__init__（state_offload 建好之后）
         self.offload = index
         # `sink` is the store half specifically: a load-only role still votes
         # off `hashes` but must nominate nothing, since a nomination that is
         # handed over takes a pin nobody will release.
+        # 【译】sink 专指存储那一半：只取的角色仍然根据 hashes 投票，但什么都不能提名，因为一次被交出去的提名会取一个没人会释放的 pin。
         self.store._offload_sink = index is not None and bool(sink)
 
+    # 【分支】下面七个方法是 CPU 层存储一侧的薄转发（调用方：BlockManager 的 take_state_stores / settle_state_store /
+    #   release_state_store_source / has_pending_state_store_pins / reclaim_stale_state_store_pins，以及 native_state_scheduler.py），
+    #   语义见 PageUnitCheckpointStore 同名方法
     def take_offload_stores(
         self, max_inflight: int
     ) -> list[tuple[StateStoreOperationId, tuple[int, ...]]]:
         """`(operation, unit_ids)` to hand the tier now. See the store."""
+        # 【译】现在要交给这一层的 (operation, unit_ids)。见 store。
         return self.store.take_offload_stores(max_inflight)
 
     def acquire_checkpoint_source(
         self, prefix_hash: int, *, max_inflight: int | None = None
     ) -> tuple[StateStoreOperationId, tuple[int, ...]] | None:
         """Lease an admitted transfer's exact READY image. See the store."""
+        # 【译】为一次已准入的传输租用它确切的 READY 镜像。见 store。
         return self.store.acquire_checkpoint_source(
             prefix_hash, max_inflight=max_inflight
         )
 
     def release_offload_store_source(self, op: StateStoreOperationId) -> None:
         """The gather drained; hand the units back but keep the pin. See store."""
+        # 【译】gather 已排空；把单元还回去，但保留 pin。见 store。
         self.store.release_offload_store_source(op)
 
     def settle_offload_store(self, op: StateStoreOperationId) -> None:
         """One store reported, either way; retire the operation. See store."""
+        # 【译】一次存储报告了，不管结果如何；让这个操作退役。见 store。
         self.store.settle_offload_store(op)
 
     def has_offload_pins(self) -> bool:
         """Whether any dispatched store is still pinning its units. See store."""
+        # 【译】是否还有任何已派发的存储在钉着它的单元。见 store。
         return self.store.has_offload_pins()
 
     def reclaim_stale_offload_pins(self, timeout_s: float) -> int:
         """Release offload pins whose report never came. See the store."""
+        # 【译】释放那些报告一直没来的 offload pin。见 store。
         return self.store.reclaim_stale_offload_pins(timeout_s)
 
     def was_reclaimed(self, op) -> bool:
         """Whether this store's source was taken back before it reported."""
+        # 【译】这次存储的源是否在它报告之前就被收回了。
         return self.store.was_reclaimed(op)
 
     def unindex(self, h: int) -> None:
         # `_pending` is keyed by `(seq, hash)`, so one hash can be pending for
         # several sequences at once -- two turns of a conversation reaching the
         # same boundary. All of them lose it together.
+        # 【译】_pending 以 (seq, hash) 为键，所以一个 hash 可以同时为好几个序列待存——一段对话的两轮到达了同一个边界。它们一起失去它。
+        # 调用方：BlockManager._record_evicted（该 hash 的 KV block 被淘汰）；有东西被删就计一次 checkpoints_orphaned
         stale = [key for key, (_, pending_h) in self._pending.items() if pending_h == h]
         for key in stale:
             del self._pending[key]
@@ -1604,6 +1748,11 @@ class PagedStateCheckpointCoordinator:
         the operator created. The reset is visible in the drop in
         `checkpoints_kept`'s growth rate, and in the admin call itself.
         """
+        # 【译】丢掉一切，用于 /reset_prefix_cache 一类的管理调用。
+        #   四种命运计数一个都不动，这是故意的而不是疏忽：每一种都指向不同的修法——dropped 要更大的池，evicted 要活得更久的池，
+        #   orphaned 要更大的分页池——而运维有意清空缓存，指向的是哪一种都不是。把一次重置记到任何一种上，都会让调优去追一个
+        #   运维自己制造的数字。重置能从 checkpoints_kept 增长率的下降里看出来，也能从那次管理调用本身看出来。
+        # 调用方：BlockManager.clear_cache
         self._pending.clear()
         self.store.clear()
 
@@ -1620,18 +1769,28 @@ class PagedStateCheckpointCoordinator:
         Keys are prefixed `state_offload_` because the aggregation upstream is
         by key across every state class.
         """
+        # 【译】这个类的 checkpoint 后来怎样了，外加 CPU 层自己的。
+        #   CPU 层的计数在这里合并，而不是单独报告，因为两者只有放在一起才有意义：stores_completed 只有作为 checkpoints_kept 的一部分
+        #   才值得读，而一个什么都没存的层，和一个从没被要求过的层，除非两个数字在同一行上，否则无法区分。合并进来让 PAGE 下的
+        #   加载和存储两条腿重新可见。
+        #
+        #   键以 state_offload_ 为前缀，因为上游是按键在所有状态类之间汇总的。
+        # 调用方：BlockManager.state_checkpoint_fates（周期性的 "state checkpoints:" 日志）
         fates = {
             "checkpoints_kept": self.checkpoints_kept,
             "checkpoints_dropped": self.checkpoints_dropped,
             "checkpoints_evicted": self.store.evictions,
             # Non-zero means store reports are being lost, which would
             # otherwise show only as a pool that has quietly shrunk.
+            # 【译】非零表示存储报告在丢失，否则这只会表现为一个悄悄缩小了的池子。
             "offload_pins_reclaimed": self.store.offload_pins_reclaimed,
             "checkpoints_orphaned": self.checkpoints_orphaned,
         }
         # `getattr`, not a direct call: `attach_offload` accepts anything that
         # answers `hashes`, and the tests attach a double that does not carry
         # counters. A missing `stats` means "no numbers to fold", not an error.
+        # 【译】用 getattr 而不是直接调用：attach_offload 接受任何能回答 hashes 的东西，而测试接上的替身不带计数器。
+        #   缺 stats 表示"没有数字可合并"，不是错误。
         stats = getattr(self.offload, "stats", None) if self.offload else None
         if callable(stats):
             fates.update((f"state_offload_{k}", v) for k, v in stats().items())
@@ -1641,6 +1800,9 @@ class PagedStateCheckpointCoordinator:
             # climbs toward the cap means checkpoints are reaching READY faster
             # than the tier drains them and fresh nominations are queueing behind
             # stale ones; at the cap the oldest are dropped, counted next to it.
+            # 【译】是仪表值而不是计数器：有多少提名在 OFFLOAD_MAX_PENDING_SAVES 之下等一个名额。队列受 _offload_backlog_cap 限制、
+            #   从最老的开始排空，所以一个向上限攀升的值意味着 checkpoint 变 READY 的速度快于这一层排空它们的速度，新提名排在陈旧提名后面；
+            #   到了上限，最老的被丢弃，丢弃数紧挨着它记录。
             fates["state_offload_store_backlog"] = len(self.store.store_backlog)
             fates["state_offload_nominations_dropped"] = (
                 self.store.offload_nominations_dropped
