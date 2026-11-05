@@ -357,16 +357,17 @@ def draft_kv_lookahead(num_speculative_tokens: int) -> int:
 
 # Blocks `_hit_walk` hashes per round past the cached prompt chain, doubling
 # from MIN to MAX; bounds the hashing wasted past the first miss.
+# 【译】_hit_walk 在已缓存的prompt链之外每轮hash的block数，从MIN开始翻倍到MAX；限制第一次未命中之后白算的hash数。
+# 例：链没算到的部分按64、128、256、512、1024、1024…块一轮现算
 _WALK_HASH_ROUND_MIN = 64
 _WALK_HASH_ROUND_MAX = 1024
 # Blocks `_hit_walk` looks up per round on the cached chain: the first block
 # alone, then 16, growing 4x; bounds the lookups past the first miss to ~4x
 # the hit.
-# 【译】_hit_walk 在已缓存的prompt链之外每轮hash的block数，从MIN开始翻倍到MAX；限制第一次未命中之后白算的hash数。
-#   _hit_walk 在已缓存的链上每轮查表的block数：先只查第一个block，然后16个，每轮×4；把第一次未命中之后多查的次数
+# 【译】_hit_walk 在已缓存的链上每轮查表的block数：先只查第一个block，然后16个，每轮×4；把第一次未命中之后多查的次数
 #   限制在命中长度的约4倍。
-# 例（prompt链已由前端算好，一个128k token的prompt、block 16 → 8000块）：冷prompt只查1次就知道没命中；
-#   全命中时按1、16、64、256、1024、4096…一轮轮查，几轮就走完。链没算到的部分按64、128、256、512、1024、1024…块一轮现算
+# 例（prompt链已由前端算好，一个128k token的prompt、block 16 → 约8000块）：冷prompt只查1次就知道没命中；
+#   全命中时按1、16、64、256、1024、4096…块一轮轮查，几轮就走完
 _WALK_LOOKUP_ROUND_MIN = 16
 
 
