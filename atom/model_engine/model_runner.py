@@ -2289,34 +2289,105 @@ class ModelRunner:
         #   返回计数是因为 `busy_loop` 只在 `if out is not None` 时才回复——返回None的RPC目标会让 `wait_out=True` 的调用方挂住。
         return freeze_gc_heap(worker_process_name(self.config, self.rank))
 
+    # =====================================================================================
+    # get_num_blocks：KV cache能放多少个block（以及每请求状态池要多少槽位）——ATOM版的"显存预算"（A级）
+    #   调用方：EngineCore.__init__ 经 call_func("get_num_blocks", wait_out=True)，只取rank 0的返回值；
+    #     此时本rank的__init__（含warmup）已跑完，分配器的峰值统计里记着warmup那次满额prefill的激活峰值
+    #   输出：dict（见末尾return），由EngineCore回填进它的Config，再交给allocate_kv_cache和Scheduler / BlockManager
+    #   本段是显存预算条的规范位置（engine_core.py __init__上方的预算条是它的概要，数字与这里一致）
+    #
+    # ① 显存都花在哪：用PyTorch分配器的统计量把整张卡拆开（GB按2^30字节，与日志一致）
+    #   例：192GB的卡、--gpu-memory-utilization 0.9、70B稠密模型FP8权重（TP=1，≈70GB）、80层、8个KV头、head_dim=128、
+    #     --kv-cache-dtype fp8、block_size=16、默认--cudagraph-mode FULL；warmup（16384个token）的激活峰值≈8GB
+    #
+    #   0                                                                                                 192GB（total）
+    #   ├──────── 常驻（权重等）70 ────────┼激活峰值 8┼非torch≈2┼graph 1.6┼余量3.84┼─────── KV ≈87.36 ───────┼不进预算 19.2┤
+    #   │◄─────────── current ───────────►│          │                                                     │
+    #   │◄────────── peak（= peak_torch）───────────►│                                                     │
+    #   │◄──────────────────────────────── budget = total × util = 172.8 ─────────────────────────────►│
+    #
+    #   变量                     怎么得到                                                                  例（GB）
+    #   current                 分配器当前已分配的字节：权重 + forward_vars等常驻buffer                         70
+    #   peak                    warmup开头reset_peak_memory_stats之后分配器的最高点 = 常驻 + 激活峰值             78
+    #   peak_torch              max(peak, current)                                                         78
+    #   non_torch               (total − free) − memory_reserved()：不经PyTorch分配器的显存——RCCL/aiter custom
+    #                           all-reduce的缓冲、HIP运行时，以及同卡上其他进程占的                                ≈2
+    #   cudagraph_overhead      _estimate_cudagraph_overhead()：FULL时 (peak − current) × 0.2                  1.6
+    #   safety_margin           total × 2%                                                                 3.84
+    #   non_kv_overhead         peak_torch + non_torch + cudagraph_overhead + safety_margin               85.44
+    #   available_for_kv_budget budget − non_kv_overhead − extra_reserve（RapidServe 8%）− connector_bytes   87.36
+    #   free_for_kv             free − connector_bytes：物理上限，别的进程占着的显存不能算给KV                    ≈120
+    #   available_for_kv        min(available_for_kv_budget, free_for_kv)                                  87.36
+    #
+    # ② 一个block多少字节：不再是一个写死的公式，而是每个注意力builder声明的子池规格（sub_pool_specs）
+    #   (a) MHA/GQA（aiter_attention.py + mha_kv_pool.py）：一个block = 本rank所有全注意力层的K、V（fp8时再加scale）
+    #         K、V        2 × 层数 × 本rank的KV头 × head_dim × block_size × 元素字节 = 2×80×8×128×16×1B = 2,621,440 B
+    #         fp8 scale   每个(层, KV头, token)一个fp32：2×80×8×16×4B = 81,920 B（bf16 KV没有这一项）
+    #         合计2,703,360 B ≈ 2.58MB（每个字段按256B对齐，这里恰好对齐）→ 87.36GB / 2.58MB ≈ 34,698个block ≈ 55.5万个token
+    #   (b) MLA（aiter_mla.py + mla_kv_pool.py，DeepSeek-V3等）：每层每token只存一行576维latent（512维k_c + 64维k_pe），
+    #         没有单独的V和scale；而且不按TP切（只有1个"KV头"，-tp 8时8张卡各存一整份，DP-attention就是为此而来，
+    #         见engine_core_mgr.py的【科普】DP-attention）
+    #         61层 × 16 × 576 × 1B（fp8）= 562,176 B ≈ 549KB/block（每token ≈ 34KB，约为(a)的1/5；开MTP时MTP层也在池里，62行）
+    #         DSA索引器（V3.2、GLM-5等）每block再加：61 × 16 × 144B（128维fp8 key + 4B scale，补齐到16B）= 140,544 B
+    #   (c) 混合模型（gdn_attn.py，Qwen3-Next：12层全注意力 + 36层GDN，TP=1、bf16 KV）：
+    #         PAGE子池只装12层全注意力：2 × 12 × 2个KV头 × 256 × 16 × 2B = 393,216 B = 384KB/block
+    #         STATE子池：每请求一份GDN递归状态 ≈ 37.7MB（state_pool.py【科普】②），每请求槽位数 = 1 + num_spec（ReplaySSM时为1）
+    #       DeepSeek-V4的滑动窗口、压缩器环也是STATE类（deepseek_v4_attn.py，第8批）
+    #
+    # ③ plan_pools（pool_layout/sub_pool_spec.py）：先扣STATE（请求没有它就跑不了），剩下的全给PAGE
+    #     STATE条目数 = max_num_seqs × entries_per_req + extra_entries；PAGE条目数 = 剩余字节 // PAGE每条目字节
+    #     例（(c)，max_num_seqs=512、不开MTP）：先扣 512 × 37.7MB ≈ 18.8GB，剩下的才按384KB切成block；
+    #     剩余 ≤ 0 时抛InsufficientPoolBudget，下面换算成"--gpu-memory-utilization至少要多大"的报错
+    # ④ PP：各stage层数不同，算出的block数不同；而block id要在每个stage都合法，所以all_reduce(MIN)取最小值
+    # ⑤ 【分支】copy式状态checkpoint（state_pool.py【科普】⑤）：把快照切成"页单元"存进PAGE池，这里算出页单元的规格
+    #
+    # 对比nano-vllm：nano-vllm是 total×util − used − peak + current（used = total − free，含权重和非torch显存），
+    #   再除以 2×层数×block_size×KV头×head_dim×dtype字节。同一个例子它得到 172.8 − 72 − 8 = 92.8GB，ATOM是87.36GB。ATOM多扣了：
+    #   ① CUDA Graph私有池的估计（1.6GB；nano-vllm先按util填满KV再录图，graph池落在util之外的那部分显存里）；② 2%安全余量（3.84GB）；
+    #   ③ 每请求状态池（STATE，混合模型/V4）；④ KV connector缓冲（PD分离）、RapidServe的额外8%；
+    #   还多了⑤ 实际空闲显存的上限（同卡还有别的进程时）和⑥ PP的跨stage取最小；block字节数也从写死的MHA公式变成各后端声明
+    # =====================================================================================
     def get_num_blocks(self) -> dict[str, object]:
+        # 与__init__同理，临时把默认device设成本GPU；显存算完后恢复None
         torch.set_default_device(self.device)
         config = self.config
         hf_config = config.hf_config
+        # 有的HF config不带head_dim字段，按 hidden_size / 头数 补上（MhaKvPool.from_hf_config等按它算每个KV头的大小）
         if not hasattr(hf_config, "head_dim") or hf_config.head_dim is None:
             hf_config.head_dim = hf_config.hidden_size // hf_config.num_attention_heads
 
+        # 驱动视角：本卡空闲字节、总字节（空闲量已扣掉同卡其他进程的占用）
         free, total = torch.cuda.mem_get_info()
+        # 分配器视角：peak = 自warmup开头reset以来已分配字节的最高点；current = 此刻已分配的字节（见上方①的表）
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         # weights + peak activation tensors (PyTorch allocator high-water).
+        # 【译】权重 + 峰值时的激活张量（PyTorch分配器的最高水位）。
         peak_torch = max(peak, current)
         # RCCL/NCCL buffers etc. held outside the allocator: device-used minus
         # torch-reserved. Ignoring it over-allocates KV and OOMs at runtime.
+        # 【译】RCCL/NCCL的缓冲等由分配器之外持有的显存：设备已用量减去torch已预留量。忽略它会把KV分多了，运行时OOM。
+        # 解释：memory_reserved()是分配器向驱动要来的全部显存（已分配 + 缓存着的空闲块）；warmup末尾已empty_cache，所以它≈current
         non_torch = max((total - free) - torch.cuda.memory_reserved(), 0)
 
+        # CUDA Graph私有池的预估（见_estimate_cudagraph_overhead上方）和整卡2%的安全余量
         cudagraph_overhead = self._estimate_cudagraph_overhead()
         safety_margin = int(total * 0.02)
 
+        # 预算 = 整卡 × util；扣掉一切非KV开销，剩下的就是KV（含每请求状态池）能用的
         budget = int(total * config.gpu_memory_utilization)
         non_kv_overhead = peak_torch + non_torch + cudagraph_overhead + safety_margin
         available_for_kv_budget = budget - non_kv_overhead
 
         # Physical clamp: never exceed what's actually free on the GPU.
         # Subclasses may reserve extra headroom (override point).
+        # 【译】物理上限：绝不超过GPU上实际空闲的量。子类可以额外预留余量（覆写点）。
+        # 解释：这两句注释前一句说的是下面的min(..., free_for_kv)，后一句才是紧接着的_kv_budget_extra_reserve
         extra_reserve = self._kv_budget_extra_reserve(total)
         available_for_kv_budget -= extra_reserve
         # GPU buffers the KV connector allocates after the KV cache is sized.
+        # 【译】KV connector在KV cache定好大小之后才分配的GPU缓冲。
+        # 【分支】PD分离：例如mooncake connector的MLA staging / landing池（第9批），现在不扣，之后分配时就没地方了
         connector_bytes = KVConnectorFactory.kv_budget_reserve_bytes(config)
         if connector_bytes:
             logger.info(
@@ -2325,10 +2396,12 @@ class ModelRunner:
             available_for_kv_budget -= connector_bytes
         # This prevents OOM when other processes share the GPU. Free HBM must
         # cover the connector buffers too.
+        # 【译】这能防止其他进程共用GPU时OOM。空闲的HBM还必须能装下connector的缓冲。
         free_for_kv = free - connector_bytes
         if connector_bytes and free_for_kv <= 0:
             # Otherwise the KV cache gets nothing and the connector allocates
             # from memory that is not there.
+            # 【译】否则KV cache什么也拿不到，而connector要从并不存在的显存里分配。
             raise RuntimeError(
                 f"Only {free / (1 << 30):.2f}GB is free on the GPU, less than "
                 f"the {connector_bytes / (1 << 30):.2f}GB the KV connector "
@@ -2336,10 +2409,12 @@ class ModelRunner:
                 "turn those buffers off (ATOM_PD_MLA_STAGING=0 / "
                 "ATOM_PD_MLA_LANDING=0)."
             )
+        # 预算口径和物理口径取小（上方①的表；例子里是87.36GB）
         available_for_kv = min(available_for_kv_budget, free_for_kv)
 
         torch.set_default_device(None)
 
+        # 各builder声明的子池规格（_sub_pool_specs上方；每block字节数的例子见本方法上方②）
         specs = self._sub_pool_specs()
 
         # Sub-pool sizing is pure arithmetic over the byte budget — see
@@ -2350,12 +2425,20 @@ class ModelRunner:
         # called, is the backend's business — the runner sizes them and
         # publishes the counts, then every consumer looks up the class it
         # declared itself.
+        # 【译】子池的规模计算只是对字节预算做算术——见 atom/model_ops/attentions/pool_layout/sub_pool_spec.py。
+        #   STATE类（GDN递归状态、V4压缩器环、V4滑动窗口）先拿走它们的下限，因为请求没有它们就跑不起来；PAGE类吸收剩下的全部。
+        #   有哪些类、叫什么名字，是后端的事——runner只负责算出规模、发布条目数，之后每个使用者按自己声明的类名去查。
         try:
             plan = plan_pools(specs, available_for_kv, config.max_num_seqs)
         except InsufficientPoolBudget as exc:
             # Minimum gpu_memory_utilization that makes the budget just cover the
             # per-request pools. Rounded UP to the next 0.01 so the printed value
             # is actually sufficient, not the exact threshold.
+            # 【译】让预算恰好盖住每请求池所需的最小gpu_memory_utilization。向上取整到下一个0.01，这样打印出的值确实够用，
+            #   而不是恰好卡在阈值上。
+            # 解释：min_util = (非KV开销 + 额外预留 + connector + STATE下限) / total。例：192GB的卡、非KV开销85.44GB、
+            #   STATE下限18.8GB（上方③的例子），若 --gpu-memory-utilization 0.5：预算96GB − 85.44GB = 10.56GB < 18.8GB → 抛异常；
+            #   min_util = (85.44 + 18.8) / 192 ≈ 0.543 → 提示 >= 0.55（这只是让PAGE刚好不为负，要有像样的KV容量还得更高）
             min_util = (
                 non_kv_overhead + extra_reserve + connector_bytes + exc.reserved_bytes
             ) / total
@@ -2367,12 +2450,14 @@ class ModelRunner:
                 f"({available_for_kv / (1 << 30):.2f}GB) at "
                 f"--gpu-memory-utilization {config.gpu_memory_utilization:.2f}."
             )
+            # 三种提示：①卡在物理空闲显存上（调util没用，只能腾显存或减max_num_seqs）；②调到min_util就够；③util=1.0也不够
             if (
                 available_for_kv_budget > free_for_kv
                 or free_for_kv <= exc.reserved_bytes
             ):
                 # The physical free-memory clamp is the binding limit, now or
                 # once the budget grows — raising --gpu-memory-utilization won't help.
+                # 【译】真正卡住的是物理空闲显存这个上限（现在就是，或者预算增大之后也会是）——调高--gpu-memory-utilization没有用。
                 connector_note = (
                     f"{connector_bytes / (1 << 30):.2f}GB of it reserved for KV "
                     f"connector buffers; "
@@ -2405,6 +2490,11 @@ class ModelRunner:
         # result back into the plan before publishing anything: the plan is the
         # single source for every entry count, so it must never disagree with
         # the number the pool is actually built at.
+        # 【译】各PP stage算出的block数不同；block id必须在每个stage的KV张量上都合法，所以归约到全局最小值。在发布任何东西之前
+        #   把结果折回plan里：plan是所有条目数的唯一来源，它绝不能和池真正建出来的数量不一致。
+        # 例：-pp 2时两个stage的层数、权重大小都不同，各自算出的block数不同，取较小的那个
+        # 观察：TP组内各rank也各自算了一遍，但这里只对PP做了归约；EngineCore只取TP rank 0的结果让所有rank按它分配，
+        #   靠的是TP各rank的显存占用对称（同卡上若有别的进程，非0号rank可能分配失败）
         num_kvcache_blocks = plan.paged_entries
         if config.pipeline_parallel_size > 1 and torch.distributed.is_initialized():
             t = torch.tensor(
@@ -2414,14 +2504,21 @@ class ModelRunner:
             num_kvcache_blocks = int(t.item())
             plan = plan.with_paged_entries(num_kvcache_blocks)
 
+        # 一个PAGE条目（= 一个调度器block）的字节数，例(a)里是2,703,360
         block_bytes = plan.entry_bytes[plan.paged_class]
         # The whole plan travels to the engine process; BlockManager, the
         # sliding-window pool and the attention builder each index it by the
         # class name they declared. Nothing here needs to know those names.
+        # 【译】整个plan会传到引擎进程；BlockManager、滑动窗口池和注意力builder各自按自己声明的类名去索引它。这里不需要知道那些名字。
+        # self.pool_plan给本进程的builder用（warmup时还是空计划，现在换成真的）；config上的两份只在本runner进程里可见，
+        #   引擎进程那边靠下面return的dict拿到（engine_core.py里回填）
         self.pool_plan = plan
         config.pool_entries = dict(plan.entries)
         config.pool_entries_per_req = dict(plan.entries_per_req)
         # Keep runtime state metadata out of Config.
+        # 【译】运行时的状态元数据不放进Config。
+        # ⑤ 后端声明它的每请求状态怎样交接（state_runtime.py的StateTransfer：fork / copy / replay / none，第4批）；
+        #   copy = 快照切成"页单元"存进PAGE池（state_pool.py【科普】⑤），需要在这里算出页单元的规格
         transfer = self.attn_metadata_builder.state_transfer()
         uses_paged_state = transfer.copies
         if uses_paged_state and config.pipeline_parallel_size > 1:
@@ -2441,13 +2538,18 @@ class ModelRunner:
                 raise RuntimeError(
                     "PAGE-backed state checkpoints require a PAGE sub-pool"
                 )
+            # 一个活跃槽位（一份完整状态）的字节数
             slot_bytes = int(plan.entry_bytes[STATE_SLOT_CLASS])
             # None means the backend has not narrowed its image: carry it all.
+            # 【译】None表示后端没有缩小它的快照映像：整份都要带上。
             narrowed = self.attn_metadata_builder.checkpoint_image_bytes()
             # The charged entry can be larger than the bytes a transfer
             # publishes: MHA alignment padding is not a region, and a draft
             # pool merged into the same class is ordinary KV after the
             # checkpoint regions. The backend names the published unit.
+            # 【译】计价的条目可能比一次传输发布的字节多：MHA的对齐填充不是一个区域；并进同一类的草稿池在checkpoint区域之后，
+            #   只是普通的KV。由后端说明发布的单元是多大。
+            # 例（state_pool.py【科普】⑤）：Qwen3-Next一个页单元 = 384KB的block，37.7MB的槽位 → 约101个页单元一份快照
             page_unit_bytes = int(plan.entry_bytes[plan.paged_class])
             published_unit = getattr(
                 self.attn_metadata_builder, "checkpoint_page_unit_bytes", None
@@ -2479,6 +2581,7 @@ class ModelRunner:
                 checkpoint_spec.units_per_checkpoint,
                 checkpoint_spec.layout_id,
             )
+        # 状态的运行时描述：本进程留一份；序列化成wire格式随返回值交给EngineCore（Scheduler / BlockManager用，第4批）
         state_runtime = StateRuntime(
             transfer=transfer,
             checkpoint_spec=checkpoint_spec,
@@ -2508,6 +2611,11 @@ class ModelRunner:
         # max_model_len, how many requests can simultaneously hold their
         # KV in the pool. Per-req block usage = ceil(ctx_len/block_size).
         # Active Slots are reserved; PAGE checkpoints borrow from the paged pool.
+        # 【译】并发容量表：在max_model_len的各个百分比的上下文长度下，池里能同时放下多少个请求的KV。
+        #   每请求占用的block数 = ceil(ctx_len/block_size)。活跃槽位是预留好的；PAGE checkpoint从分页池里借。
+        # 例：34,698个block、block_size=16、max_model_len=32768、max_num_seqs=512：
+        #   10%（3276 tok）→ 205 blk/req → min(512, 34698 // 205 = 169) = 169，受block数限制；
+        #   100%（32768 tok）→ 2048 blk/req → 16。DCP时每个rank只存1/dcp的token，blk/req按本rank计
         max_model_len = config.max_model_len
         cap = config.max_num_seqs
         dcp_w = max(1, getattr(config, "decode_context_parallel_size", 1) or 1)
@@ -2553,6 +2661,11 @@ class ModelRunner:
         # BlockManager. Ship the whole per-class entry table across instead of
         # a hand-picked field per architecture; consumers over there look up
         # the class they declared.
+        # 【译】get_num_blocks运行在RUNNER子进程里，所以它写进 `config` 的任何东西，构建BlockManager的引擎进程都看不到。
+        #   把整张按类别的条目表传过去，而不是为每种架构挑一个字段；那边的使用者按自己声明的类名去查。
+        # 返回值的去向（engine_core.py）：num_kvcache_blocks → allocate_kv_cache与config.num_kvcache_blocks（BlockManager的block池大小）；
+        #   pool_entries / pool_entries_per_req → BlockManager、滑动窗口池；state_runtime → StateRuntime.from_wire → Scheduler
+        # 对比nano-vllm：nano-vllm直接改config.num_kvcache_blocks——它的Scheduler在同一个进程里读同一个对象
         return {
             "num_kvcache_blocks": num_kvcache_blocks,
             "pool_entries": dict(plan.entries),
@@ -4910,16 +5023,16 @@ class ModelRunner:
            _estimate_cudagraph_overhead. Free is min-reduced across DP so all
            ranks skip the same set.
         """
-           # 【译】是否跳过捕获一个num_tokens个token的PIECEWISE档位。
-           #
-           #   两道闸，都是DP安全的（每个rank的决定必须完全相同，否则各rank的捕获循环会错开，下一次get_dp_padding的all_reduce
-           #   会把不匹配的num_tokens配在一起 → 报"batch_id_per_q_token len < T"）：
-           #
-           #   1. DP + 投机解码的硬上限：大的bs*q档位在DP下永远跑不到，却会撑大内存池、也不能重叠通信，所以上限为
-           #      ATOM_PIECEWISE_DP_MAX_TOKENS。
-           #   2. 显存闸：估算的捕获占用放不进空闲显存时跳过该档（随GPU大小 / 配置自适应，没有写死的上限）。DP会放大每token
-           #      占住的显存（MoE all_gather约dp_size倍token）；斜率按dp**0.6缩放，与_estimate_cudagraph_overhead一致。空闲显存在
-           #      DP间取最小值，让所有rank跳过同一组档位。
+        # 【译】是否跳过捕获一个num_tokens个token的PIECEWISE档位。
+        #
+        #   两道闸，都是DP安全的（每个rank的决定必须完全相同，否则各rank的捕获循环会错开，下一次get_dp_padding的all_reduce
+        #   会把不匹配的num_tokens配在一起 → 报"batch_id_per_q_token len < T"）：
+        #
+        #   1. DP + 投机解码的硬上限：大的bs*q档位在DP下永远跑不到，却会撑大内存池、也不能重叠通信，所以上限为
+        #      ATOM_PIECEWISE_DP_MAX_TOKENS。
+        #   2. 显存闸：估算的捕获占用放不进空闲显存时跳过该档（随GPU大小 / 配置自适应，没有写死的上限）。DP会放大每token
+        #      占住的显存（MoE all_gather约dp_size倍token）；斜率按dp**0.6缩放，与_estimate_cudagraph_overhead一致。空闲显存在
+        #      DP间取最小值，让所有rank跳过同一组档位。
         dp_size = self.config.parallel_config.data_parallel_size
         if dp_size > 1 and hasattr(self, "drafter"):
             dp_cap = int(os.environ.get("ATOM_PIECEWISE_DP_MAX_TOKENS", "512"))
