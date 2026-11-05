@@ -46,6 +46,8 @@
 #
 # ---------------------------------------------------------------------------------------------------------
 # 几条请求带数字走一遍（block_size = 4，6 个 block，默认 lru；每一步都对照 BlockManager 实际调用的方法推算过）
+#   （这里只看池子内部的容器怎么变；BlockManager 一侧从准入、decode 到释放、淘汰的全程见 block_manager.py 文件头的 100 块例子，
+#    准入时命中块正被占用 / 在空闲表里两种情况的对比见 BlockManager.can_allocate 里的 20 块例子）
 #   A = 12 个 token [a0 … a11]；B 与 A 共享前 8 个：[a0 … a7, b8 … b11]；C 与谁都不同：[c0 … c11]
 #   h0 = H(a0..a3)，h1 = H(h0, a4..a7)，h2 = H(h1, a8..a11)，h2' = H(h1, b8..b11)
 #   （H 即 prefix_hash.block_hash；纯文本请求的种子是 -1。为了好读，下面假设请求在 prefill 那一步就结束，不追加 decode 块）
@@ -85,7 +87,8 @@
 #   所以真正的淘汰发生在 allocate（这个号要装别的东西了），而不是 free。
 #   一个 block 的 hash 和内容到底什么时候失效：
 #     ① 它被 pop 出来分给新内容（allocate → _unindex），即上例第 6 步；
-#     ② clear_index（BlockManager.clear_cache，/reset_prefix_cache 一类的管理接口）；
+#     ② clear_index（BlockManager.clear_cache；docstring 说供 /reset_prefix_cache 一类的管理接口用，但 v0.1.8 的 atom/ 里
+#        没有调用方，只有测试调用，见那里的"观察"）；
 #     ③ 同一个 hash 被登记到了另一个块上（publish 改指，见 publish 里的例子），旧块从此找不到；
 #     ④ 【分支】池子缩小、顶部的块被收回（retire_top）。
 #   ref_count ≥ 1 的块永远不会被淘汰。
@@ -487,7 +490,8 @@ class BlockPool:
         # 【译】删掉所有内容 hash 条目，保留活着的序列持有的 block。
         #
         #   那些块通过 block_table 的引用依然有效；只是不再能通过 hash 找到，所以以后的请求都不能认领它们。
-        # 调用方：BlockManager.clear_cache（/reset_prefix_cache 一类的管理接口）。只清空闲块的 hash / token；
+        # 调用方：BlockManager.clear_cache（docstring 称供 /reset_prefix_cache 一类的管理接口用；atom/ 里目前只有测试调用）。
+        #   只清空闲块的 hash / token；
         #   在用的块保留自己的 hash（后续 hash_blocks 还要读它当父 hash），但索引里已经没有它了
         self._hash_to_block_id.clear()
         self.index_version += 1

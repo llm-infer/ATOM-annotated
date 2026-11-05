@@ -438,3 +438,12 @@ C 级示例：
 - **延迟输出的占位 token 就是 eos id**，下一步原地覆盖，所以"结束"要晚一步才发现；投机解码稳态末尾有 2k+1 个占位（`num_placeholder_tokens`）。→ 第 5、7 批
 - **PrefillDelayer**：DP>1 时每个 rank 总会创建（跨 DP 对齐模式），DP=1 时仅在 PP=1 且 `ATOM_PREFILL_DECODE_INTERVAL>0` 时创建（本地模式）；`_first` 不改变任何决策（与 SGLang 的 `skip_first_delayer` 语义不同）。→ 第 9 批
 - **RapidServe 的 PrefillScheduler / DecodeScheduler** 有若干按代码推断的问题（超长 prompt 永久堵住、abort 对部分队列不生效、不复用前缀缓存、被抢占后不会再 prefill），均以"观察："写在 scheduler.py 中，读第 5、9 批时再核对。
+
+### 来自第 4 批
+
+- **规范位置**：block 池 / 空闲表 / 惰性淘汰 → `block_pool.py` 文件头；前缀 hash / 链式 hash / DCP 下的 hash block 大小 → `prefix_hash.py` 【科普】④；无逐 token KV 时的前缀缓存（状态快照、阶梯、fork/copy/replay）→ `state_pool.py` 【科普】①~⑤；BlockManager 整体流程与阅读路线 → `block_manager.py` 文件头。后续批次讲到这些概念时指向这里。
+- **淘汰顺序**：先用从未缓存过的空块（`_vacant` 最小堆，id 小的先），再淘汰最早释放的缓存块（`_cached.popitem(last=False)`，按释放时间的 LRU），最后才动 `_protected`；块被释放后 hash 和内容保留，直到真正被复用时才失效。BlockManager 逆序释放，请求开头的块活得最久。→ 第 9 批（offload）
+- **hash 只在 forward 算完之后登记**（`hash_blocks` 由 `Scheduler.postprocess` 调用；没写满的块不登记），链式 hash 为 xxh64(前一个 hash ‖ int64 token)，种子是 `cache_seed`（纯文本 -1，多模态为媒体内容的 blake2b）。
+- **`can_append` 偏保守**：按 `len + max(n, lookahead)` 估算，比 `may_append` 实际分配多估 `max(n, la) − la` 个位置（不开 MTP 时 1 个，k=3 时 2 个）。→ 第 3 批调度器的抢占判断
+- **Qwen3-Next 的 GDN 状态**：状态 dtype 为 torch_dtype（bf16），每请求 36 层 × 548,864 个数 ≈ 37.7 MiB，约等于 1608 个 token 的全注意力 KV。→ 第 8 批
+- 疑点（以"观察："写在注释中，读对应批次时再核对）：`reconcile_orphan_load_slots` 在同一请求多次停放时，迟到的报告可能提前释放较新的、仍在写入的槽位（→ 第 9 批）；`block_table_convert` 被 MiniMax-M3 以 token 数调用、kernel 却按页号比较（→ 第 8 批）。

@@ -31,7 +31,7 @@
 #   slot_mapping（本步每个token的KV写进KV cache的哪个槽位）由这张表算：slot = table[行, pos // block_size] × block_size + pos % block_size
 #     例：A的第40个token（pos=39）→ table[0, 2] = 12 → slot = 12 × 16 + 7 = 199
 #     （实现：model_ops/attentions/token_layout/slots.py 的 slot_mapping；DCP下另走 dcp_ops.dcp_prefill_slot_mapping，
-#      只给本rank持有的token填槽位、其余填-1，DCP的前置知识见 block_convert.py 文件头③）
+#      只给本rank持有的token填槽位、其余填-1；DCP的前置知识见 prefix_hash.py 文件头④，本地下标的换算见 block_convert.py 文件头③）
 #
 # 增量写入：每步只写"变了的部分"
 #   BlockTableState 不保存id的副本，只记每行的 (version, length)（version的定义见 sequence.py BlockTable类上方）。

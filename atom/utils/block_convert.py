@@ -28,7 +28,8 @@
 # ③ DCP下的换算（前置：DCP）
 #   MLA每token每层只缓存一个所有头共用的576维潜在向量，相当于只有1个KV头，TP按头切不开它：-tp 8时8张卡各存一整份。
 #   DCP（decode上下文并行）让这几张卡按token轮流各存一部分：-dcp 4（interleave_size=1）时token t只存在第 t % 4 张卡上。
-#   （完整讲解：arg_utils.py EngineArgs.decode_context_parallel_size上方的【科普】，scheduler.py文件开头【前置⑥】）
+#   （block_table一项怎样覆盖 block_size × DCP 个全局token的图见 prefix_hash.py 文件头④；DCP本身的完整讲解：
+#    arg_utils.py EngineArgs.decode_context_parallel_size上方的【科普】）
 #   于是同一个block_table条目在4张卡上各放自己的block_size个token：一个条目覆盖 block_size × DCP 个全局token——
 #   这也是前缀hash的块大小（prefix_hash.py 的 hash_block_size_for：16 × 4 = 64）。
 #   本卡第 j 个本地token的位置 = table[j // block_size] × block_size + j % block_size，与不开DCP时的公式相同，

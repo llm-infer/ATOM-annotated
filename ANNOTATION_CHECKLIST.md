@@ -110,22 +110,22 @@
 
 ### 4a KV block 账本与前缀缓存
 
-- [ ] **A** `atom/model_engine/block_manager.py`（3372 行）
-- [ ] **A** `atom/model_engine/block_pool.py`（523 行）
-- [ ] **A** `atom/model_engine/kv_block.py`（44 行）
-- [ ] **A** `atom/model_engine/prefix_hash.py`（111 行）
-- [ ] **B** `atom/model_engine/block_table_codec.py`（220 行）
-- [ ] **B** `atom/utils/block_tables.py`（233 行）
-- [ ] **B** `atom/utils/block_convert.py`（380 行）
-- [ ] **B** `atom/distributed/kv_events.py`（549 行）
+- [x] **A** `atom/model_engine/block_manager.py`（3372 行）
+- [x] **A** `atom/model_engine/block_pool.py`（523 行）
+- [x] **A** `atom/model_engine/kv_block.py`（44 行）
+- [x] **A** `atom/model_engine/prefix_hash.py`（111 行）
+- [x] **B** `atom/model_engine/block_table_codec.py`（220 行）
+- [x] **B** `atom/utils/block_tables.py`（233 行）
+- [x] **B** `atom/utils/block_convert.py`（380 行）
+- [x] **B** `atom/distributed/kv_events.py`（549 行）
 
 ### 4b 递归状态缓存（GDN / Mamba / KDA 等混合模型）
 
-- [ ] **B** `atom/model_engine/state_cache.py`（155 行）
-- [ ] **B** `atom/model_engine/state_offload.py`（445 行）
-- [ ] **B** `atom/model_engine/state_pool.py`（803 行）
-- [ ] **B** `atom/model_engine/state_runtime.py`（348 行）
-- [ ] **B** `atom/model_engine/page_unit_checkpoint.py`（1369 行）
+- [x] **B** `atom/model_engine/state_cache.py`（155 行）
+- [x] **B** `atom/model_engine/state_offload.py`（445 行）
+- [x] **B** `atom/model_engine/state_pool.py`（803 行）
+- [x] **B** `atom/model_engine/state_runtime.py`（348 行）
+- [x] **B** `atom/model_engine/page_unit_checkpoint.py`（1369 行）
 
 ## 第 5 批：ModelRunner：执行、权重加载、采样、CUDA Graph 与编译（43 个文件，17,801 行）
 

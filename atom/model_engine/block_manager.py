@@ -98,19 +98,20 @@ logger = logging.getLogger("atom")
 #
 #   初始：100个block全空闲且没有hash（BlockPool._vacant，id小的先发），hash索引为空
 #   ① 请求A，prompt 1000个token：要 ⌈1000/16⌉ = 63个block，最后一个只装 1000 − 62×16 = 8个token
-#      can_allocate(A)：沿hash链查前62个block（最后一个永远不复用），第一个就没命中 → 命中0；要63个新block ≤ 100 → 返回0
+#      can_allocate(A)：沿hash链最多查前62个block（最后一个永远不复用），第0块就没命中 → 命中0；要63个新block ≤ 100 → 返回0
 #      allocate(A, 0)：按整条prompt一次取63个新block → A.block_table = [0, 1, …, 62]，num_cached_tokens = 0；空闲37
 #   ② 第1步prefill位置0~639（非最后一块chunk向下对齐到64），postprocess里 hash_blocks(A, 640)：
 #      block 0~39写满了，登记 h0 = H(seed, 块0)、h1 = H(h0, 块1) … h39；num_cached_tokens = 640
 #   ③ 第2步（Phase 1优先续算）位置640~999：hash_blocks登记block 40~61（h40 … h61）；block 62只装了992~999，不登记。
 #      prompt算完；延迟输出下第1个生成token要到下一步才交回CPU，token_ids末尾先挂一个占位 → len(A) = 1001
-#   ④ decode：每步算位置 len(A) − 1；can_append / may_append只在 len(A) % 16 == 1 时要一个新block：
+#   ④ decode：每步算位置 len(A) − 1；may_append只在 len(A) % 16 == 1 时取一个新block（can_append偏保守：len % 16 == 0
+#      时就先要求池里有1个空闲block，见can_append里的"观察"）：
 #      len = 1001 → 位置1000落在block 62（管992~1007）的偏移8，不用新block；……len = 1009 → 位置1008开一个新块，
 #      may_append取block 63 → A.block_table = [0, …, 63]。block 62的16个位置都写完KV后，hash_decode_blocks登记h62
 #      （下一轮对话"上轮prompt + 上轮回答"也能命中生成的部分）
 #   ⑤ A生成20个token后结束（len = 1020）：deallocate(A)倒序释放63、62、…、0，引用计数都归0。
 #      有hash的block 0~62进"cached"空闲队列（越早释放越早被淘汰：62最先、0最后），没hash的block 63进"vacant"；
-#      空闲回到100个，但hash索引里h0~h62还在、显存里的KV也没清——这就是惰性淘汰
+#      空闲回到100个，但hash索引里h0~h62还在、显存里的KV也没清——这就是惰性淘汰（空闲表的三个容器、淘汰顺序见block_pool.py文件头）
 #   ⑥ 请求B：A的前800个token + 300个新token，共1100个token（⌈1100/16⌉ = 69个block）
 #      can_allocate(B)：h0~h49命中（block 0~49，token 0~799），h50（800~815）不同 → 停（链式hash，之后不可能再命中）。
 #      命中的50个block都躺在空闲队列里，取回来也占空闲名额：要69个 ≤ 100 → 返回50
@@ -119,18 +120,23 @@ logger = logging.getLogger("atom")
 #   ⑦ 之后某个请求要的新block超过vacant存量时，才从cached队头拿block 62（最早释放的）：直到这一刻h62才真正失效
 #      （BlockPool.allocate里触发on_evict → _record_evicted）；在此之前任何请求都还能命中它
 #   字段的逐步变化（num_cached_tokens、num_hashed_tokens、block_table）见sequence.py Sequence类上方的"字段演化总表"
+#   另外三个带数字的例子各看一个细节，与这条主线互补：can_allocate里的20块池例子（命中块正被别人用着时不占空闲名额、
+#   最后一块为什么总要重算）、block_pool.py文件头的6块池例子（三个空闲容器每一步怎么变）、checkpoint_limit上方的40000 token
+#   例子（有每请求状态的模型怎样放checkpoint）
 #
 # 前置概念（读者懂MHA/GQA、读过nano-vllm即可；每条先给本文件用到的要点，再指向完整讲解）
-#   分页KV / block table、前缀缓存的链式hash：nano-vllm已有。要点见scheduler.py文件开头【前置①③】，完整讲解见sequence.py
-#     BlockTable类上方"科普：KV cache分块"、Sequence类上方"科普：前缀缓存"
+#   分页KV / block table、前缀缓存的链式hash：nano-vllm已有。要点见scheduler.py文件开头【前置①③】，概念见sequence.py
+#     BlockTable类上方"科普：KV cache分块"、Sequence类上方"科普：前缀缓存"；本批的实现讲解：空闲表 / 引用计数 / 惰性淘汰见
+#     block_pool.py文件头，hash函数本身（种子、为什么链式、碰撞、前端算链）见prefix_hash.py文件头【科普】①~⑤
 #   每请求状态与状态checkpoint：线性注意力（GDN：Qwen3-Next / Qwen3.5；KDA：Kimi-K3、GLM-5.3）和DeepSeek-V4 / V4.1的
 #     滑动窗口不给每个token留一行KV，而是每请求一份定长状态、每来一个token原地覆盖（Qwen3-Next一层GDN约52万个数，
 #     ≈ 一层全注意力里512个token的KV）。前缀命中时KV行还在，"第N个token时的状态"早被覆盖了，只能事先存快照
 #     （checkpoint：默认每8192个token一级 + prompt末尾的锚点），于是命中被截到最近的checkpoint（_gated_hit）。
 #     例：与旧prompt共享前18432个token → KV命中18432，状态只能从16384恢复 → 从16384开始prefill。
-#     要点见scheduler.py文件开头【前置⑤】，完整讲解见sequence.py Replay类上方"科普：状态checkpoint与有界重放"；
-#     槽位与checkpoint的实现在本批state_pool.py、page_unit_checkpoint.py
-#   DCP（hash block = block_size × DCP，前提是MLA只有1个KV头）：见下面_effective_block_size上方的【前置：DCP】
+#     要点见scheduler.py文件开头【前置⑤】，概念见sequence.py Replay类上方"科普：状态checkpoint与有界重放"；实现原理（槽位、
+#     fork / copy / replay、页单元checkpoint）的规范讲解是本批state_pool.py文件头【科普】①~⑤
+#   DCP（hash block = block_size × DCP，前提是MLA只有1个KV头）：要点见下面_effective_block_size上方的【前置：DCP】，
+#     图解见prefix_hash.py文件头【科普】④
 #   投机解码的草稿lookahead：草稿模型自己也往len(seq)之后写k − 1个位置的KV，见下面draft_kv_lookahead
 #   KV offload分层（HBM前缀缓存下面再挂CPU内存 / LMCache）：见下面_joint_kv_boundary上方的【前置：KV offload分层】
 #
@@ -552,7 +558,7 @@ class BlockManager:
         #   可能被一个池承认、另一个池不承认。
         # ★ 主干：整个KV池的账本（BlockPool，block_pool.py）。"compressed"沿用DeepSeek-V4的叫法（V4缓存的是压缩后的KV行）；
         #   对普通模型它就是全部KV block。
-        #   观察：这段英文注释已过时——全仓库只有这一处构造BlockPool；block_pool.py的类说明写明滑动窗口现在是每请求的环、
+        #   观察：这段英文注释已过时——atom/里只有这一处构造BlockPool（另外只有tests/里直接构造）；block_pool.py的类说明写明滑动窗口现在是每请求的环、
         #   和压缩器状态共用一个state槽位（v4_pool_geometry.py），下面state_caches上方的英文注释也是这么说的
         # 参数：on_evict = _record_evicted（某个hash离开索引时回调：block被拿去装新内容，或publish把它改登记成新hash）；
         #   cache_policy = ATOM_PREFIX_CACHE_POLICY（默认"lru"；"slru"：被命中复用过的block释放后进受保护队列，最多占池子的
@@ -959,7 +965,8 @@ class BlockManager:
         #   或者forward的起点不在block网格上。每一个都是"截chunk的阶梯"本来会保留下来的checkpoint。
         self.midstep_positions_unreadable: int = 0
 
-    # ★ 主干：一个block的链式hash（= prefix_hash.block_hash；前端预先算hash链用的也是同一个函数）
+    # ★ 主干：一个block的链式hash（= prefix_hash.block_hash；前端预先算hash链用的也是同一个函数；规范讲解见prefix_hash.py
+    #   文件头【科普】①~③）
     #   做法：token id按int64的字节喂给xxh64；prefix ≠ -1时先拼上前一块hash的8个字节（小端序）：
     #     h0 = H(seed, 块0的token)，h1 = H(h0, 块1的token)，……，hi隐含了从开头到第i块的全部内容
     #   第0块的prefix是seq.cache_seed：纯文本请求为-1（什么都不拼），多模态请求是图片等内容的指纹——同样的文本 + 不同的图片，
@@ -1055,7 +1062,7 @@ class BlockManager:
         #   新内容（文件开头例子的⑦）；另外publish把一个block改登记成新hash时，旧hash也走这里。做三件事：
         #   计数（total_evicted_blocks）；记一条BlockRemoved事件（开了KV事件时）；【分支】把同一hash上的状态checkpoint一并删掉
         #   ——"状态 ⊆ KV"：那个位置的KV都没了，那里的状态快照也就接不上了
-        #   观察：因为publish改登记也算进来，total_evicted_blocks会比BlockPool.blocks_evicted（只数allocate里的淘汰）略大
+        #   观察：因为publish改登记也算进来，total_evicted_blocks可能比BlockPool.blocks_evicted（只数allocate里的淘汰）略大
         # 对比nano-vllm：nano-vllm在_allocate_block里直接 del hash_to_block_id[hash]，没有回调
         self.total_evicted_blocks += 1
         self._note_index_change(h)
@@ -1323,24 +1330,14 @@ class BlockManager:
         return lo
 
     # =========================================================================================
-    # 【前置：DCP】为什么开DCP后"hash block = block_size × DCP"（本文件里DCP只在这里讲；完整原理见arg_utils.py
-    #   EngineArgs.tensor_parallel_size下方的【科普】MLA、decode_context_parallel_size上方的【科普】）
+    # 【前置：DCP】为什么开DCP后"hash block = block_size × DCP"（要点；带图的讲解见prefix_hash.py文件头【科普】④，
+    #   DCP本身的完整原理见arg_utils.py EngineArgs.tensor_parallel_size下方的【科普】MLA、decode_context_parallel_size上方的【科普】）
     # =========================================================================================
-    #   ① 前提：MLA只有1个KV头。MLA（DeepSeek-V3、Kimi-K2、GLM-5等）每token每层只缓存一行所有头共用的576维潜在向量
-    #     （DeepSeek-V3若用MHA要存 128头 × (192 + 128) = 40960个数），相当于只有1个KV头。TP按头切KV，1个头切不开：
-    #     -tp 8时8张卡各存一整份同样的KV
-    #   ② DCP（decode上下文并行）：让TP组里的几张卡按token轮流各存一份，不增加卡数。-dcp 4、interleave = 1时token t只存在
-    #     第t % 4张卡上，每卡只存1/4；注意力各卡先对自己那部分算，再用LSE合并（结果与在全部token上算一次相同）
-    #   ③ 对账本的影响：4张卡用同一个block id，各在自己的KV池里放自己那16个token（dcp_ops.dcp_prefill_slot_mapping：
-    #     槽位 = block_table[pos // (16 × 4)] × 16 + 本地序号 % 16），所以一个block table条目覆盖 16 × 4 = 64个全局token：
-    #
-    #       全局token        0  1  2  3  4  5  6  7  …  60 61 62 63 │ 64 65 …
-    #       卡0的block 7     0           4           …  60          │          （卡0本地的第0~15个token）
-    #       卡1的block 7        1           5        …     61       │          （卡1本地的第0~15个token）
-    #       卡2、卡3同理                                             │
-    #       → block_table[0] = 7 覆盖全局token 0~63，block_table[1]从64开始
-    #
-    #     于是本类里有两个数：
+    #   前提：MLA（DeepSeek-V3、Kimi-K2、GLM-5等）每token每层只缓存一行所有头共用的576维潜在向量，相当于只有1个KV头，TP按头
+    #   切不开：-tp 8时8张卡各存一整份同样的KV。DCP（decode上下文并行）让TP组里的卡按token轮流各存一份、不增加卡数：-dcp 4、
+    #   interleave = 1时token t只在第t % 4张卡上，各卡对自己那份算注意力、再用LSE合并（结果与在全部token上算一次相同）。
+    #   对账本的影响：4张卡共用同一个block id、各在自己的KV池里放自己那16个token，所以一个block table条目覆盖
+    #   16 × 4 = 64个全局token（block_table[0] = 7 覆盖全局token 0~63，block_table[1]从64开始）。于是本类里有两个数：
     #       block_size（16）                 一个rank上的物理block装几个token；KV池按"每卡本地token数 / block_size"计
     #                                        （num_pool_blocks、max_pool_tokens）
     #       hash_block_size = _effective_block_size() = block_size × DCP（64）
@@ -1530,7 +1527,8 @@ class BlockManager:
     # 【分支】状态门控（第4、8批；为什么需要见文件开头前置概念的"每请求状态与状态checkpoint"）：KV前缀命中到compressed_hit块，
     #   但带每请求状态的序列只能在"有状态checkpoint"的位置接上。每个状态类回答"≤ X的位置里我能接受的最右一个"，本函数在
     #   各类之间反复传递候选值直到不再变化（不动点）
-    # 例（hbs = 256）：compressed_hit = 72块（18432个token），checkpoint在32块（8192）和64块（16384）→ 返回64
+    # 例（Qwen3-Next，hbs = 16；与can_allocate里【前置：每请求状态与状态checkpoint】、state_pool.py【科普】③是同一个例子）：
+    #   compressed_hit = 1152块（18432个token），checkpoint在512块（8192）和1024块（16384）→ 返回1024
     #   → 命中从18432截到16384，从16384开始prefill（与scheduler.py文件开头【前置⑤】的例子一致）
     # 调用方：_evaluate（准入）、_joint_kv_boundary（往HBM命中之外找边界）、_record_checkpoint_demand（assume_checkpointed=True
     #   的反事实）。不带状态的序列：每个类的resumable_hit直接原样返回（applies为False），命中不变——和nano-vllm一样
@@ -1599,7 +1597,7 @@ class BlockManager:
     #   used = 被序列引用的block，free = 空闲（含还能命中的cached），hashed = 索引里的hash数（在用的 + 空闲但还没被覆盖的）
     #   观察：retained = hashed − used 只是"空闲但还能命中的block"的近似：used里还有没登记hash的block（每条序列末尾没写满的块、
     #   decode新分到的块、PAGE checkpoint占的单元），会把它压低；更准的是BlockPool.num_reusable_free（cached和protected两个
-    #   队列的长度）
+    #   队列的长度；它也会多算被publish改指过的旧块，见block_pool.py publish里的"观察"）
     def pool_occupancy(self) -> dict[str, int]:
         used = self.kv.num_used
         free = self.kv.num_free
@@ -1939,7 +1937,7 @@ class BlockManager:
         #     _probe_hbm_prefix: can_allocate(seq, record=False, block_hashes=[])  -->  token预算 / chunk检查
         #       -->  record_allocation(seq, 命中块数, block_hashes)  -->  allocate(seq, 命中块数)
         #     任何一步不通过：seq放回waiting队头、本轮停止准入（还没allocate，不用释放）
-        #   记号：hbs = hash_block_size = block_size × DCP（DCP=1时就是block_size；为什么乘DCP见scheduler.py文件开头【前置⑥】），
+        #   记号：hbs = hash_block_size = block_size × DCP（DCP=1时就是block_size；为什么乘DCP见上面_effective_block_size上方的【前置：DCP】），
         #     一个hash block = block_table的一项；n = ⌈len(seq) / hbs⌉ 是整条序列的块数
         #
         # 方法一览（主干A级 / 【分支】B级）：
@@ -1954,14 +1952,11 @@ class BlockManager:
         #   _state_leg_secured ~ take_state_loads ....... 【分支】每请求状态槽位、CPU状态层的加载 / 存储（第9批）
         #   _chain_parent_hash .......................... hash_blocks的辅助：取前一个block的hash
         #
-        # 【前置：每请求状态与状态checkpoint】（下面(4)、allocate的状态槽位、replay_start都要用到；完整讲解见arg_utils.py
-        #   EngineArgs.state_checkpoint_interval_tokens上方的【科普】、sequence.py Replay类上方"科普：状态checkpoint与有界重放"）
-        #   线性注意力层（GDN：Qwen3-Next / Qwen3.5；KDA：Kimi-K3、GLM-5.3）不给每个token留一行K/V，而是每条请求每层一个
-        #   定长状态矩阵（Qwen3-Next一层GDN约 32头 × 128 × 128 ≈ 52万个数），每来一个token原地覆盖；DeepSeek-V4 / V4.1的
-        #   128窗口滑动注意力、压缩器还没凑满一组的token，也是这种"每请求状态"。它们放在单独的状态池里，按"槽位"编号。
-        #   于是前缀命中时：KV行还在，"第N个token时的状态"却早被覆盖了 → 只能从事先存下的快照（状态checkpoint）接上；
-        #   checkpoint只存在少数位置：每 state_checkpoint_interval_tokens（默认8192）个token一级 + prompt末尾锚点 + 按需补的一级。
-        #   例（Qwen3-Next，block 16）：新请求与旧prompt共享前18432个token，旧prompt的checkpoint还在8192、16384
+        # 【前置：每请求状态与状态checkpoint】（下面(4)(6)、allocate的状态槽位、replay_start都要用到）要点见文件开头"前置概念"：
+        #   线性注意力（GDN / KDA）和DeepSeek-V4 / V4.1窗口这类层每请求只有一份定长状态（Qwen3-Next一层GDN约52万个数）、放在
+        #   状态池的"槽位"里，每来一个token原地覆盖，前缀命中时只能从事先存下的快照（状态checkpoint：每8192个token一级 + prompt
+        #   末尾锚点 + 按需补的一级）接上；实现原理的规范讲解见state_pool.py文件头【科普】①~⑤。下面(4)(6)用到的数字
+        #   （Qwen3-Next，block 16，即state_pool.py【科普】③的例子）：新请求与旧prompt共享前18432个token，旧prompt的checkpoint在8192、16384
         #     → KV遍历命中 18432 / 16 = 1152块（compressed_hit），但状态只在第512块（8192）、第1024块（16384）有快照
         #     → _gated_hit 截到1024块 → num_cached_blocks = 1024，从16384开始prefill（比KV命中多算2048个token）；
         #     同时 _record_checkpoint_demand 记下"想要的"1152块（demand = 18432；池子放得下一份镜像时）：本请求prefill时在
@@ -2007,6 +2002,8 @@ class BlockManager:
         #   hash不在这里登记：forward算完KV后，postprocess → hash_blocks 只登记写满的块（与nano-vllm的hash_blocks相同）
         #
         # 一条请求带数字走一遍（block_size=16、无DCP → hbs=16；池子20个block，id 0~19起初都空；普通模型、不开MTP）：
+        #   （只看准入的细节；一条请求从准入、decode到释放、被淘汰的全程见文件开头的100块例子，空闲容器每步怎么变见block_pool.py
+        #    文件头的6块例子）
         #   请求A：prompt 100个token → n = ⌈100/16⌉ = 7块（前6块满，第7块只有4个token）
         #     can_allocate：索引是空的，_hit_walk第一轮只查第0块就未命中 → 命中0；要7块，空闲20 ≥ 7 → 返回0
         #     allocate：没有可认领的；_fresh_block取7块（空块按id从小到大）→ A.block_table=[0,1,2,3,4,5,6]，空闲20→13
@@ -2019,7 +2016,8 @@ class BlockManager:
         #   (a) A还在运行（占着0~6）：命中的4块都被A用着 → num_new_blocks = 7 − 4 = 3；空闲13 ≥ 3 → 返回4
         #       allocate：claim_many([0,1,2,3]) 把它们的ref_count 1→2；再取3个新块7、8、9
         #       → B.block_table=[0,1,2,3,7,8,9]，空闲13→10，num_cached_tokens = 4×16 = 64，B只prefill 100−64 = 36个token
-        #   (b) A已结束：deallocate倒序释放，块0~5带着hash进"缓存空闲"队列，没hash的块6进"空块"堆；空闲 = 20
+        #   (b) A已结束（假设A在prefill那一步就结束、没有decode块，同block_pool.py的例子）：deallocate倒序释放，块0~5带着hash进
+        #       "缓存空闲"队列，没hash的块6进"空块"堆；空闲 = 20
         #       命中的4块都在空闲表里 → num_new_blocks = 7 − 0 = 7（从空闲表捞回来也占名额）；20 ≥ 7 → 返回4
         #       allocate：claim_many把0~3从空闲表取出（ref_count 0→1，内容和hash原样保留）；新块先取空块6、7、8
         #       → B.block_table=[0,1,2,3,6,7,8]，空闲20→13；A的块4、5（h4、h5）仍在缓存空闲队列里，没有被淘汰
@@ -2799,20 +2797,15 @@ class BlockManager:
     #   settle_state_load、take_state_loads（CPU层加载）；take_state_stores、settle_state_store、release_state_store_source、
     #   has_pending_state_store_pins、reclaim_stale_state_store_pins（CPU层存储）；reconcile_orphan_load_slots（孤儿槽位回收）
     #
-    # 什么是"槽位"（slot）：ModelRunner启动时按 pool_entries["state"] 预先分配一个状态张量，槽位号就是它的下标；
-    #   一个槽位 = 一条请求在所有状态层的一份完整状态（例：Qwen3-Next每个GDN层一个约52万个数的矩阵，外加conv状态）。
-    #   一条请求拿 state_slots_per_req = 1 + 投机token数 个槽位：state_slots[0] 是已提交状态（每步读写它），
-    #   [1:] 是投机解码的回滚槽位（MTP k=3 → [s0, r1, r2, r3]，见sequence.py has_per_req_cache处的科普），彼此不必相邻。
-    #   空闲表（state_pool.py StateSlotPool）也是"先给空槽位（号小的先）、再按LRU花掉存着checkpoint的槽位"，
-    #   和KV的BlockPool是同一套惰性淘汰
-    #
-    # checkpoint放在哪里——三种后端，由注意力后端的 state_transfer() 决定（state_runtime.py StateTransfer）：
-    #   PAGE（copy）：checkpoint的状态镜像切成若干"PAGE单元"存进KV池（和KV block是同一个BlockPool，
-    #     PagedStateCheckpointCoordinator 管理）；恢复 = 下一个batch之前把镜像从这些单元gather到请求自己的新槽位（begin_restore 排队）。
-    #     用于Qwen3-Next / Qwen3.5的GDN、Kimi-K3的KDA（这两类在PP或RapidServe下改用fork）、DeepSeek-V4
+    # 槽位与checkpoint的三种存法（规范讲解见state_pool.py文件头【科普】④(a)(b)(c)、⑤，各模型用哪一种见④(b)的表；
+    #   这里只列本组函数用到的要点）：
+    #   槽位 = ModelRunner预分配的状态张量（pool_entries["state"]个）的一个下标，装一条请求在所有状态层的一份完整状态；一条请求拿
+    #     state_slots_per_req = 1 + 投机token数 个（state_slots[0] 已提交状态，[1:] 投机回滚，见sequence.py has_per_req_cache处）。
+    #     空闲槽位也是"空的先给（号小的先）、存着checkpoint的按LRU后花"，和KV的BlockPool同一套惰性淘汰
+    #   PAGE（copy）：checkpoint镜像切成页单元存进KV池（PagedStateCheckpointCoordinator）；恢复 = 下一个batch之前把镜像gather进
+    #     请求自己的新槽位（begin_restore 排队）
     #   fork：checkpoint就是一个"内容仍有效的空闲槽位"（StateSlotPool.hash_to_slot）；恢复 = 下一次forward从源槽位
-    #     （seq.state_fork_src）读初始状态、写进请求自己的槽位，源槽位被pin住直到那次forward发出。用于上述模型在PP / RapidServe下、
-    #     以及不在PAGE名单里的GDN模型（gdn_attn.py GDN_PAGE_CHECKPOINT_MODEL_TYPES 之外，如Qwen4Exp）
+    #     （seq.state_fork_src）读初始状态、写进请求自己的槽位，源槽位被pin住直到那次forward发出
     #   replay：不存checkpoint，命中时重算一小段来重建（DeepSeek-V4.1默认，见 replay_start）
     #
     # CPU状态层（self.state_offload，只有配了能承载状态的KV connector——如LMCache——时才存在；第9批）：
@@ -3366,9 +3359,10 @@ class BlockManager:
         #   H2D之下回收，会把一块别人正在填充的缓冲区交给下一个请求，而它上面的 has_initial_state 已经为真。所以窗口必须是放弃
         #   超时，而不是一个很紧的值：要长到任何仍在途的报告都已经到达。索引那条腿早在 deallocate 里就放弃了，所以这里不碰它；
         #   迟到的报告会发现槽位已被取走，什么也不释放。
-        # 观察：docstring最后一句说迟到报告"什么也不释放"，但下面循环里的英文说它"会释放下一个停放的槽位"。按
-        #   _release_oldest_orphan_slot 的实现（弹出最早的一项），同一req_id还有更新的停放时，过期项被回收后迟到的报告会把那个
-        #   更新的槽位提前还回空闲表——而它可能还在被后一次加载写入。只有同一请求被停放过不止一次时才会出现
+        # 观察：docstring最后一句说迟到报告"什么也不释放"，下面循环里的英文却说它"会释放下一个停放的槽位"，两句各对一半。
+        #   报告里没有槽位号，_release_oldest_orphan_slot 只按req_id弹出最早的一项：同一req_id只停放过一次时，过期项被回收后列表
+        #   已空，迟到的报告确实什么也不释放；停放过不止一次时（抢占后重新准入、又在加载途中被释放），迟到的旧报告会弹出那个更新的
+        #   停放、把它提前还回空闲表——而它可能还在被后一次加载写入，正是docstring警告的"在仍在进行的H2D之下回收"
         # 调用方：scheduler.py 处理KV传输进度时，与 reclaim_stale_state_store_pins 同窗口（_save_abandon_timeout_s；0 = 关闭）
         if timeout_s <= 0 or not self._orphan_load_slots:
             return 0
@@ -3512,16 +3506,13 @@ class BlockManager:
         #   Scheduler.postprocess 的 batch=None 分支（RapidServe的DecodeEngineCore）：一次性登记整段prompt
         #   hash_decode_blocks（下面）      decode生成的block，aimed=False
         #
-        # 链式hash（prefix_hash.block_hash；本类的compute_hash就是它）：
-        #   h_-1 = seq.cache_seed   纯文本 = -1，表示"没有父hash"；多模态 = multimodal_cache_seed(媒体数据)：
-        #                           像素、图像网格、token类型和embedding_spans的64位blake2b摘要（multimodal_runtime.py）
-        #   h_i  = xxh64( h_{i-1}的8字节小端 ‖ 第i块token按int64排列的字节 )；h_{i-1} = -1 时只hash token字节
-        #
+        # 链式hash（prefix_hash.block_hash；本类的compute_hash就是它。公式、种子cache_seed的来源、为什么链式、碰撞，规范讲解见
+        #   prefix_hash.py文件头【科普】①~③）：
         #   token：[0 ...... hbs-1][hbs .... 2hbs-1][2hbs ... 3hbs-1][3hbs .. 半满]
         #   hash ：  h0=H(种子,块0) ─► h1=H(h0,块1) ──► h2=H(h1,块2) ──► 不登记
-        #   hbs = hash_block_size = block_size × DCP（不开DCP时就是block_size，默认16；DCP下一个block_table条目
-        #     对应 block_size × DCP 个全局token，前置知识见scheduler.py文件开头【前置⑥】）
-        #   h2相同 ⇔ 种子相同且块0~2的token全同：同一段文字配不同的图片，种子不同，从h0起就全不一样，不会误命中
+        #   hbs = hash_block_size = block_size × DCP（不开DCP时就是block_size，默认16；见上面_effective_block_size上方的【前置：DCP】）
+        #   种子 = seq.cache_seed（纯文本 -1；多模态是媒体数据的指纹）：h2相同 ⇔ 种子相同且块0~2的token全同，同样的文字配不同的图
+        #     从h0起就全不一样，不会误命中
         #
         # 为什么只在forward之后登记：allocate时只是把block号写进block_table，GPU上那些行还没写。这时就登记的话，别的请求可能
         #   复用一个KV还没写——甚至永远不会写（这条请求在forward之前被抢占、取消）——的block；chunked prefill下一个block还可能
@@ -3702,6 +3693,7 @@ class BlockManager:
     #       变成只读的checkpoint，序列换到新槽位S'；下一次forward从S读初始状态、写进S'
     #     从checkpoint恢复（_attach_state_slots）：新请求拿新槽位S'，第一次forward从checkpoint槽位S读、写进S'
     #   两种都叫fork：seq.state_fork_src = S。fork之后的那次forward至少要带min_fork_tokens个token才能把S'写完整
+    #   （fork快照的一生带数字见state_pool.py文件头【科普】④(c)）
     # 本函数：那次forward太短时取消fork——不写新槽位，直接把S接过来当自己的槽位（S上的checkpoint随之作废）：
     #   做checkpoint的那种 → 等于没存；恢复的那种 → 变成独占式命中（S不再留给别人）
     #   S还被同一步的另一个请求读（pin_count > 1）时不能接管，返回False，调用方改为把chunk撑到min_fork_tokens
@@ -3755,17 +3747,13 @@ class BlockManager:
         return True
 
     # ════════ 【分支】状态checkpoint阶梯（ladder）：存在哪些位置、什么时候切chunk、什么时候真的存（B级，第4批） ════════
-    # 【科普】前置（要点；完整讲解见arg_utils.py EngineArgs.state_checkpoint_interval_tokens上方的【科普】、
-    #   sequence.py Replay类上方的"科普：状态checkpoint与有界重放"）
-    #   ① MHA/GQA的KV按token一行一行存，前缀命中到哪就从哪接着算。线性注意力层（GDN：Qwen3-Next / Qwen3.5；KDA：Kimi-K3）
-    #      每请求只有一份定长状态S（Qwen3-Next一层GDN ≈ 32头×128×128 ≈ 52万个数），每来一个token原地覆盖；DeepSeek-V4的
-    #      128窗口环形缓冲和压缩器没凑满的尾巴也一样。算到位置P时"P处的状态"只存在一瞬间
-    #   ② 想让以后的请求从P接上，就得当时把状态另存一份 = 状态checkpoint，归档在"块P/hbs−1的链式hash"名下——和KV block
-    #      共用一条hash链：KV命中到第k块后，再问状态池"h_{k-1}名下有没有快照"（_gated_hit），没有就往回找更短的
-    #   ③ 状态一般只在forward的最后一个token处是完整的（中间位置的状态在kernel里一闪而过），所以要在P处存，就得让某次
-    #      forward恰好结束在P：把prefill chunk截短到P——多一次forward，这是放checkpoint的主要代价
-    #      （例外：能在forward中途读快照的后端，见下方midstep_positions上方的说明）
-    #   ④ 每个checkpoint都占一份状态大小的存储（PAGE路径从KV池借单元，fork路径占一个状态槽位），所以只放在少数位置
+    # 前置（要点；为什么要checkpoint、命中为什么退到最近的快照、快照存在哪，规范讲解见state_pool.py文件头【科普】②~⑤，
+    #   概念概要见sequence.py Replay类上方"科普：状态checkpoint与有界重放"）：
+    #   状态checkpoint = 位置P处的状态快照，归档在"块P/hbs − 1的链式hash"名下，和KV block共用一条hash链（_gated_hit按它查）。
+    #   本节讲的是放在哪里、什么时候存：状态一般只在forward的最后一个token处完整（中间位置的状态在kernel里一闪而过），所以要在P处
+    #   存，就得让某次forward恰好结束在P——把prefill chunk截短到P，多一次forward，这是放checkpoint的主要代价（例外：能在forward
+    #   中途读快照的后端，见下方midstep_positions上方的说明）；每个checkpoint还占一份状态大小的存储（PAGE从KV池借单元，fork占
+    #   一个状态槽位）。所以只放在少数位置
     #
     #   三种位置（都是hash_block_size的整数倍，否则算不出hash，存了也找不到）：
     #     阶梯（rung）   每interval个token一级（--state-checkpoint-interval-tokens，默认8192）："猜"复用会从哪里接上。
@@ -3773,16 +3761,19 @@ class BlockManager:
     #     需求（demand） 准入时KV命中被状态门控截短，就把"本来能命中到的位置"记成这条序列自己的一级（_record_checkpoint_demand）：
     #                   发现缺口的请求反正要从更低处重算，顺手在缺口处存一份，下一个同前缀的请求就能接满
     #     锚点（anchor） 本prompt的末尾，退到hash block边界（_record_checkpoint_end）：多轮对话的下一轮
-    #                   "上一轮prompt + 回答 + 新问题"正好从这里接上（源码实测：cc-traces里93.5%的恢复落在上一轮prompt末尾）
+    #                   "上一轮prompt + 回答 + 新问题"正好从这里接上（据_record_checkpoint_end的docstring，在SemiAnalysis
+    #                   cc-traces上实测：93.5%的恢复落在上一轮prompt末尾）
     #   interval取值：>0 阶梯开；0 checkpoint全关；-1 只有demand和锚点（见__init__里state_checkpoint_interval_tokens处）
     #
     #   谁做什么：
     #     准入（can_allocate → _evaluate）    _record_checkpoint_demand、_record_checkpoint_end：记下demand / 锚点位置
-    #     调度（Scheduler._finalize_prefill_chunk）  checkpoint_cut：在(起点, 终点]里挑最早的候选，把chunk截到那里
+    #     调度（Scheduler._finalize_prefill_chunk）  checkpoint_cut：阶梯先收缩成不超过终点的最右一级，再在(起点, 终点]里的
+    #                                         {这一级, demand, 锚点}中挑最早的，把chunk截到那里
     #     forward之后（hash_blocks）          checkpointers_at：forward结束在pos，哪些状态类在这里存
     #     两边必须逐个位置一致：切了却不存 = 白多一次forward；该存的位置没切 = forward越过去，状态已不是那里的了
     #
-    #   例（DeepSeek-V4：hash_block_size = 256，copy式PAGE checkpoint、successor_room = 0、不能中途读；interval 8192，
+    #   例（与文件开头的100块例子互补：那里是普通模型，这里看有状态模型的checkpoint放在哪；概念层面的18432例子见state_pool.py
+    #     【科普】③。DeepSeek-V4：hash_block_size = 256，copy式PAGE checkpoint、successor_room = 0、不能中途读；interval 8192，
     #     每步预算max_num_batched_tokens = 16384，ATOM_STATE_CHECKPOINT_END_MARGIN = 0；数字按本区段各函数的公式推算）
     #   请求A：40000个token的prompt，冷缓存
     #     准入：checkpoint_limit = (40000 − 0)//8192×8192 = 32768；锚点 = (40000 − 0)//256×256 = 39936
@@ -5139,7 +5130,7 @@ class BlockManager:
         #   （`reclaim_stale_leases`）时调用。"幂等"只在这个意义上成立：connector保证对一份租约，每个block ID只会经由
         #   `take_source_safe_releases` / `reclaim_stale_leases` 两者之一出现恰好一次——对同一个ID调用两次会重复释放这个block，
         #   和调用两次 `BlockPool.free` 一样。
-        # 解释：kv.free = 引用计数 − 1，归零才回空闲池（见下方deallocate的图）。调用方Scheduler（排空租约释放、超时回收）和
+        # 解释：kv.free = 引用计数 − 1，归零才回空闲池（见下方deallocate上方的例子）。调用方Scheduler（排空租约释放、超时回收）和
         #   chunked_scheduler.py（晚保存用不上的block）
         for block_id in block_ids:
             self.kv.free(block_id)
@@ -5149,29 +5140,21 @@ class BlockManager:
     #   _maybe_release_deferred调用，或走deallocate_partial）、preempt（重算式抢占，之后整条重新prefill）、_schedule里
     #   准入之后回滚的几条路径、_consume_failed_remote_kv、allocate_waiting
     #
-    # 核心是"引用计数 − 1，归零才回空闲池，hash和KV内容原样保留"（惰性淘汰）。例：hbs = 16，
+    # 核心是"引用计数 − 1，归零才回空闲池，hash和KV内容原样保留"（惰性淘汰；空闲表的三个容器、淘汰顺序、一个block的hash
+    #   什么时候才真正失效①~④，规范讲解见block_pool.py文件头的账本图和"为什么释放的block要保留内容"）。例：hbs = 16，
     #   A.block_table = [7, 3, 12]：块0、1已登记（7 ↔ h0、3 ↔ h1），块2是半满的尾块（hash = −1）；block 7还被B共享（ref = 2）
     #   逆序释放 12 → 3 → 7（kv.free，block_pool.py）：
-    #     block 12：ref 1→0，没有hash → 进 _vacant（按id排序的最小堆："空白"block，分配时最先被取走）
+    #     block 12：ref 1→0，没有hash → 进 _vacant（按id排序的最小堆，分配时最先被取走：拿走它什么都不损失）
     #     block 3 ：ref 1→0，有hash   → 进 _cached 队尾（按释放先后排序的LRU）；索引 h1 → 3 不动，显存里的KV也不动
     #     block 7 ：ref 2→1，B还在用   → 什么都不变
-    #
-    #     空闲池   _vacant（最小堆）   { …, 12, … }            先取：拿走它什么都不损失
-    #             _cached（LRU）      [ 最早释放 … , 3 ]       _vacant取空之后，才从最早释放的一端取
-    #             _protected（SLRU）  只在ATOM_PREFIX_CACHE_POLICY=slru时用：被命中复用过的block放这里，最后才取
-    #     hash索引 { h0:7, h1:3, … }    ← 不变：block 3虽然空闲，仍可被命中
-    #
-    #   之后block 3的两种命运：
-    #     ① 新请求C的前缀命中h1 → kv.claim(3)：从_cached摘下、ref = 1，KV原样复用，不用重算
-    #     ② 一直没人命中，某次_fresh_block（allocate未命中的部分 / may_append）把_vacant取空后轮到它 → kv.allocate(3)：
-    #        _unindex删掉 h1 → 3，回调_record_evicted（计数、发BlockRemoved事件、作废挂在h1名下的状态checkpoint），
-    #        block.reset()——这时h1才真正消失。另外几处也会抹掉hash：clear_cache（清空整个索引）、池子缩小时的retire_top
+    #   之后block 3要么被新请求的前缀命中取回（kv.claim：ref = 1，KV原样复用），要么在_vacant取空后被某次_fresh_block拿去装新内容
+    #     （kv.allocate → 这一刻h1才从索引删掉、回调_record_evicted）——即文件开头例子的⑥⑦
     #   为什么逆序释放：链是从前往后匹配的，块0没了块1就再也走不到；逆序释放让靠前的块后进LRU、最后被淘汰（同nano-vllm）
     # 对比nano-vllm：nano-vllm只有ref_count − 1和一个free deque（释放放队尾、分配从队头取），所以一个有hash的block可能
     #   在空白block之前就被拿走；ATOM把空闲block分成空白 / 可复用两半，空白的先用。函数后半部分重置的是ATOM多出来的每请求状态：
     #   checkpoint的demand / 锚点 / midstep预留、线性注意力的状态槽位（含正在加载中的槽位）、offload的联合边界
     def deallocate(self, seq: Sequence):
-        # 逆序：链尾先进LRU、先被淘汰；kv.free = ref − 1，归零才回空闲池（hash和内容保留，见上图）
+        # 逆序：链尾先进LRU、先被淘汰；kv.free = ref − 1，归零才回空闲池（hash和内容保留，见上面的例子）
         for block_id in reversed(seq.block_table):
             self.kv.free(block_id)
         seq.num_cached_tokens = 0
@@ -5301,9 +5284,11 @@ class BlockManager:
         #   （`mtp_k - 1`），所以前瞻在那里从不抬高门槛；传进来是为了让这个检查写明它覆盖了什么。
         # 解释：needed_blocks = ceil(reach / ebs)，减去已有的块数；_has_page_units：没有PAGE checkpoint时就是"空闲block ≥ n"，
         #   有PAGE checkpoint时还把可以淘汰掉的checkpoint单元算作可用
-        # 观察：may_append实际只按 len(seq)（目标写到 len(seq) − 1）和 len(seq) + lookahead 分配，这里却按 len(seq) + num_new_tokens 估，
-        #   多估了num_new_tokens个位置。例（ebs = 16、不开MTP）：len = 32 时位置31是块1的最后一格，may_append不分配，这里却算出
-        #   需要 ceil(33/16) = 3 块、要求1个空闲block——池子正好用满时会多抢占一条请求。偏保守，不会少分配
+        # 观察：may_append最远只分配到 len(seq) + lookahead 个位置（目标写到 len(seq) − 1，草稿再往后写lookahead个），这里却按
+        #   len(seq) + max(num_new_tokens, lookahead) 估，多估了 max(num_new_tokens, lookahead) − lookahead 个位置（不开MTP时1个，
+        #   MTP k = 3时 4 − 2 = 2个）。例（ebs = 16、不开MTP）：len = 32 时位置31是块1的最后一格，may_append不分配，这里却算出
+        #   需要 ceil(33/16) = 3 块、要求1个空闲block——池子正好用满时会多抢占一条请求（下一步len = 33时may_append才真的取这一块）。
+        #   偏保守，不会少分配
         # 对比nano-vllm：nano-vllm是 len(free) >= (len(seq) % block_size == 1)，和它的may_append逐位一致
         seq_len = len(seq)
         current_blocks = len(seq.block_table)

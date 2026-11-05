@@ -1126,7 +1126,8 @@ class PageUnitCheckpointStore:
             self._release_record(checkpoint_id)
         return True
 
-    # clear：/reset_prefix_cache 时清空索引，所有记录标为 EVICTING，能立刻释放的立刻释放（调用方：协调器 clear_index ← BlockManager.clear_cache）
+    # clear：清空前缀缓存时清空索引，所有记录标为 EVICTING，能立刻释放的立刻释放（调用方：协调器 clear_index ← BlockManager.clear_cache，
+    #   后者在 v0.1.8 的 atom/ 里只有测试调用）
     def clear(self) -> None:
         self._note_change(None)
         self.hash_to_checkpoint.clear()

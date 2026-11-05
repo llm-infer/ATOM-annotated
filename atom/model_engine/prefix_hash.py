@@ -55,7 +55,8 @@
 #     前缀不同、hash 又恰好相同"比对不出来，只能靠 2^-64 的概率。（nano-vllm 每块都比；据 _hit_walk 的 docstring，vLLM 一块都不比）
 #   xxh64 不是密码学 hash（不抗刻意构造的碰撞），追求的是快和分布均匀
 #
-# ④ 开 DCP 时，一个 hash block = block_size × DCP 个 token（hash_block_size_for）
+# ④ 开 DCP 时，一个 hash block = block_size × DCP 个 token（hash_block_size_for；本批讲"DCP 对 block 账本的影响"的规范位置，
+#   block_manager.py 的【前置：DCP】、block_convert.py 文件头③只写要点并指回这里）
 #   前置（完整讲解见 arg_utils.py EngineArgs.decode_context_parallel_size 上方的【科普】DCP、tensor_parallel_size 下方的【科普】MLA）：
 #     MLA（DeepSeek-V3 等）每个 token 每层只缓存一份 576 个数、所有头共用，相当于只有 1 个 KV 头，没法再按 TP 切头，
 #     所以 -tp 8 时 8 张卡各存一整份同样的 KV。DCP 改成按 token 切：-dcp 4（interleave_size = 1）时第 i 个 token 的 KV
@@ -66,6 +67,9 @@
 #         卡0 的第 7 页：全局 token 0, 4, 8, …, 60          卡1 的第 7 页：1, 5, 9, …, 61
 #         卡2 的第 7 页：2, 6, 10, …, 62                    卡3 的第 7 页：3, 7, 11, …, 63
 #       → block_table 的一项（物理 block 7）覆盖全局 token 0~63，共 16 × 4 = 64 个
+#       各卡的写入槽位 = block_table[pos // 64] × 16 + 本卡本地序号 % 16（dcp_ops.dcp_prefill_slot_mapping）；
+#       KV 池按每卡的本地 block 数计：1000 个 token → ⌈1000/64⌉ = 16 个条目，每卡本地 250 个 token 也是 16 个物理 block
+#       （BlockManager.num_pool_blocks）
 #
 #     前缀复用以 block_table 的一项为单位，所以 hash 也必须按 64 个全局 token 一块来算；DCP = 1 时就等于 block_size。
 #     interleave_size = S > 1（每 S 个 token 一组轮流分；Config 断言 block_size 是 S 的倍数）时，第 k 项同样覆盖

@@ -107,7 +107,8 @@ class Block:
 # 【译】支撑每请求状态槽位（GDN / Mamba 的递归状态、DeepSeek-V4 的压缩器环形缓冲）的子池规模类别名。
 #   放在消费这个数量的 block / 槽位机制旁边，而不是放在规模计算层里。
 # 前置：线性注意力层没有逐 token 的 KV，每条请求只有一份定长状态（Qwen3-Next 一层 GDN ≈ 52 万个数），
-#   所以按"槽位"而不是按 block 分配（见 arg_utils.py EngineArgs.state_checkpoint_interval_tokens 上方的【科普】、state_pool.py）。
+#   所以按"槽位"而不是按 block 分配（规范讲解见 state_pool.py 文件头【科普】②④(a)；概念概要见 arg_utils.py
+#   EngineArgs.state_checkpoint_interval_tokens 上方的【科普】）。
 # 用法：注意力后端声明子池 state_pool(STATE_SLOT_CLASS, 每槽字节数, entries_per_req=…)（gdn_attn.py、
 #   deepseek_v41/backend.py 等）；ModelRunner 按声明切分显存，得到 {类别名: 条目数}，EngineCore 回填到
 #   config.pool_entries；BlockManager.__init__ 读 pool_entries[STATE_SLOT_CLASS] 得到状态槽位总数 num_state_slots

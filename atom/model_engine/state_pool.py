@@ -59,6 +59,8 @@
 #       代码注释里的实测：cc-traces 上 93.5% 的恢复落在上一轮 prompt 末尾，落在 8192 阶梯上的是 0.0%
 #     - 按需一级（demand rung）：某次命中因"缺快照"被截短时，在被拒的位置给自己补一级，后来的请求就能整段命中
 #       （BlockManager._record_checkpoint_demand；--state-checkpoint-demand / ATOM_STATE_CHECKPOINT_DEMAND，默认开）
+#     （三种位置怎样把 prefill chunk 切开、forward 结束时存不存，带数字的逐步走查——40000 token 的请求 A/B/C——见
+#      block_manager.py checkpoint_limit 上方的【分支】状态checkpoint阶梯；这里只讲概念）
 #   命中判定：BlockManager._gated_hit 把 KV 命中长度交给每个状态类的 resumable_hit（本文件 StateSlotPool.resumable_hit、
 #     page_unit_checkpoint.py 的同名方法），从命中点往左扫，停在第一个"有快照"的边界：
 #
@@ -110,7 +112,8 @@
 #         - 命中长度 = KV 命中再经状态门控截短（_gated_hit），allocate 只认领到快照位置为止的 KV block，其余重算
 #         - KV block 被淘汰时（BlockPool 的 on_evict 回调 → BlockManager._record_evicted），同一 hash 的快照立刻 unindex：
 #           这一环的 KV 没了，快照永远不会再被命中，留着只会挤掉还有用的快照（本类 unindex 的 docstring）
-#         - /reset_prefix_cache 时两边一起清（BlockManager.clear_cache 依次调 kv.clear_index 和 状态类.clear_index）
+#         - 清空前缀缓存时两边一起清（BlockManager.clear_cache 依次调 kv.clear_index 和 状态类.clear_index；这个管理接口在
+#           v0.1.8 的 atom/ 里只有测试调用）
 #
 # ⑤ 页单元 checkpoint（page_unit_checkpoint.py，copy 方式）
 #   页单元 = KV 池（Pool.PAGE）里一个 block 的全部字节（跨所有全注意力层，ModelRunner 里 PagedStateCheckpointSpec.page_unit_bytes）。
@@ -1129,7 +1132,7 @@ class StateSlotPool:
     def clear_index(self) -> None:
         """Drop all checkpoint hashes, preserving only in-flight readers."""
         # 【译】丢掉所有 checkpoint hash，只保留正在进行中的读者。
-        # 调用方：BlockManager.clear_cache（/reset_prefix_cache 之类的管理操作）；被钉住的源仍不在空闲表上，release_pins 照常归还
+        # 调用方：BlockManager.clear_cache（管理操作；v0.1.8 的 atom/ 里只有测试调用）；被钉住的源仍不在空闲表上，release_pins 照常归还
         for slot in list(self.hash_to_slot.values()):
             self.invalidate(slot)
 

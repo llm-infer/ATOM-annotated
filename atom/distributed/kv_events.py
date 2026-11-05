@@ -198,7 +198,8 @@ class BlockTransferred(KVCacheEvent):
     #
     #   在 GPU↔CPU/DISK 换入换出、REMOTE→GPU 接收、GPU→REMOTE 发送时发出。
     #   仅ATOM有——严格的vLLM消费者应把联合类型收窄、排除它。
-    # 观察：grep整个仓库，没有任何地方构造BlockTransferred（KV offload / PD分离的路径都没发它），目前只是线上格式里预留的类型
+    # 观察：atom/ 下没有任何地方构造BlockTransferred（KV offload / PD分离的路径都没发它；只有tests/test_kv_events.py做编解码往返
+    #   测试时构造），目前只是线上格式里预留的类型
 
     block_hashes: list[int]
     from_medium: str
