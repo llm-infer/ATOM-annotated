@@ -347,7 +347,7 @@ def draft_kv_lookahead(num_speculative_tokens: int) -> int:
     #   目标模型：  ■    ■      │                  第0步草稿也写在这些位置（与目标模型同一槽位）
     #   草稿中间步1：           │ ■                context_lens = 1009 → 写1008
     #   草稿中间步2：           │      ■           context_lens = 1010 → 写1009 = C + k − 2
-    #   1008个token正好占满63个block（0~1007），1008、1009落在第64个block里：admission要多收1个block
+    #   1008个token正好占满63个block（0~1007），1008、1009落在第64个block里：准入时要多收1个block
     #   （draft_lookahead_blocks(1008) = 1），may_append(lookahead=2)把它分出来；若不分，block_table[63]读到的是
     #   ScheduledBatch里补零的尾部 → 物理block 0 → 覆写别人的KV
     #   k = 1（只有1个草稿token）时没有中间步，返回0；没开投机解码时num_speculative_tokens为0，也返回0
@@ -700,8 +700,9 @@ class BlockManager:
             )
         # 【分支】PAGE状态checkpoint的协调器（page_unit_checkpoint.py）：checkpoint镜像不占状态槽位，而是借KV池的block存。
         #   例（kimi_mla_gdn_attn.py的说明）：一个KDA槽位53.6 MiB，按PAGE存是127个普通KV block、约占KV池的0.112%，
-        #   和普通KV从同一个空闲表里取、按同一个LRU淘汰。enabled = 开了前缀缓存且确实有状态槽位（关闭时对象仍在，只是不登记
-        #   checkpoint）；readable_midstep：后端能否在forward中途取快照（GDN在ATOM_GDN_STATE_MIDSTEP=1时能）
+        #   和普通KV从同一个空闲表里取、按同一个LRU淘汰。enabled = 开了前缀缓存且确实有状态槽位（为False时对象仍在，但对
+        #   所有序列都不适用：不门控、也不存checkpoint）；readable_midstep：后端能否在forward中途取快照（GDN在
+        #   ATOM_GDN_STATE_MIDSTEP=1时能）
         self.paged_state_checkpoints: PagedStateCheckpointCoordinator | None = None
         if checkpoint_spec is not None:
             enabled = self.enable_prefix_caching and self.num_state_slots > 0
@@ -915,7 +916,7 @@ class BlockManager:
                 # (DSpark3: 42.45 vs 29.51 MiB), and dividing by it would cap
                 # this index a third below the codec, hiding images it holds.
                 # 【译】codec每个条目存一个 image_bytes 大小的镜像（除非条目恰好这么大，否则worker会关掉这一层）。不用 slot_bytes：
-                #   MTP下一个槽位装的不止一个镜像（DSpark3：42.45 对 29.51 MiB），用它来除会让这个索引比codec的上限少三分之一，
+                #   MTP下一个槽位比一个镜像大（DSpark3：42.45 对 29.51 MiB），用它来除会让这个索引比codec的上限少三分之一，
                 #   把它实际持有的镜像藏起来。
                 # 例：OFFLOAD_STATE_CPU_SIZE默认32 GiB，镜像29.51 MiB时上限 32768 / 29.51 ≈ 1110个条目
                 max_cpu_entries=(
@@ -1202,7 +1203,8 @@ class BlockManager:
         #   _has_page_units 的参数相同，所以同一轮里的两道门对"什么可以花"意见一致。
         #
         #   完全没有PAGE checkpoint时返回 True：fork checkpoint不花池子任何东西，所以没什么要把关的。
-        # units_per_checkpoint = ⌈镜像字节数 / 一个block的字节数⌉，例：KDA一个镜像127个block（见__init__里paged_state_checkpoints处）
+        # units_per_checkpoint = ⌈image_bytes / page_unit_bytes⌉（一个PAGE单元约是一个KV block的字节数），例：KDA一个镜像
+        #   127个单元（见__init__里paged_state_checkpoints处）
         if self.paged_state_checkpoints is None:
             return True
         return self.paged_state_checkpoints.has_available_units(
@@ -1636,7 +1638,7 @@ class BlockManager:
     # 依次过的门（不过就返回_no_joint(原因)，原因由_commit_joint_boundary计入joint_skips）：
     #   off（没有CPU状态层）→ no_paged_checkpoints（序列不带状态，或没用PAGE checkpoint）→ no_chunk_size →
     #   lmcache_within_hbm（LMCache并不比HBM多）→ hbm_off_chunk_grid → no_room_above_hbm → no_rung_above_hbm →
-    #   covering_chunk_beyond_lookup → claim_off_hash_grid
+    #   covering_chunk_beyond_lookup → claim_off_hash_grid（共9道）
     # 调用方：record_allocation（_evaluate在record=True时，或调度器在等待 / 预算检查通过后调用）
     def _joint_kv_boundary(
         self,
@@ -1718,7 +1720,7 @@ class BlockManager:
         # The KV leg moves whole chunks and the blocks below the HBM prefix are
         # shared, so an unaligned start cannot be rounded down.
         # 【译】KV腿按整chunk搬运，而HBM前缀以下的block是共享的，所以一个没对齐的起点不能向下取整。
-        # 例（hbs 64、chunk 256）：HBM命中3块 = 192个token，192 % 256 ≠ 0 → 放弃（向下取到0就要往别人共享的block里写）
+        # 例（hbs 64、chunk 256）：门控后的HBM命中3块 = 192个token，192 % 256 ≠ 0 → 放弃（向下取到0就要往别人共享的block里写）
         if (hbm_boundary * hbs) % chunk != 0:
             return self._no_joint("hbm_off_chunk_grid")
         # cap：两条腿能到的上限（以hash block计）——不超过LMCache有的，也不到最后一块（最后一块永远要自己算，同can_allocate）
