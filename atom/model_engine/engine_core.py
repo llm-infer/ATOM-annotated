@@ -267,7 +267,9 @@ class EngineCore:
     #     例（量级，数字与预算条一致）：192GB的卡、utilization=0.9 → 预算172.8GB；权重70 + 激活峰值8 + 其他约7.4
     #       （非torch≈2 + graph池≈1.6 + 2%余量≈3.8）→ KV约87GB；
     #       80层、8个KV头（GQA：64个q头每8个共用一组K/V）、head_dim=128、FP8 KV的模型，
-    #       每token的KV = 2(K和V)×80×8×128×1B = 160KB；block_size=16 → 每个block 2.5MB → 约3.5万个block ≈ 57万个token的KV容量
+    #       每token的KV = 2(K和V)×80×8×128×1B = 160KB，再加FP8的每token每头fp32 scale 2×80×8×4B = 5KB → 约165KB；
+    #       block_size=16 → 每个block 2,703,360 B ≈ 2.58MB → 87.36GB / 2.58MB ≈ 34,698个block ≈ 55.5万个token的KV容量
+    #       （逐项算法见 model_runner.py 中 get_num_blocks 上方的显存预算条，那里是规范位置）
     #   ③ 为什么不能写死：权重大小、激活峰值、TP切分、KV dtype、同卡上的其他进程都会改变结果，只能在本机实测；
     #     而block数就是调度器的准入上限（BlockManager没有空闲block时请求只能等待或被抢占），所以必须测完才能建Scheduler
     #   ④ CUDA Graph在KV分配之后捕获：graph里记录的是kernel参数中的显存地址，KV cache必须已经在它最终的地址上；
@@ -319,7 +321,7 @@ class EngineCore:
     #     graph：_estimate_cudagraph_overhead（enforce_eager时为0；PIECEWISE时按逐token字节数×捕获的token总数估计，上限约预算的15%）
     #     余量：total × 2%；RapidServe再多扣 _kv_budget_extra_reserve = 4×2% = 8%；KV connector缓冲（若有）也先扣掉
     #     最终 available_for_kv = min(上面算出的值, 实际空闲显存 − connector缓冲)，再交给plan_pools按各子池切分成block
-    #   读法：gpu_memory_utilization每调高0.01，在这张卡上就多出约1.9GB的KV（约790个2.5MB的block、约1.26万个token）；
+    #   读法：gpu_memory_utilization每调高0.01，在这张卡上就多出约1.92GiB的KV（约763个2.58MB的block、约1.22万个token）；
     #     调得太高的代价是分配器碎片、其他进程或之后的临时分配没有余地，运行中OOM
     def __init__(self, config: Config, input_address: str, output_address: str):
         self.label = "Engine Core"

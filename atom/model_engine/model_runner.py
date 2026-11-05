@@ -401,7 +401,8 @@ class TokenLocations(NamedTuple):
 #
 # 本类做两件事，一"出"一"进"：
 #   出（prepare_sampled_ids，postprocess采样后调用）：对本步的sampled_tokens（GPU）只发起异步D2H、不等；改为取出*上一步*发起的
-#     那次D2H的结果交给EngineCore（这时它通常早已拷完）。所以forward(第N步)返回的是第N-1步的token
+#     那次D2H的结果交给EngineCore（GPU做完上一步就拷完了；CPU比GPU快时会在这里等一会儿，但本步此时已排进GPU队列，GPU不会空闲）。
+#     所以forward(第N步)返回的是第N-1步的token
 #   进（prepare_input_ids，prepare_model准备输入时调用）：decode请求本步的输入token就是它上一步刚采样出来的那个，CPU此时还没有它
 #     （scheduled_tokens里那一格只是占位，值为eos_token_id）；fill_deferred_decode_ids kernel（model_ops/decode_input_ids.py）在
 #     GPU上直接从prev_token_ids（上一步的sampled_tokens，一直留在GPU上）把它抄进input_ids——token从"被采样"到"成为下一步
@@ -1114,7 +1115,7 @@ class tokenIDProcessor:
             if gbs is not None:
                 fill_to = max(fill_to, int(gbs) * tokens_per_seq)
         # 一次launch：每个请求一个program写它自己的[cu[i], cu[i+1])，再加若干program清零[cu[bs], fill_to)
-        #   上一步没有草稿时（pre_num_decode_token_per_seq == 1）不传draft表，此时每个请求必须恰好1个token（kernel里有assert）
+        #   上一步没有草稿时（pre_num_decode_token_per_seq == 1）不传draft表，此时每个请求必须恰好1个token（fill_deferred_decode_ids里有assert）
         fill_deferred_decode_ids(
             self.input_ids.gpu,
             self.runner.forward_vars["cu_seqlens_q"].gpu[: bs + 1],
