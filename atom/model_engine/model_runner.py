@@ -3485,6 +3485,14 @@ class ModelRunner:
             torch.distributed.barrier()
         return True
 
+    # 【分支】DP：本rank本步要补多少个token，才能和token最多的那个DP rank对齐（B级）
+    #   为什么要对齐：DP下MoE层要在DP rank之间gather / all-to-all token（第7批），这些集合通信要求各rank的形状一致；
+    #     为什么每个rank都要知道"每个DP rank本步有多少token"见utils/forward_context.py DPMetadata上方的【科普】
+    #   返回：(要补的token数, 各DP rank的token数 [dp_size] 的CPU张量)；DP=1时 (0, None)
+    #   例：dp=4，各rank本步token数 [3, 8, 5, 8] → rank 0返回 (5, [3,8,5,8])、rank 2返回 (3, …)
+    #   num_tokens_across_dp由DPMetadata.num_tokens_across_dp在DP组的gloo（CPU）组上做一次all_reduce得到——这是一次跨DP的同步点
+    #   调用方：capture_cudagraph（PIECEWISE逐档录图时）、_capture_attn_ffn_graphs；正常服务的每一步改由ForwardMode.decide里的
+    #     打包all_gather一次拿齐（forward_context.py）
     def get_dp_padding(self, num_tokens: int) -> tuple[int, torch.Tensor | None]:
         dp_size = self.config.parallel_config.data_parallel_size
         dp_rank = self.config.parallel_config.data_parallel_rank
@@ -3495,9 +3503,15 @@ class ModelRunner:
         #
         # TODO(tms) : There are many cases where padding is enabled for
         # prefills, causing unnecessary and excessive padding of activations.
+        # 【译】DP时：设置了enforce_eager就不补齐。这样在P/D部署里可以给prefill端设enforce_eager，而decode端仍能用
+        #   CUDA graph（正是这里的补齐让它成为可能）。
+        #
+        #   TODO(tms)：有很多情况下prefill也开了补齐，造成不必要、过量的激活补齐。
+        # 观察：这段注释（来自vLLM）说enforce_eager时不补齐，但下面的代码并没有检查enforce_eager，DP>1时总是补齐
 
         if dp_size == 1:
             # Early exit.
+            # 【译】提前返回。
             return 0, None
         num_tokens_across_dp = DPMetadata.num_tokens_across_dp(
             num_tokens, dp_size, dp_rank
@@ -3506,6 +3520,14 @@ class ModelRunner:
 
         return max_tokens_across_dp - num_tokens, num_tokens_across_dp
 
+    # 【分支】TBO（Two-Batch Overlap，B级，第9批utils/tbo/）
+    #   前置：TBO把一个batch切成两个微batch，用两条stream交错执行，让一个微batch的MoE all-to-all通信和另一个的计算重叠
+    #     （时间线图见arg_utils.py enable_tbo上方的【科普】）；DP下要不要切必须所有rank一致，否则各rank的集合通信次数对不上会挂死
+    #   本方法：在ForwardMode.decide已经跨DP定下"要切"（tbo_collective_active）之后，真正把batch切成两段UBatchSlice
+    #     （每段的请求区间和token区间）；不切时返回None
+    #   切法（utils/tbo/ubatch_splitting.py maybe_create_ubatch_slices）：decode按请求数对半（例：8条 → 4 + 4）；
+    #     prefill按token数大致对半、在请求边界处切（ATOM_TBO_PREFILL_TOKEN_SPLIT时可以在一条请求内部按token中点切）
+    #   调用方：prepare_inputs
     def _maybe_create_tbo_slices(
         self,
         batch,
@@ -3520,6 +3542,9 @@ class ModelRunner:
         With the packed-reduce path the eligibility (local + cross-DP AND)
         is decided in ``ForwardMode.decide``; here we just realise the split.
         """
+        # 【译】在跨DP的集体决定为True时创建TBO微batch切片。
+        #
+        #   在打包归约的路径上，资格判定（本地 + 跨DP的AND）在 ``ForwardMode.decide`` 里做；这里只是把切分落实。
         if not tbo_collective_active:
             return None
 
@@ -3528,6 +3553,8 @@ class ModelRunner:
         # is committed to splitting even if it's below ATOM_TBO_PREFILL_MIN_TOKENS
         # (a peer cleared the bar). force=True bypasses the local min-token gate
         # so we don't desync from peers and hang.
+        # 【译】tbo_collective_active是跨DP按OR归约后的决定：即使本rank低于ATOM_TBO_PREFILL_MIN_TOKENS（有同伴达标了），
+        #   本rank也必须切。force=True绕过本地的最少token门槛，免得和同伴失步而挂死。
         ubatch_slices = maybe_create_ubatch_slices(
             num_reqs=tbo_num_reqs,
             num_tokens=scheduled_tokens,
@@ -3542,6 +3569,11 @@ class ModelRunner:
             )
         return ubatch_slices
 
+    # 【分支】TBO：本rank对"这一步切不切"的本地回答（B级），交给ForwardMode.decide跨DP归约
+    #   返回 (meets_min_tokens, can_split, ub0_tokens, ub1_tokens)：前两项在本步唯一一次打包all_gather里分别做OR、AND归约，
+    #     例：dp=2，rank 0的prefill有9000个token（≥ATOM_TBO_PREFILL_MIN_TOKENS默认8192）、rank 1只有500 → OR后两边都切
+    #   副作用：顺便设置PCP+TBO的路由标志（_pcp_tbo_balanced_active、_pcp_bal_groups），每步重置
+    #   调用方：prepare_model（传给ForwardMode.decide的local_tbo）
     def _local_tbo_eligibility(
         self, batch: ScheduledBatch
     ) -> tuple[bool, bool, int, int]:
@@ -3553,6 +3585,10 @@ class ModelRunner:
         decision. Sets the PCP+TBO routing flags as a side effect because they
         come out of the same sizing.
         """
+        # 【译】本rank对TBO的回答，以及随之而来的PCP标志。
+        #
+        #   `(meets_min_tokens, can_split, ub0_tokens, ub1_tokens)`。前两项在本步唯一一次打包的all_gather里跨DP归约——
+        #   分别做OR和AND——所以这是那个问题的本地一半，而不是决定。顺带设置PCP+TBO的路由标志，因为它们出自同一次规模计算。
         is_prefill = batch.total_tokens_num_prefill > 0
         if not self.config.enable_tbo:
             self._pcp_tbo_balanced_active = False
@@ -3567,14 +3603,19 @@ class ModelRunner:
         # (never split a sequence's tokens), so each ubatch = "non-TBO PCP on a
         # request subset". Requires num_reqs >= 2 (request-boundary split needs
         # two non-empty groups); bs=1 falls back to non-TBO.
+        # 【译】PCP+TBO的prefill：在请求边界处把请求分成两*组*（绝不切开一条序列的token），于是每个微batch =
+        #   "在一个请求子集上做不带TBO的PCP"。要求num_reqs >= 2（按请求边界切需要两个非空的组）；bs=1时退回不用TBO。
+        # 【分支】PCP（prefill上下文并行：一条长prompt的token分给几张卡一起算，第9批）
         pcp_size = self.config.prefill_context_parallel_size
         # Read by build_ubatch / run_model / prepare_prefill to route the
         # per-group path; reset every step so a stale value cannot route one.
+        # 【译】build_ubatch / run_model / prepare_prefill读取它们来选择按组的路径；每步重置，免得过期的值把某一步路由错。
         self._pcp_tbo_balanced_active = False
         self._pcp_bal_groups = None
         if is_prefill and pcp_size > 1 and not batch.is_dummy_run:
             # PCP is always dp=1, so the single-rank path returns this verbatim
             # as `tbo_collective_active`; ub0/ub1 are only read under dp > 1.
+            # 【译】PCP时总是dp=1，所以单rank路径把这个值原样作为 `tbo_collective_active` 返回；ub0/ub1只在dp > 1时才被读取。
             local_tokens = batch.total_tokens_num_prefill // pcp_size
             eligible = batch.total_seqs_num_prefill >= 2 and local_tokens >= 2
             ub0 = local_tokens // 2
@@ -3582,6 +3623,17 @@ class ModelRunner:
             self._pcp_tbo_balanced_active = eligible
         return local_tbo
 
+    # 【分支】DSpark投机解码：按置信度把本步的验证长度缩短（B级，第7批；概念见arg_utils.py EngineArgs.method上方的【科普】、
+    #   config.py DSparkConfig上方的字段说明）
+    #   前置：DSpark每步给每个请求出mtp_k个草稿，目标模型一次forward验证 1 + mtp_k 个token（anchor + 草稿）。
+    #     开了confidence_schedule后，置信度头为每个请求r估一个"值得验证的长度"ell_r（上一步算出，在verify_scheduler.ell_by_req里），
+    #     尾部不值得验证的草稿白占算力，于是有两种缩法：
+    #       q-bucket（旧路径，--dspark-config q_buckets）：整批统一缩到 q = 取不小于 max(ell+1, num_bonus+1) 的最小桶，
+    #         每条序列都forward q个token，回放(bs, q)那张图
+    #       ragged（--dspark-config ragged）：每条序列各自缩到 max(ell_i, num_bonus_i) + 1，长度不等、拼成一维（见_dspark_apply_ragged）
+    #     例（docstring里的）：满长mtp_k+1，两个请求分别接受了2和5个 → ragged时分别forward 3和6个token，而不是都按满长
+    #     丢掉的草稿后缀下一步会重新起草，结果不变（lossless）；KV仍按 mtp_k+1 预留
+    #   调用方：prepare_model；只改worker进程里这份batch副本的计数和scheduled_tokens
     def _dspark_apply_q_bucket(self, batch: ScheduledBatch) -> int | None:
         """Shrink this decode step's verify length to one CUDA-graph bucket q,
         and return it -- or None when nothing shrank and the step keeps the
@@ -3598,6 +3650,15 @@ class ModelRunner:
         The bucket math lives in `apply_q_bucket` so CPU CI can run it without
         importing this module (which loads AITER).
         """
+        # 【译】把本decode步的验证长度缩到一个CUDA graph桶q并返回它——如果什么都没缩、本步保持配置的 `num_spec_step + 1`，返回None。
+        #
+        #   q = quantize_up(max ell_i + 1)，在整个batch上取（ell_i = 上一步对每个请求的调度）。之后所有序列都forward q个token
+        #   （anchor + q-1个草稿），而不是mtp_k+1，回放时选(bs, q)那张graph；被丢掉的草稿后缀下一步重新起草 → 无损。
+        #
+        #   只修改worker的batch副本（计数 + 截断到q-1的scheduled_spec_decode_tokens）；KV仍按mtp_k+1预留。
+        #   除非开了DSpark置信度调度且这是一个纯decode的batch，否则什么也不做。
+        #   分桶的计算放在 `apply_q_bucket` 里，这样CPU CI不用导入本模块（它会加载AITER）也能跑它。
+        # ragged时apply_q_bucket转调下面的_dspark_apply_ragged
         from atom.spec_decode.dspark_scheduler import apply_q_bucket
 
         drafter = getattr(self, "drafter", None)
@@ -3611,6 +3672,13 @@ class ModelRunner:
             ),
         )
 
+    # 【分支】DSpark ragged验证（B级）：每条序列各自的验证长度（前置见上面_dspark_apply_q_bucket）
+    #   改写batch：scheduled_tokens（一维、按序列首尾相接）、num_scheduled_tokens、total_tokens_num(_decode)；返回q_eff
+    #     （单条序列长度的上界，用来给按序列开的结构定尺寸），或None表示保持矩形（不缩）
+    #   例：3条序列、满长8、new_len = [3, 6, 8]：old_cu = [0, 8, 16, 24] → new_cu = [0, 3, 9, 17]，
+    #     每条保留自己旧段的前new_len[i]个（第0个是anchor，其余是调度器已填好的草稿占位）；total_tokens_num_decode = 17
+    #   不缩的情况：上一批与本批的请求集合或顺序不同（读的是上一步的num_bonus）、有请求的上下界交叉、没有一条能缩、
+    #     或FULL整图模式（整图只按矩形录，缩了也只能矩形回放）
     def _dspark_apply_ragged(self, batch, scheduled_bs, full_q, by_req):
         """DSpark per-request RAGGED verify (paper §5.2 avoid-padding).
 
@@ -3621,6 +3689,11 @@ class ModelRunner:
         unchanged; the dropped draft suffix is re-drafted next step (lossless).
         KV stays reserved at mtp_k+1.
         """
+        # 【译】DSpark按请求的RAGGED验证（论文§5.2，避免填充）。
+        #
+        #   令num_scheduled_tokens[i] = max(ell_i, num_bonus_i) + 1，并夹到[1, full_q]——两项都是请求i自己的，
+        #   所以接受了2个和5个的两个请求分别forward 3个和6个token，而不是6个和6个。下游的V4注意力由标记驱动（cu_seqlens等），
+        #   所以不等长的长度原样流过；被丢掉的草稿后缀下一步重新起草（无损）。KV仍按mtp_k+1预留。
         old_nst = batch.num_scheduled_tokens
 
         tp = getattr(self, "tokenID_processor", None)
@@ -3631,12 +3704,16 @@ class ModelRunner:
         # the same order (no new/prefill seqs, no reorder), because the per-
         # request lengths below are read off that batch's `num_bonus`. Any
         # deviation → boundary step.
+        # 【译】收缩要求上一个batch恰好就是这一组decode、顺序也相同（没有新序列/prefill序列，没有重排），因为下面每个请求的长度
+        #   是从那个batch的 `num_bonus` 里读出来的。任何偏差 → 视为边界步。
         if prev_req is None or prev_req != cur_req:
             return  # boundary / reorder step: skip ragged, stay rectangular
 
         # Positional, which is what the `prev_req == cur_req` guard buys: entry
         # i is request i's own count from the step that produced it, before
         # `prepare_input_ids` remaps the deferred rows.
+        # 【译】按位置取，这正是 `prev_req == cur_req` 这个检查换来的：第i项就是请求i自己在产生它的那一步里的计数，
+        #   在 `prepare_input_ids` 重新映射延迟的行之前。
         nb = batch.num_bonus[:scheduled_bs]
 
         from atom.spec_decode.dspark_scheduler import (
@@ -3648,6 +3725,8 @@ class ModelRunner:
         # Bounded per request by nb[i]+1 (its anchor must stay inside its OWN
         # segment) and old_nst[i] (a stale ell must not grow a seq past what the
         # scheduler scheduled). None -> some request's bounds cross.
+        # 【译】每个请求的下界是nb[i]+1（它的anchor必须留在它*自己*的段里），上界是old_nst[i]（过期的ell不能让一条序列
+        #   超出调度器排给它的长度）。返回None → 有请求的上下界交叉了。
         new_len = ragged_verify_lens(
             (by_req.get(rid) for rid in batch.req_ids[:scheduled_bs]),
             full_q,
@@ -3670,10 +3749,17 @@ class ModelRunner:
         #     seq can overflow them. It is NOT the total compute size -- that is
         #     the flat num_tokens bucket (running_tokens), sized to the
         #     real sum, so a long-tail seq no longer inflates the batch row count.
+        # 【译】在改写batch上的任何东西*之前*，先算q_eff并检查回放形状是否可行。只有回放能跟着缩下去，收缩一维token布局才安全；
+        #   跟不下去时，正是这次重建让这一步不安全，所以决定必须放在前面。
+        #     * max_seqlen_q（标量）q_eff：*每条序列*长度的上界（>= max(new_len)，向上量化到一个录过的桶）。按序列开的结构
+        #       （压缩器网格、矩形索引器）按它定尺寸，所以不会有序列溢出。它*不是*总计算量——那是一维num_tokens的桶
+        #       （running_tokens），按真实总和定尺寸，所以一条长尾序列不再撑大整个batch的行数。
         buckets = resolve_q_buckets(self.config.dspark.ragged_graph_sizes, full_q)
         if self.enforce_eager:
             # Eager: no graph → capacity == exact Σ (no bucket). Scalar = batch max
             # real len (positions/attn bound); layout is pure flat Σ.
+            # 【译】eager：没有graph → 容量 == 精确的Σ（不分桶）。标量 = batch里真实长度的最大值（位置/注意力的上界）；
+            #   布局就是纯一维的Σ。
             q_eff = int(new_len.max()) if scheduled_bs > 0 else full_q
         else:
             # Graph: q_eff = smallest bucket >= the real MAX per-seq len, so no
@@ -3682,6 +3768,9 @@ class ModelRunner:
             # full_q cap needed. The TOTAL compute size is `running_tokens`,
             # settled apart from this by `ForwardMode`, so q_eff no longer needs
             # to track the sum/avg.
+            # 【译】有graph：q_eff = 不小于真实最大单序列长度的最小桶，所以没有序列会超过q_eff。按序列开的结构（压缩器网格、
+            #   矩形索引器）按q_eff定尺寸，不会溢出——不需要另外的full_q上限。总计算量是 `running_tokens`，由 `ForwardMode`
+            #   另外决定，所以q_eff不再需要跟踪总和/平均值。
             q_eff = (
                 quantize_to_bucket(int(new_len.max()), buckets)
                 if scheduled_bs > 0
@@ -3694,12 +3783,17 @@ class ModelRunner:
             # second search on this rank's own count is how the two came to
             # disagree. A miss there forwards the run eagerly, which is what the
             # branch above already does under `enforce_eager`.
+            # 【译】FULL cudagraph下没有录任何一维（按总token数）的图，所以打包后的run没有宽度可落，收缩什么也换不来——
+            #   回放反正是矩形的。落在*哪个*宽度不在这里问：`ForwardMode.decide` 按DP一致同意的总数来定，而在本rank自己的计数上
+            #   再搜一次，正是两边曾经不一致的原因。那边没命中时这次run就eager执行，这也正是上面enforce_eager分支已经在做的。
             if not self._piecewise_cg_active():
                 return  # stay rectangular
 
         # Rebuild scheduled_tokens (flat) to the ragged per-seq layout: keep the
         # first new_len[i] of each seq's old segment (token[0]=anchor, rest=draft
         # placeholders already populated by the scheduler from seq.token_ids).
+        # 【译】把一维的scheduled_tokens重建成按序列不等长的布局：保留每条序列旧段的前new_len[i]个
+        #   （token[0]=anchor，其余是调度器已经从seq.token_ids填好的草稿占位）。
         sched = np.asarray(batch.scheduled_tokens)
         old_cu = np.zeros(scheduled_bs + 1, dtype=np.int64)
         np.cumsum(old_nst[:scheduled_bs], out=old_cu[1:])
@@ -3723,8 +3817,12 @@ class ModelRunner:
         # `num_scheduled_tokens` with smaller entries, and every reader reads
         # those. `scheduled_spec_decode_tokens` keeps its full width --
         # `prepare_input_ids` slices it per request (`spec[i, :len_i - 1]`).
+        # 【译】不发布"本步缩过"的标记：缩过的一步就是条目更小的 `num_scheduled_tokens`，每个读者读的都是它。
+        #   `scheduled_spec_decode_tokens` 保持完整宽度——`prepare_input_ids` 按请求切它（`spec[i, :len_i - 1]`）。
         return int(q_eff)
 
+    # 【分支】投机解码：这次forward要不要用拒绝采样器验证草稿——decode步、有草稿器、不是P/D的producer、不是dummy时才要
+    #   调用方：prepare_inputs、prepare_model
     def _verifies_drafts(self, batch: ScheduledBatch, is_prefill: bool) -> bool:
         """Whether this forward scores drafts with the rejection sampler.
 
@@ -3732,6 +3830,10 @@ class ModelRunner:
         scheduler never pads drafts for it, so its decodes (the step that
         surfaces a deferred T0) are q=1 and have nothing to verify.
         """
+        # 【译】这次forward是否用拒绝采样器给草稿打分。
+        #
+        #   P/D的producer保留草稿器只是为了写它的上下文KV；调度器从不为它补草稿，所以它的decode（把延迟的T0取出来的那一步）
+        #   都是q=1，没有东西可验证。
         return (
             not is_prefill
             and hasattr(self, "drafter")
