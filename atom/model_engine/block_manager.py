@@ -1367,6 +1367,18 @@ class BlockManager:
         hbs = self.hash_block_size
         return seq.token_ids[i * hbs : (i + 1) * hbs]
 
+    # 【分支】DeepSeek-V4的有界重放（ATOM_DSV4_STATE_REPLAY打开时Config.state_replay_tokens > 0，第8批；原理与数字见sequence.py
+    #   Replay类上方"科普：状态checkpoint与有界重放"④）。_evaluate在状态门控之后调用它，返回值就是最终的命中块数
+    # 两种恢复方式比代价：
+    #   不重放：从checkpoint（hit）处接上，要重算 [hit, 末尾)，hit之上那段KV命中白白浪费
+    #   重放：保住整个KV命中（compressed_hit），只从它往前退state_replay_tokens个token重算一遍，把窗口状态精确重建出来
+    # 例（hbs = 256，state_replay_tokens = R = 509，不开offload）：hit = 32块（8192），compressed_hit = 50块（12800）
+    #   resume = 8192，end = 12800，end − resume = 4608 > 509 → 重放更省：返回50，seq.replays_hit = True；
+    #   之后replay_start把forward的起点放到 12800 − 509 = 12291
+    #   若compressed_hit只有33块（8448）：8448 − 8192 = 256 ≤ 509 → 不如直接从checkpoint接上，返回32
+    # 开了LMCache MP时两头都可能被推远（推远的量不足OFFLOAD_MIN_LOAD_TOKENS（默认8192）就不算，因为connector本来就会跳过
+    #   这么小的加载）：resume → kv_prefix_tokens（LMCache连KV带状态镜像都有的位置）；end → kv_only_tokens（只看全注意力KV
+    #   能到多远），后者超过HBM命中时要先把那段KV加载回来（seq.replay_kv_load = True）
     def _replay_hit(self, seq: Sequence, compressed_hit: int, hit: int) -> int:
         """`hit` widened to `compressed_hit` when replaying is cheaper.
 
@@ -1378,12 +1390,20 @@ class BlockManager:
         the connector loads the KV past the HBM hit first (`replay_kv_load`).
         Records on `seq` whether the hit it returns replays (`replay_start`).
         """
+        # 【译】当重放更便宜时，把 hit 放宽到 compressed_hit。
+        #
+        #   不重放时，forward从checkpoint hit 处恢复；如果LMCache MP的命中（kv_prefix_tokens）更远就从那里恢复，它会把自己的
+        #   状态镜像一起带回来。重放则从最远的全注意力KV之下 state_replay_tokens 处恢复：HBM的 compressed_hit，或者LMCache
+        #   仅KV能到达的位置（kv_only_tokens）——如果那更远，connector会先把HBM命中之后的KV加载回来（replay_kv_load）。
+        #   在 seq 上记下它返回的命中是否要重放（replay_start 读它）。
+        # 没开重放、或序列不带状态：原样返回门控后的hit
         hbs = self.hash_block_size
         seq.replays_hit = seq.replay_kv_load = False
         if not self.state_replay_tokens or not seq.has_per_req_cache:
             return hit
         # The connector skips a load under OFFLOAD_MIN_LOAD_TOKENS, so neither
         # LMCache figure counts unless it clears that above where it starts.
+        # 【译】connector会跳过小于 OFFLOAD_MIN_LOAD_TOKENS 的加载，所以两个LMCache的数都必须比各自的起点多出这么多才算数。
         min_load = envs.OFFLOAD_MIN_LOAD_TOKENS
         resume = hit * hbs
         tier_hit = int(seq.offload_joint.kv_prefix_tokens or 0)
@@ -1407,11 +1427,21 @@ class BlockManager:
         hit is no place to resume; the forward replays below it instead, and
         rewrites the blocks past it the load would have filled.
         """
+        # 【译】一次重放的仅KV加载不会执行了：改为在HBM命中之下重放。
+        #
+        #   状态槽位是新的（allocate没有恢复任何checkpoint），所以HBM命中处不是能直接恢复的位置；forward改在它之下重放，并重写
+        #   这次加载本该填上的、HBM命中之后的那些block。
+        # 【分支】调用方：LMCache MP的native_state_scheduler（offload的KV加载不执行或失败时，第9批）
         seq.replay_kv_load = False
 
+    # ★ 主干：一条序列的prompt hash链，每个cache_seed只算一次（缓存在_prompt_hash_chains里），优先用前端算好送来的
+    #   （_adopt_shipped_chain）。链只覆盖prompt里写满的block：再往后的block还会随生成而变。读者：_walk_prefix / _hit_walk、
+    #   _block_hash、allocate、_chain_to、hash_blocks（登记时直接取用，不再重算）
     def _prompt_hashes(self, seq: Sequence) -> list[int]:
         """`seq`'s prompt-block hash chain, computed once per `cache_seed`;
         starts from the frontend's when it checks out (`_adopt_shipped_chain`)."""
+        # 【译】seq 的prompt block hash链，每个 cache_seed 只算一次；前端送来的链核对无误时就从它开始（_adopt_shipped_chain）。
+        # 返回的是缓存里那个list本身：_block_hash、_hit_walk会往它后面追加新算出的prompt块hash（只追加prompt里写满的块）
         seed = seq.cache_seed
         cached = self._prompt_hash_chains.get(seq)
         if cached is None or cached[0] != seed:
@@ -1419,15 +1449,27 @@ class BlockManager:
             self._prompt_hash_chains[seq] = cached
         return cached[1]
 
+    # 前端预先算好的hash链（prefix_hash.ship_prompt_hash_chain，ATOM_FRONTEND_PREFIX_HASH默认开）：API进程在preprocess时就把
+    #   prompt的整条链算好，随ADD消息经ZMQ送到EngineCore（Sequence本身被pickle时不带它），调度线程就不用为长prompt算几千次xxhash。
+    #   但前端和引擎的配置可能不一致，所以核对后才采用：
+    #   ① hash block大小、cache_seed、块数（= num_prompt_tokens // hbs）都对得上
+    #   ② 链确实是从这些token算出来的：prompt token数、整个prompt的指纹（prompt_fingerprint，一次xxh64）都相等
+    #   ③ 抽查第0块、中间一块、最后一块：在本地重算，链式hash相等（同一个hash函数）
+    #   全过就整条信任；任何一条不过就丢掉、在本地重算（命中结果不受影响，只是调度线程多算hash）
+    #   例：128k token的prompt、hbs 16 → 约8000块的链，只重算3块
     def _adopt_shipped_chain(self, seq: Sequence) -> list[int]:
         """The frontend's chain for `seq` (consumed), or `[]` to hash here.
         Adopted only if it was minted for this block size and seed from these
         prompt tokens (`prompt_fingerprint`), and its first, middle and last
         links rehash equal here (the same hash function). Then trusted whole:
         walks, `allocate` and `hash_blocks` read it."""
+        # 【译】前端为 seq 算的链（取用后即清除），或者 [] 表示在这里重算。只有当它是为这个block大小和种子、从这些prompt token
+        #   算出来的（prompt_fingerprint），并且它的第一、中间、最后三个链节在这里重算相等（同一个hash函数）时才采用。
+        #   采用后就整条信任：各种查找、allocate 和 hash_blocks 都读它。
         shipped = getattr(seq, "prompt_hash_chain", None)
         if shipped is None:
             return []
+        # 取用后即清：链只在这里用一次（结果存进_prompt_hash_chains）
         seq.prompt_hash_chain = None
         hbs, seed = self.hash_block_size, seq.cache_seed
         n = full_prompt_blocks(seq, hbs)
@@ -1445,6 +1487,8 @@ class BlockManager:
             return self._reject_shipped_chain("it was minted from other tokens")
         chain = packed.tolist()
 
+        # link_holds(i)：第i块的hash是否等于 H(第i−1块的hash（i = 0时为种子）, 第i块的token)；{0, n // 2, n − 1}用集合去重
+        #   （n很小时三个下标可能相同）
         def link_holds(i: int) -> bool:
             prev = chain[i - 1] if i else seed
             return chain[i] == self.compute_hash(self._hash_block_tokens(seq, i), prev)
@@ -1456,6 +1500,7 @@ class BlockManager:
 
     def _reject_shipped_chain(self, why: str) -> list[int]:
         # Warn once: a frontend/engine mismatch repeats on every request.
+        # 【译】只警告一次：前端和引擎不一致会在每个请求上重复出现。
         if not self.shipped_chains_rejected:
             logger.warning(
                 "Prefix cache: rehashing a prompt chain the frontend shipped, "
@@ -1469,6 +1514,9 @@ class BlockManager:
     def _block_hash(self, seq: Sequence, chain: list[int], i: int, prev: int) -> int:
         """Chained hash of block `i` given block `i - 1`'s hash `prev`, read
         from or appended to `chain` (`_prompt_hashes`, full prompt blocks)."""
+        # 【译】已知第 i − 1 块的hash为 prev 时第 i 块的链式hash：从 chain（_prompt_hashes，prompt里写满的块）中读出，
+        #   或者算出来后追加进去。
+        # 只有恰好接在链尾（i == len(chain)）且仍在prompt写满的范围内才追加，所以链里永远是一段连续的前缀
         if i < len(chain):
             return chain[i]
         h = self.compute_hash(self._hash_block_tokens(seq, i), prev)
@@ -1476,6 +1524,13 @@ class BlockManager:
             chain.append(h)
         return h
 
+    # 【分支】状态门控（第4、8批；为什么需要见文件开头前置概念的"每请求状态与状态checkpoint"）：KV前缀命中到compressed_hit块，
+    #   但带每请求状态的序列只能在"有状态checkpoint"的位置接上。每个状态类回答"≤ X的位置里我能接受的最右一个"，本函数在
+    #   各类之间反复传递候选值直到不再变化（不动点）
+    # 例（hbs = 256）：compressed_hit = 72块（18432个token），checkpoint在32块（8192）和64块（16384）→ 返回64
+    #   → 命中从18432截到16384，从16384开始prefill（与scheduler.py文件开头【前置⑤】的例子一致）
+    # 调用方：_evaluate（准入）、_joint_kv_boundary（往HBM命中之外找边界）、_record_checkpoint_demand（assume_checkpointed=True
+    #   的反事实）。不带状态的序列：每个类的resumable_hit直接原样返回（applies为False），命中不变——和nano-vllm一样
     def _gated_hit(
         self,
         seq: Sequence,
@@ -1504,6 +1559,20 @@ class BlockManager:
         answer if every ladder were dense". A boundary the other classes decline
         anyway is one no checkpoint would rescue.
         """
+        # 【译】每个 Pool.STATE 类都能从那里恢复的最右边界。
+        #
+        #   每个类回答"<= X 的边界里我能接受的最右一个"，而没有哪个类对另一个类的答案是单调的，所以不能串起来依次套用：最大的
+        #   SWA完整边界不一定带着状态checkpoint，往回走到一个带checkpoint的边界，又可能落在一个尾部SWA窗口已经没了的边界上。
+        #   那样 allocate 就会为一个SWA池从没承诺过的hash调用 swa.claim_cached——而这正是那个方法的docstring要求调用方保证
+        #   不会发生的。
+        #
+        #   所以跑到不动点：把候选值在各个类之间传来传去，直到完整一轮什么都没改变。每个答案都 <= 它的输入，所以每一轮要么
+        #   结束、要么严格减小；0是吸收态。不适用的类是恒等映射，所以只有一个类的构建在第一轮就收敛。
+        #
+        #   assume_checkpointed 原样传给每个类，给出联合的反事实："如果每条阶梯都是满的，答案是多少"，而不是"去掉某一个类的门槛
+        #   之后的答案"。一个其他类无论如何都会拒绝的边界，是任何checkpoint都救不回来的。
+        # 观察：docstring里的"SWA池""swa.claim_cached"是旧设计，仓库里已没有claim_cached；滑动窗口现在不是单独的类
+        #   （见__init__里state_caches处），state_caches只有一个成员，循环第一轮就收敛
         boundary = compressed_hit
         while boundary > 0:
             settled = True
@@ -1523,6 +1592,11 @@ class BlockManager:
                 break
         return boundary
 
+    # 统计：KV池的占用快照，EngineStats每个统计周期打一行"[Cache Pool] used … free … retained-cache … evicted this interval …"
+    #   used = 被序列引用的block，free = 空闲（含还能命中的cached），hashed = 索引里的hash数（在用的 + 空闲但还没被覆盖的）
+    #   观察：retained = hashed − used 只是"空闲但还能命中的block"的近似：used里还有没登记hash的block（每条序列末尾没写满的块、
+    #   decode新分到的块、PAGE checkpoint占的单元），会把它压低；更准的是BlockPool.num_reusable_free（cached和protected两个
+    #   队列的长度）
     def pool_occupancy(self) -> dict[str, int]:
         used = self.kv.num_used
         free = self.kv.num_free
@@ -1536,6 +1610,33 @@ class BlockManager:
             "evicted_total": self.total_evicted_blocks,
         }
 
+    # =========================================================================================
+    # 【分支】KV offload的联合加载（joint load）边界（B级；connector侧的实现见第9批 atom/kv_transfer/offload/）
+    # =========================================================================================
+    # 【前置：KV offload分层】（完整讲解：sequence.py SequenceStatus类上方"科普：KV offload"、arg_utils.py文件开头的【科普】KV offload）
+    #   L1 HBM前缀缓存（本类的self.kv）── 算好的KV在后台另存一份 ──► L2 CPU内存 / L3 NVMe（LMCache、Mooncake Store，可到TB级）
+    #   HBM里已被淘汰的前缀，以后可以从L2加载回显存、免去重算（2万个token的前缀约2.6GB，读回约0.06s、重算约0.25s，数字见
+    #   sequence.py那段）。LMCache按chunk搬运（LMCACHE_CHUNK_SIZE，kv_transfer/offload/__init__.py里的例子是256个token），只能
+    #   整chunk读写。带每请求状态的模型还多一条腿：除了KV，还要取回边界处的状态checkpoint（CPU状态层，self.state_offload）。
+    #   两条腿必须落在同一个位置B——KV取到B、状态是B处的快照——从B接着算才是对的
+    #
+    # 为什么需要它：can_allocate只走HBM的前缀缓存，HBM里第一个缺失的block就停；状态门控还会把命中截到HBM里最近的checkpoint。
+    #   本函数往HBM命中之外看：LMCache里还有KV、状态层里还有checkpoint的话，选一个两边都到得了的最右边界
+    #
+    # 例（hbs = 64，LMCache chunk = 256，checkpoint间隔8192；prompt 40000个token）：
+    #   HBM：KV前缀命中70块（4480个token），但4480以下没有checkpoint → 门控后的HBM命中hbm_boundary = 0（只能冷启动）
+    #   LMCache报告有前20000个token的KV（kv_prefix_tokens）→ 向下取整到chunk：19968
+    #   cap = min(19968 / 64 = 312, ⌈40000/64⌉ − 1 = 624) = 312；hash链续到312块，_gated_hit问312块以内最右的可恢复点：
+    #     设CPU状态层有16384处的checkpoint → candidate = 256块 = 16384个token
+    #   kv_tokens = 16384向上取整到chunk = 16384（≤ 19968，KV腿够得着）
+    #   claim：HBM里那70块免费认领，向下取整到chunk：4480 → 4352（17个chunk）
+    #   结果：allocate认领HBM的 [0, 4352)，KV腿从LMCache取 [4352, 16384)，状态腿取16384处的checkpoint；两腿都到齐后
+    #     num_cached_tokens才从0抬到16384（seq.offload_joint几个字段的位置关系见sequence.py OffloadJointRecord类上方的图）
+    # 依次过的门（不过就返回_no_joint(原因)，原因由_commit_joint_boundary计入joint_skips）：
+    #   off（没有CPU状态层）→ no_paged_checkpoints（序列不带状态，或没用PAGE checkpoint）→ no_chunk_size →
+    #   lmcache_within_hbm（LMCache并不比HBM多）→ hbm_off_chunk_grid → no_room_above_hbm → no_rung_above_hbm →
+    #   covering_chunk_beyond_lookup → claim_off_hash_grid
+    # 调用方：record_allocation（_evaluate在record=True时，或调度器在等待 / 预算检查通过后调用）
     def _joint_kv_boundary(
         self,
         seq: Sequence,
@@ -1563,6 +1664,19 @@ class BlockManager:
         B: overshooting costs one chunk into blocks the forward is about to
         rewrite, undershooting would be silent wrong output.
         """
+        # 【译】HBM命中之上、两条腿都能到达的边界，作为一个值返回。
+        #
+        #   纯计算：它读取seq的KV腿输入和各个缓存，返回一个 JointBoundaryDecision，但不在seq上写任何东西，也不动任何漏斗计数器。
+        #   要不要提交由 can_allocate 决定——真正的准入调用 _commit_joint_boundary，适配探测则丢弃它。正是把两者分开，才让过去
+        #   一路穿到这里的 record 标志消失。
+        #
+        #   can_allocate 只走HBM的前缀缓存，别的都不看，所以一个被淘汰的前缀会停在第一个未命中处，哪怕LMCache里每个block都在。
+        #   这里看得更远：KV腿从LMCache取 [hbm, B)，状态腿从状态层取B处的checkpoint，两者落在同一个边界上，要么都执行，要么都
+        #   不执行。
+        #
+        #   两边的网格对不齐——状态的一级是一个hash block边界，KV腿按整chunk搬运。与其丢掉每个没对齐的级，不如让KV腿瞄准*覆盖*B
+        #   的那个chunk，而请求只认领到B：多取的代价是一个chunk的数据写进forward马上要重写的block，取少了则是悄无声息的错误输出。
+        # 现在的提交点是record_allocation（见上方"调用方"），docstring里的"can_allocate决定"指的就是这条路径
         if self.state_offload is None:
             return self._no_joint("off")
         # PAGE is now the served class, not the excluded one. This used to
@@ -1573,6 +1687,10 @@ class BlockManager:
         # the instant its boundary block is spent) means a checkpoint can no
         # longer outlive its KV in HBM -- so when LMCache hands the KV back,
         # nothing hands the state back unless the two are fetched together.
+        # 【译】PAGE现在是被服务的那一类，而不是被排除的那一类。这里过去写的是 is not None 并拒绝——那时K3的checkpoint还是一个由
+        #   状态层从 StateSlotPool 里溢出的活跃槽位，这样做是对的。#2045 把镜像搬进了KV池，联合路径存在的全部理由也随之而来：
+        #   HBM里"状态 ⊆ KV"（_record_evicted 在一个checkpoint的边界block被花掉的瞬间就取消它的索引）意味着在HBM里checkpoint再也
+        #   活不过它的KV——所以当LMCache把KV送回来时，除非两者一起取，否则没有什么会把状态送回来。
         if not seq.has_per_req_cache or self.paged_state_checkpoints is None:
             return self._no_joint("no_paged_checkpoints")
         hbs = self._hash_block_size()
@@ -1580,6 +1698,8 @@ class BlockManager:
         # not off the connector object: the scheduler holds whatever
         # `get_kvconnector` returned, and one without `chunk_size` would zero
         # this and disable the feature silently.
+        # 【译】构造时从config解析一次（state_tier_chunk_tokens），而不是从connector对象上读：调度器持有的是 get_kvconnector 返回的
+        #   任何东西，一个没有 chunk_size 的connector会把它置零，悄悄关掉这个特性。
         chunk = self._joint_chunk_tokens
         lmc_tokens = int(seq.offload_joint.kv_prefix_tokens or 0)
         if chunk <= 0:
@@ -1588,13 +1708,19 @@ class BlockManager:
         # covering-chunk check becomes true by construction rather than by
         # luck. (`get_num_new_matched_tokens` withholds one token on a
         # full-prompt hit, which takes the lookup off the grid.)
+        # 【译】向下取整到下面所有比较所用的网格上，这样"覆盖它的chunk"这个检查由构造保证为真，而不是靠运气。
+        #   （get_num_new_matched_tokens 在整个prompt都命中时会扣下一个token，使查询结果偏离网格。）
+        # 例：LMCache报告20000个token、chunk 256 → 19968
         lmc_tokens = (lmc_tokens // chunk) * chunk
         if lmc_tokens <= hbm_boundary * hbs:
             return self._no_joint("lmcache_within_hbm")
         # The KV leg moves whole chunks and the blocks below the HBM prefix are
         # shared, so an unaligned start cannot be rounded down.
+        # 【译】KV腿按整chunk搬运，而HBM前缀以下的block是共享的，所以一个没对齐的起点不能向下取整。
+        # 例（hbs 64、chunk 256）：HBM命中3块 = 192个token，192 % 256 ≠ 0 → 放弃（向下取到0就要往别人共享的block里写）
         if (hbm_boundary * hbs) % chunk != 0:
             return self._no_joint("hbm_off_chunk_grid")
+        # cap：两条腿能到的上限（以hash block计）——不超过LMCache有的，也不到最后一块（最后一块永远要自己算，同can_allocate）
         cap = min(lmc_tokens // hbs, self._n_hash_blocks(seq) - 1)
         if cap <= hbm_boundary:
             return self._no_joint("no_room_above_hbm")
@@ -1602,12 +1728,16 @@ class BlockManager:
         # One scan: `_gated_hit` already returns the rightmost rung
         # `_resumable_from` accepts, so a decrement-and-rescan walk would spend
         # a fixpoint pass per rung to reach the same answer.
+        # 【译】扫一次就够：_gated_hit 已经返回 _resumable_from 接受的最右一级，逐级递减再重扫的做法要为每一级花一轮不动点计算，
+        #   才得到同样的答案。
         candidate = self._gated_hit(seq, cap, chain)
         if candidate <= hbm_boundary:
             return self._no_joint("no_rung_above_hbm")
         tokens = candidate * hbs
         h = chain[candidate - 1]
         # Cannot fail given the two premises above; kept as their assertion.
+        # 【译】在上面两个前提下不可能失败；保留下来当作它们的断言。
+        # -(-a // b)：Python里不经浮点的向上取整，即把边界B向上取整到chunk
         kv_tokens = -(-tokens // chunk) * chunk
         if kv_tokens > lmc_tokens:
             return self._no_joint("covering_chunk_beyond_lookup")
@@ -1622,9 +1752,17 @@ class BlockManager:
         # `<= compressed_hit`, so the boundary is always past the compressed
         # hit and this min is always the compressed hit. Written as a min
         # anyway: the invariant belongs to `_gated_hit`, not here.
+        # 【译】直到压缩命中为止的一切都是这个prompt的KV，并且仍在池里——_gated_hit 截掉的是可恢复性，不是驻留。在联合边界之下
+        #   这些block对这个请求是只读的（forward从边界开始），所以认领它们不花钱；这就是KV腿取 [hit, B) 还是取 [0, B)（而前一半
+        #   明明已经在HBM里）的区别。
+        #
+        #   candidate > hbm_boundary，而 hbm_boundary 是 <= compressed_hit 的*最右*一级，所以边界总在压缩命中之后，这个min
+        #   永远等于压缩命中。还是写成min：这个不变式属于 _gated_hit，不属于这里。
         claim_blocks = min(len(block_hashes), candidate)
         # Floored to the chunk grid so the KV leg starts aligned and writes
         # only into blocks below it that nobody else can be reading.
+        # 【译】向下取整到chunk网格，这样KV腿的起点是对齐的，而且只写进（边界以下）没有别人可能在读的block。
+        # 例：70块 × 64 = 4480 → 4352（17个chunk）；不低于HBM命中（max）
         claim_tokens = ((claim_blocks * hbs) // chunk) * chunk
         claim_tokens = max(claim_tokens, hbm_boundary * hbs)
         # `allocate` claims the boundary in whole hash blocks --
@@ -1638,6 +1776,13 @@ class BlockManager:
         # shipping case (`block_size * dcp_world_size == LMCACHE_CHUNK_SIZE`), so
         # it only surfaces at DCP world sizes that take `hbs` off the chunk grid.
         # Refuse the joint and recompute the tail rather than resume over a gap.
+        # 【译】allocate 以整hash block为单位认领边界——claim_tokens // hbs——但上面的值是向下取整到*chunk*网格，而不是hash block
+        #   网格。当 hbs 不整除 chunk 时，一个chunk对齐的认领不一定是hash block对齐的：取整会把
+        #   [floor(claim_tokens/hbs)*hbs, claim_tokens) 这一段尾巴丢进一个新的、没填过的block，而 num_cached_tokens（KV腿到达后
+        #   会被抬到边界）随后把它算作已计算——悄无声息的错误输出，没有任何异常。只要 hbs | chunk 它就看不出来，这正是出货配置
+        #   的情况（block_size * dcp_world_size == LMCACHE_CHUNK_SIZE），所以它只在让 hbs 偏离chunk网格的DCP规模下才会出现。
+        #   宁可拒绝联合、重算尾巴，也不要越过一个缺口去恢复。
+        # 例：block 16、-dcp 6 → hbs = 96，chunk 256：70块 × 96 = 6720 → 向下取整到chunk = 6656，6656 % 96 = 32 ≠ 0 → 拒绝
         if claim_tokens % hbs != 0:
             return self._no_joint("claim_off_hash_grid")
         # Which tier the STATE leg came from. The KV leg's own tier is decided
@@ -1645,6 +1790,9 @@ class BlockManager:
         # named for the boundary as a whole. Read here, off the same cache the
         # boundary was computed against, and carried on the decision so the
         # commit does not have to look it up again.
+        # 【译】状态腿来自哪一层。KV腿自己的层由 _decide_load_after_alloc 另行决定，所以这个字段不按整个边界命名。在这里、从计算
+        #   边界所用的同一份缓存读出来，并带在决策上，这样提交时不必再查一次。
+        # state_from_hbm：这个checkpoint此刻就在HBM的PAGE单元里（contains），否则要从CPU状态层取
         return JointBoundaryDecision(
             boundary_tokens=tokens,
             boundary_hash=h,
@@ -1653,6 +1801,7 @@ class BlockManager:
             state_from_hbm=self.paged_state_checkpoints.contains(h),
         )
 
+    # @staticmethod：不需要self也不需要类，只是放在类里的普通函数
     @staticmethod
     def _no_joint(reason: str) -> JointBoundaryDecision:
         """The empty decision, naming why no joint boundary was found.
@@ -1660,6 +1809,8 @@ class BlockManager:
         even trying", because a silent zero is indistinguishable from a feature
         that ran and found nothing.
         """
+        # 【译】空的决策，并写明为什么没找到联合边界。每个原因都在提交时计数，包括"这个构建根本没在尝试"，因为一个沉默的0和
+        #   "特性跑过、什么都没找到"是没法区分的。
         return JointBoundaryDecision(skip_reason=reason)
 
     def _commit_joint_boundary(
@@ -1674,6 +1825,13 @@ class BlockManager:
         leaves no stale span from a prior one -- the same clean-slate the old
         code got from resetting at the top of every boundary walk.
         """
+        # 【译】把一个 JointBoundaryDecision 应用到seq和漏斗计数器上。
+        #
+        #   这是 _joint_kv_boundary 过去在 record=True 下内联做的"记录"那一半：真正的准入调用它，适配探测不调用，所以计数器每次
+        #   准入只动一次，只探测过的seq永远不动。先 reset_joint，这样一个在本轮落成skip的边界不会留下上一轮的过期范围——与旧代码
+        #   在每次边界查找开头重置得到的干净状态相同。
+        # 调用方：record_allocation。写进seq.offload_joint的四个字段之后由allocate（认领claim_tokens）和KV connector（取kv_tokens、
+        #   状态腿取boundary_hash）读取
         seq.offload_joint.reset_joint()
         if decision.skip_reason is not None:
             self.joint_skips[decision.skip_reason] = (
@@ -1699,10 +1857,16 @@ class BlockManager:
         boundary addressable. Resumes from the last APPENDED hash: on a miss the
         caller's loop variable holds a hash that is not in the chain.
         """
+        # 【译】把 block_hashes 续到 blocks 个条目，只算hash。
+        #   链式hash只是prompt的函数，所以在HBM缓存停下的地方之后照样能算——这就是一个只在LMCache里的边界能被寻址的原因。
+        #   从最后一个*追加进去*的hash接着算：未命中时，调用方的循环变量里放的是一个不在链里的hash。
+        # 先尽量用prompt链（_prompt_hashes）里现成的；首尾对不上（block_hashes不是这条prompt链的前缀）就不用它、全部现算。
+        #   调用方：_joint_kv_boundary、_extend_hash_chain、prefix_hash_chain
         prompt = self._prompt_hashes(seq)
         chain = list(block_hashes)
         k = min(len(chain), len(prompt))
         if k and (chain[0], chain[k - 1]) != (prompt[0], prompt[k - 1]):
+            # 【译】（下一行行尾）不是prompt链的前缀：越过它现算。
             prompt = []  # Not a prefix of the prompt chain: hash past it.
         chain += prompt[len(chain) : blocks]
         h = chain[-1] if chain else seq.cache_seed
@@ -1716,6 +1880,8 @@ class BlockManager:
     ) -> list[int]:
         """`block_hashes` continued to `blocks` entries, for callers outside
         the manager. Seeded from `seq.cache_seed` like every chain it mints."""
+        # 【译】把 block_hashes 续到 blocks 个条目，给管理器之外的调用方用。和它生成的每条链一样，以 seq.cache_seed 为种子。
+        # 【分支】调用方：LMCache MP的native_state_scheduler（算checkpoint边界的hash，第9批）
         return self._chain_to(seq, block_hashes, blocks)
 
     def can_allocate(
@@ -1859,7 +2025,7 @@ class BlockManager:
         #     最后一个位置，才有logits采样第1个输出token，整条prompt都命中就没有东西可forward了
         #     （A的100个token原样再来一遍：n=7，看前6块 → 命中6块 = 96，只重算最后4个token）
         #
-        # 对比nano-vllm（block_manager.py的can_allocate / allocate，共约50行）：骨架相同——沿链式hash逐块查、第一次未命中就停、
+        # 对比nano-vllm（block_manager.py的can_allocate / allocate，两个函数合计约40行代码）：骨架相同——沿链式hash逐块查、第一次未命中就停、
         #   最后一块不复用、命中块里"正被别人用着的"不占空闲名额、allocate先认领命中块（ref_count+1）再取新块。ATOM多出来的：
         #   ① hash链只算一次：_prompt_hashes把prompt的链缓存在seq上，默认由前端（API进程）算好随请求送来
         #      （ATOM_FRONTEND_PREFIX_HASH，见prefix_hash.py【科普】⑤）；nano-vllm在can_allocate和allocate里各hash一遍
@@ -1889,7 +2055,7 @@ class BlockManager:
         the walk is asked afresh on every call."""
         # 【译】在 walk_of(seq) 返回的遍历结果上做 can_allocate；除了遍历本身，其余每一项每次调用都重新询问。
         # walk_of 有两种：can_allocate 传 _admission_walk（每次都重新遍历），can_allocate_memoized 传 _memoised_walk
-        #   （遍历结果跨tick缓存）。"其余每一项"= 状态槽位、门控、重放、命中块里几块正被使用、池子够不够——它们随池子变化，
+        #   （遍历结果跨tick缓存；ATOM_PREFIX_WALK_MEMO=0 时传 _walk_prefix）。"其余每一项"= 状态槽位、门控、重放、命中块里几块正被使用、池子够不够——它们随池子变化，
         #   不能缓存；只有"沿hash链能走多远"这件最贵的事可以缓存（有效条件见 _walk_still_valid）
         # 下面的 (1)~(9) 与 can_allocate 里流程图的编号一一对应
         # Active Slots are preallocated; PAGE checkpoints share the KV pool.
@@ -2342,10 +2508,12 @@ class BlockManager:
         # 观察：返回False的实际条件是"state_holds为False 且 disown_claimed_prefix失败"。state_holds为False不只发生在联合边界上：
         #   普通HBM命中背后的checkpoint在探测之后没了（_attach_state_slots 里PAGE分支的"Neither tier can produce it"、fork分支的
         #   `return hit_hash == -1`）也会走到这里，比docstring说的范围宽
-        # 调用方：scheduler.py _schedule Phase 2（返回False时 deallocate + 放回waiting队头 + 本轮停止准入）
+        # 调用方：scheduler.py _schedule Phase 2（返回False时 deallocate + 放回waiting队头 + 本轮停止准入）；
+        #   【分支】RapidServe的 DecodeScheduler.allocate_waiting（不传 num_cached_blocks，即不复用前缀）
         assert not seq.block_table
         # Admitted: the delayer no longer probes this seq.
-        # 【译】已准入：delayer不会再探测这条seq。所以丢掉它的跨tick遍历缓存（can_allocate_memoized）
+        # 【译】已准入：delayer不会再探测这条seq。
+        # 所以丢掉它的跨tick遍历缓存（can_allocate_memoized 用的 _cached_walks）
         self._cached_walks.pop(seq, None)
         # Two extents, and they are not the same number. `num_cached_blocks` is
         # what the request may call cached -- it needs a resumable state behind
@@ -2685,7 +2853,7 @@ class BlockManager:
         # 【译】（行尾注释）有一个fork checkpoint作为它的源
         if getattr(seq, "state_fork_src", -1) != -1:
             return True  # a fork checkpoint is its source
-        # PAGE：下一个batch是否排了一次gather恢复，目标正是这条seq的已提交槽位
+        # 剩下只有PAGE恢复一种：没有PAGE coordinator → False；有则看下一个batch是否排了一次gather恢复、目标正是本seq的已提交槽位
         if self.paged_state_checkpoints is None:
             return False
         return self.paged_state_checkpoints.restore_queued_for(seq.state_slot)
